@@ -1,0 +1,27 @@
+# 機密與本機狀態，絕對不要進版控
+# .env      —— FTP 帳密、登入密碼、TMDB 金鑰、資料庫密碼
+# data/     —— 媒體庫索引、HLS 快取、字幕快取、session 簽章金鑰
+# 註解一定要自己一行：.gitignore 的 # 只有在行首才是註解，
+# 寫成 ".env  # 說明" 會被當成一個含空格與井號的樣式，整條規則失效。
+.env
+.env.local
+data/
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 編輯器與作業系統
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 執行期產物
+*.log

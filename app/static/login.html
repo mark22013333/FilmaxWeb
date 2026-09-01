@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登入 — FilmaxWeb</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  body{display:grid;place-items:center;min-height:100vh;padding:20px}
+  .box{width:100%;max-width:360px;background:var(--panel);border:1px solid var(--line);
+       border-radius:16px;padding:32px 28px;box-shadow:var(--shadow)}
+  .box .brand{justify-content:center;margin-bottom:6px;font-size:20px}
+  .box p{text-align:center;color:var(--dim);font-size:13px;margin:0 0 22px}
+  label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:6px;font-weight:600}
+  input[type=password]{width:100%;padding:11px 13px;border-radius:9px;background:var(--bg-2);
+       border:1px solid var(--line);outline:none;transition:.15s;font-size:15px}
+  input[type=password]:focus{border-color:var(--accent)}
+  button[type=submit]{width:100%;margin-top:16px;padding:11px;border-radius:9px;
+       background:var(--accent);color:#191919;font-weight:800;font-size:14px}
+  button[type=submit]:hover{background:var(--accent-2)}
+  .err{background:#241618;border:1px solid #5c2b2b;color:#ffb0b0;border-radius:9px;
+       padding:10px 12px;font-size:13px;margin-bottom:16px;text-align:center}
+</style>
+</head>
+<body>
+<form class="box" method="post" action="/login">
+  <div class="brand"><i>F</i>FilmaxWeb</div>
+  <p>請輸入密碼</p>
+  <div class="err" id="err">{{ERROR}}</div>
+  <label for="pw">密碼</label>
+  <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
+  <input type="hidden" name="next" value="{{NEXT}}">
+  <button type="submit">登入</button>
+</form>
+<script>
+  const e = document.getElementById('err');
+  if (!e.textContent.trim()) e.style.display = 'none';
+</script>
+</body>
+</html>

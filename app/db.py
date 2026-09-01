@@ -1,0 +1,213 @@
+"""SQLite 資料層。單檔資料庫，放在 data/library.db。"""
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional
+
+from .config import DB_PATH
+
+log = logging.getLogger("filmax.db")
+_local = threading.local()
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS media_item (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,              -- movie / tv
+    title           TEXT NOT NULL,
+    original_title  TEXT,
+    sort_title      TEXT,
+    year            INTEGER,
+    tmdb_id         INTEGER,
+    overview        TEXT,
+    poster          TEXT,                       -- 本地快取檔名
+    backdrop        TEXT,
+    rating          REAL,
+    runtime         INTEGER,
+    genres          TEXT,                       -- JSON array
+    cast_json       TEXT,                       -- JSON array
+    scrape_state    TEXT DEFAULT 'pending',     -- pending / ok / failed / manual
+    guess_key       TEXT UNIQUE,                -- 用來合併同一部作品
+    added_at        REAL,
+    updated_at      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_item_kind ON media_item(kind);
+CREATE INDEX IF NOT EXISTS idx_item_title ON media_item(title);
+
+CREATE TABLE IF NOT EXISTS episode (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id     INTEGER NOT NULL REFERENCES media_item(id) ON DELETE CASCADE,
+    season      INTEGER NOT NULL,
+    episode     INTEGER NOT NULL,
+    title       TEXT,
+    overview    TEXT,
+    still       TEXT,
+    air_date    TEXT,
+    UNIQUE(item_id, season, episode)
+);
+
+CREATE TABLE IF NOT EXISTS media_file (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id      INTEGER REFERENCES media_item(id) ON DELETE CASCADE,
+    episode_id   INTEGER REFERENCES episode(id) ON DELETE SET NULL,
+    ftp_path     TEXT NOT NULL UNIQUE,
+    filename     TEXT NOT NULL,
+    size         INTEGER,
+    mtime        TEXT,
+    ext          TEXT,
+    -- ffprobe 結果
+    duration     REAL,
+    container    TEXT,
+    video_codec  TEXT,
+    audio_codec  TEXT,
+    width        INTEGER,
+    height       INTEGER,
+    bitrate      INTEGER,
+    subtitles    TEXT,          -- JSON: [{index,codec,lang,title}]
+    audio_tracks TEXT,          -- JSON
+    play_mode    TEXT,          -- direct / hls
+    -- 色彩資訊，決定要不要做 HDR tonemap
+    pix_fmt         TEXT,
+    color_transfer  TEXT,       -- smpte2084 = HDR10 / arib-std-b67 = HLG
+    color_primaries TEXT,
+    color_space     TEXT,
+    bit_depth       INTEGER,
+    is_hdr          INTEGER DEFAULT 0,
+    probe_state  TEXT DEFAULT 'pending',   -- pending / ok / failed
+    probe_error  TEXT,
+    thumb        TEXT,
+    seen_at      REAL,
+    added_at     REAL
+);
+CREATE INDEX IF NOT EXISTS idx_file_item ON media_file(item_id);
+CREATE INDEX IF NOT EXISTS idx_file_probe ON media_file(probe_state);
+
+CREATE TABLE IF NOT EXISTS play_state (
+    file_id     INTEGER PRIMARY KEY REFERENCES media_file(id) ON DELETE CASCADE,
+    position    REAL DEFAULT 0,
+    duration    REAL DEFAULT 0,
+    finished    INTEGER DEFAULT 0,
+    updated_at  REAL
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+    k TEXT PRIMARY KEY,
+    v TEXT
+);
+"""
+
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")
+    return conn
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = _connect()
+        _local.conn = conn
+    return conn
+
+
+_write_lock = threading.RLock()
+
+
+@contextmanager
+def tx():
+    conn = get_conn()
+    with _write_lock:
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+# 既有資料庫要補的欄位。SQLite 沒有 IF NOT EXISTS 的 ADD COLUMN，
+# 所以自己比對一次；這比要求使用者砍掉重建資料庫友善得多。
+_ADDED_COLUMNS = {
+    "media_file": [
+        ("pix_fmt", "TEXT"),
+        ("color_transfer", "TEXT"),
+        ("color_primaries", "TEXT"),
+        ("color_space", "TEXT"),
+        ("bit_depth", "INTEGER"),
+        ("is_hdr", "INTEGER DEFAULT 0"),
+        ("fps", "REAL"),
+    ],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, cols in _ADDED_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                log.info("資料庫補上欄位 %s.%s", table, name)
+
+
+def init_db() -> None:
+    conn = get_conn()
+    with _write_lock:
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.commit()
+
+
+def q(sql: str, params: Iterable = ()) -> List[sqlite3.Row]:
+    return get_conn().execute(sql, tuple(params)).fetchall()
+
+
+def q1(sql: str, params: Iterable = ()) -> Optional[sqlite3.Row]:
+    return get_conn().execute(sql, tuple(params)).fetchone()
+
+
+def execute(sql: str, params: Iterable = ()) -> sqlite3.Cursor:
+    with tx() as conn:
+        return conn.execute(sql, tuple(params))
+
+
+def kv_get(key: str, default: Any = None) -> Any:
+    row = q1("SELECT v FROM kv WHERE k=?", (key,))
+    if not row:
+        return default
+    try:
+        return json.loads(row["v"])
+    except Exception:
+        return default
+
+
+def kv_set(key: str, value: Any) -> None:
+    execute(
+        "INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (key, json.dumps(value, ensure_ascii=False)),
+    )
+
+
+def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    d = dict(row)
+    for jf in ("genres", "cast_json", "subtitles", "audio_tracks"):
+        if jf in d and isinstance(d[jf], str):
+            try:
+                d[jf] = json.loads(d[jf])
+            except Exception:
+                d[jf] = []
+    return d
+
+
+def now() -> float:
+    return time.time()

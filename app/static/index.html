@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FilmaxWeb — 我的影音庫</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎬</text></svg>">
+</head>
+<body>
+
+<header>
+  <div class="brand"><i>F</i>FilmaxWeb</div>
+  <nav>
+    <button data-kind="" class="on">全部</button>
+    <button data-kind="movie">電影</button>
+    <button data-kind="tv">影集</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="search">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+    <input id="q" type="search" placeholder="搜尋片名或檔名…" autocomplete="off">
+  </div>
+  <button class="btn" id="btnScan">掃描媒體庫</button>
+  <button class="btn" id="btnStats" title="狀態">ⓘ</button>
+</header>
+
+<div class="toolbar">
+  <div class="chips" id="genres"></div>
+  <select class="sort" id="sort">
+    <option value="added">最近加入</option>
+    <option value="title">片名</option>
+    <option value="year">年份</option>
+    <option value="rating">評分</option>
+  </select>
+</div>
+
+<main>
+  <div id="continue"></div>
+  <div class="section-title" id="libTitle">媒體庫 <span id="libCount"></span></div>
+  <div class="grid" id="grid"></div>
+  <div id="pager"></div>
+</main>
+
+<div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
+
+<div class="scan-panel" id="scanPanel">
+  <div class="scan-h"><span class="dot" id="scanDot"></span><b id="scanPhase">掃描中</b>
+    <button class="btn" id="btnCancelScan" style="padding:4px 10px">停止</button>
+    <button class="btn" id="btnHideScan" style="padding:4px 10px">×</button></div>
+  <div class="scan-b">
+    <div id="scanText">準備中…</div>
+    <div class="bar"><i id="scanBar" style="width:0"></i></div>
+    <div class="scan-log" id="scanLog"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

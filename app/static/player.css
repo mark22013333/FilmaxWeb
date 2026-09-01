@@ -1,0 +1,213 @@
+/* ---------------- 播放器 ---------------- */
+body.player{background:#000;overflow:hidden}
+.pl{position:fixed;inset:0;display:flex;flex-direction:column;background:#000}
+
+/* 頂部標題列 */
+.pl-top{
+  position:absolute;top:0;left:0;right:0;z-index:30;display:flex;align-items:center;gap:14px;
+  padding:14px 18px;background:linear-gradient(180deg,rgba(0,0,0,.85),transparent);
+  transition:opacity .25s, transform .25s;
+}
+.pl-top .ti{flex:1;min-width:0}
+.pl-top .ti b{display:block;font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pl-top .ti small{color:#9aa3b6;font-size:12px}
+
+/* 影片區 */
+.stage{position:relative;flex:1;min-height:0;background:#000;overflow:hidden}
+.stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+
+/* 字幕層 —— 自己畫，才能完全控制大小/顏色/位置 */
+.subs{
+  position:absolute;left:0;right:0;z-index:12;display:flex;flex-direction:column;
+  align-items:center;gap:.25em;pointer-events:none;padding:0 6%;
+  text-align:center;white-space:pre-wrap;word-break:break-word;
+  font-family:var(--sub-font,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif);
+  font-size:var(--sub-size,32px);
+  font-weight:var(--sub-weight,600);
+  line-height:1.35;
+  color:var(--sub-color,#fff);
+  text-shadow:var(--sub-shadow,0 2px 4px rgba(0,0,0,.9));
+}
+.subs.bottom{bottom:var(--sub-offset,10%);top:auto}
+.subs.top{top:var(--sub-offset,10%);bottom:auto}
+.subs .cue{
+  display:inline-block;padding:var(--sub-pad,.1em .45em);
+  background:var(--sub-bg,transparent);border-radius:6px;max-width:100%;
+}
+
+/* 中央狀態 */
+.center{
+  position:absolute;inset:0;z-index:15;display:none;place-items:center;pointer-events:none;
+}
+.center.show{display:grid}
+.center .pl-card{
+  background:rgba(0,0,0,.72);border-radius:14px;padding:22px 28px;text-align:center;
+  color:#dbe2ee;font-size:13.5px;max-width:min(520px,80vw);backdrop-filter:blur(6px);
+  pointer-events:auto;
+}
+.spin{width:34px;height:34px;border:3px solid #333c52;border-top-color:var(--accent);
+  border-radius:50%;animation:sp .9s linear infinite;margin:0 auto 14px}
+@keyframes sp{to{transform:rotate(360deg)}}
+
+.tapzone{position:absolute;inset:0;z-index:10;cursor:pointer}
+
+/* 控制列 */
+.ctl{
+  position:absolute;left:0;right:0;bottom:0;z-index:25;padding:26px 18px 12px;
+  background:linear-gradient(0deg,rgba(0,0,0,.88) 0%,rgba(0,0,0,.55) 45%,transparent 100%);
+  transition:opacity .22s, transform .22s;
+}
+.pl.idle .ctl{opacity:0;transform:translateY(12px);pointer-events:none}
+.pl.idle .pl-top{opacity:0;transform:translateY(-12px);pointer-events:none}
+.pl.idle .stage{cursor:none}
+
+/* 進度條 */
+.bar-wrap{position:relative;height:20px;display:flex;align-items:center;cursor:pointer;margin-bottom:4px}
+.bar-bg{position:relative;width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.22);transition:height .12s}
+.bar-wrap:hover .bar-bg{height:8px}
+.bar-buf{position:absolute;left:0;top:0;bottom:0;background:rgba(255,255,255,.32);border-radius:3px}
+.bar-play{position:absolute;left:0;top:0;bottom:0;background:var(--accent);border-radius:3px}
+.bar-knob{
+  position:absolute;top:50%;width:13px;height:13px;border-radius:50%;background:var(--accent);
+  transform:translate(-50%,-50%) scale(0);transition:transform .12s;box-shadow:0 1px 5px rgba(0,0,0,.6);
+}
+.bar-wrap:hover .bar-knob{transform:translate(-50%,-50%) scale(1)}
+.bar-tip{
+  position:absolute;bottom:24px;transform:translateX(-50%);background:rgba(0,0,0,.88);
+  padding:3px 8px;border-radius:5px;font-size:12px;font-variant-numeric:tabular-nums;
+  pointer-events:none;opacity:0;transition:opacity .12s;white-space:nowrap;
+}
+.bar-wrap:hover .bar-tip{opacity:1}
+
+.row{display:flex;align-items:center;gap:6px}
+.ib{
+  width:38px;height:38px;border-radius:9px;display:grid;place-items:center;color:#e8ecf4;
+  transition:.15s;flex:none;
+}
+.ib:hover{background:rgba(255,255,255,.14)}
+.ib.on{color:var(--accent)}
+.ib svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;
+  stroke-linecap:round;stroke-linejoin:round}
+.ib.solid svg{fill:currentColor;stroke:none}
+.time{font-size:12.5px;color:#c3cad9;font-variant-numeric:tabular-nums;padding:0 6px;white-space:nowrap}
+.time i{color:#6b7386;font-style:normal;margin:0 4px}
+.grow{flex:1}
+.vol{display:flex;align-items:center;gap:6px}
+.vol input{width:0;opacity:0;transition:.2s;accent-color:var(--accent);cursor:pointer}
+.vol:hover input,.vol input:focus{width:78px;opacity:1}
+.badge-mode{
+  font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;
+  background:rgba(255,255,255,.12);color:#c3cad9;white-space:nowrap;
+}
+.badge-mode.direct{background:rgba(62,207,142,.2);color:var(--green)}
+
+/* 設定面板 */
+.panel{
+  position:absolute;right:14px;bottom:76px;z-index:28;width:330px;max-width:calc(100vw - 28px);
+  max-height:min(70vh,540px);overflow-y:auto;background:rgba(18,21,29,.97);
+  border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);
+  backdrop-filter:blur(12px);display:none;
+}
+.panel.show{display:block}
+.panel h4{
+  margin:0;padding:13px 16px 9px;font-size:12px;font-weight:800;color:var(--accent);
+  letter-spacing:.6px;text-transform:uppercase;
+}
+.panel h4:not(:first-child){border-top:1px solid var(--line);margin-top:4px}
+.pi{display:flex;align-items:center;gap:10px;padding:8px 16px}
+.pi label{flex:1;font-size:13px;color:#c3cad9}
+.pi .val{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;min-width:44px;text-align:right}
+.pi input[type=range]{width:118px;accent-color:var(--accent);cursor:pointer}
+.pi select{
+  flex:1;max-width:170px;padding:6px 8px;border-radius:7px;background:var(--panel);
+  border:1px solid var(--line);outline:none;font-size:12.5px;
+}
+.opt{
+  display:flex;align-items:center;gap:10px;padding:9px 16px;font-size:13px;cursor:pointer;transition:.12s;
+}
+.opt:hover{background:rgba(255,255,255,.06)}
+.opt.on{color:var(--accent);font-weight:700}
+.opt .tick{width:14px;flex:none;text-align:center}
+.opt small{color:var(--dim);font-weight:400}
+/* 「其他字幕」展開後的項目，縮排一點好看出是子項 */
+.opt.nested{padding-left:34px;font-size:12.5px}
+.opt.more .tick{color:var(--dim);font-size:11px}
+/* 選不了的字幕軌（圖形字幕）：看得到但不假裝可以點 */
+.opt.dim{color:var(--dim)}
+.opt.dim:hover{background:transparent;cursor:default}
+
+/* 片源資訊表 */
+.info{padding:2px 16px 10px}
+.ir{display:flex;gap:12px;align-items:baseline;padding:4px 0;font-size:12.5px;line-height:1.45}
+.ir span{flex:none;width:78px;color:var(--dim)}
+.ir b{font-weight:500;color:var(--muted);word-break:break-all}
+.swatches{display:flex;gap:7px;padding:4px 16px 10px;flex-wrap:wrap}
+.sw{width:26px;height:26px;border-radius:7px;border:2px solid transparent;cursor:pointer;transition:.12s}
+.sw:hover{transform:scale(1.12)}
+.sw.on{border-color:var(--accent)}
+.seg{display:flex;gap:5px;padding:4px 16px 10px}
+.seg button{
+  flex:1;padding:6px 4px;border-radius:7px;background:var(--panel);border:1px solid var(--line);
+  font-size:12px;color:var(--muted);transition:.12s;
+}
+.seg button:hover{color:var(--text)}
+.seg button.on{background:var(--accent);color:#191919;border-color:transparent;font-weight:700}
+.panel .foot{padding:10px 16px 14px;border-top:1px solid var(--line);margin-top:4px}
+.panel .foot button{
+  width:100%;padding:8px;border-radius:8px;background:var(--panel);border:1px solid var(--line);
+  font-size:12.5px;color:var(--muted);
+}
+.panel .foot button:hover{color:var(--text)}
+
+.pl-toast{
+  /* top/bottom 都要明確寫。只寫一邊時，若別的樣式表定義了另一邊，
+     絕對定位元素會被上下同時釘住而整個撐開（曾經因此變成一條黑色長條）。 */
+  position:absolute;left:50%;top:24px;bottom:auto;transform:translateX(-50%);z-index:40;
+  background:rgba(0,0,0,.85);padding:9px 18px;border-radius:9px;font-size:13.5px;
+  opacity:0;pointer-events:none;transition:.22s;white-space:nowrap;
+}
+.pl-toast.show{opacity:1}
+
+@media(max-width:640px){
+  .ib{width:34px;height:34px}
+  .time{font-size:11.5px;padding:0 2px}
+  .vol{display:none}
+  .panel{right:8px;left:8px;width:auto;bottom:70px}
+  .ctl{padding:36px 10px 10px}
+}
+
+/* 片源標記（解析度 / HDR / 位元深度）*/
+.tags-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tg{
+  font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;white-space:nowrap;
+  background:rgba(255,255,255,.12);color:#c3cad9;
+}
+.tg.hdr{background:rgba(245,197,24,.18);color:var(--accent)}
+.tg.warn{background:rgba(255,92,92,.18);color:#ff8f8f}
+@media(max-width:720px){.tags-row .tg:not(.hdr):not(.warn){display:none}}
+
+/* 緩衝／轉碼中的小標示 —— 放角落，不遮畫面 */
+.busy{
+  position:absolute;left:14px;top:14px;bottom:auto;right:auto;z-index:26;display:flex;align-items:center;gap:8px;
+  padding:6px 12px 6px 10px;border-radius:20px;background:rgba(0,0,0,.72);
+  font-size:12.5px;color:#dbe2ee;backdrop-filter:blur(6px);
+  opacity:0;transform:translateY(-6px);transition:.2s;pointer-events:none;
+}
+.busy.show{opacity:1;transform:none}
+.busy::before{
+  content:"";width:12px;height:12px;border-radius:50%;flex:none;
+  border:2px solid rgba(255,255,255,.25);border-top-color:var(--accent);
+  animation:sp .8s linear infinite;
+}
+
+/* 快轉／倒退鍵上的秒數 */
+.ib.skip{position:relative}
+.ib.skip i{
+  position:absolute;left:0;right:0;top:50%;transform:translateY(-42%);
+  font:700 8.5px/1 ui-monospace,Consolas,monospace;font-style:normal;
+  text-align:center;pointer-events:none;
+}
+@media (prefers-reduced-motion:reduce){
+  .busy::before{animation:none}
+  .ctl,.pl-top,.busy{transition:none}
+}
