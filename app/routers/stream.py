@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 
 from .. import auth, db, ftpclient, hls, media
-from ..config import settings
+from ..config import IMAGE_DIR, settings
 
 log = logging.getLogger("filmax.stream")
 router = APIRouter()
@@ -153,6 +153,42 @@ def hls_segment(file_id: int, index: int, p: str = Query(default="")):
         raise HTTPException(500, str(e))
     return FileResponse(path, media_type="video/mp2t",
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+# --------------------------- 相片 ---------------------------
+@router.get("/photo/{photo_id}/thumb.jpg")
+def photo_thumb(photo_id: int):
+    r = db.q1("SELECT thumb FROM photo WHERE id=?", (photo_id,))
+    if not r or not r["thumb"]:
+        raise HTTPException(404, "沒有縮圖")
+    # thumb 是我們自己產生的 ph_<id>.jpg，不是使用者輸入，但還是擋一下路徑字元
+    name = str(r["thumb"])
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "非法檔名")
+    path = IMAGE_DIR / name
+    if not path.exists():
+        raise HTTPException(404, "縮圖不存在")
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+@router.get("/photo/{photo_id}/full")
+def photo_full(photo_id: int):
+    """原圖。直接從 FTP 串出去，不經過轉檔。"""
+    r = db.q1("SELECT ftp_path, filename, size, ext FROM photo WHERE id=?", (photo_id,))
+    if not r:
+        raise HTTPException(404, "找不到相片")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "webp": "image/webp", "gif": "image/gif"}.get((r["ext"] or "").lower(),
+                                                          "application/octet-stream")
+    try:
+        stream = ftpclient.FtpReadStream(r["ftp_path"], 0)
+    except ftpclient.FtpError as e:
+        raise HTTPException(502, str(e))
+    headers = {"Cache-Control": "public, max-age=86400"}
+    if r["size"]:
+        headers["Content-Length"] = str(r["size"])
+    return StreamingResponse(stream.iter_chunks(), media_type=mime, headers=headers)
 
 
 # --------------------------- 字幕 ---------------------------

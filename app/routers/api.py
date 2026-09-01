@@ -9,7 +9,7 @@ from fastapi import Depends, APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from .. import auth, db, ftpclient, hls, media, scanner
+from .. import auth, db, ftpclient, geo, hls, media, scanner, users
 from ..config import IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -42,8 +42,77 @@ def admin_only(request: Request) -> str:
 def me(request: Request):
     """前端拿來決定要不要顯示下載與管理功能。"""
     role = auth.role_of(request)
-    return {"role": role, "is_admin": role == auth.ADMIN,
-            "auth_enabled": settings.auth_enabled}
+    out = {"role": role, "is_admin": role == auth.ADMIN,
+           "auth_enabled": settings.auth_enabled,
+           "google_login": settings.google_enabled,
+           "uid": auth.user_id(request), "email": auth.user_email(request),
+           "display_name": None, "picture_url": None}
+    uid = auth.user_id(request)
+    if uid:
+        rec = users.by_id(uid) or {}
+        out["display_name"] = rec.get("display_name")
+        out["picture_url"] = rec.get("picture_url")
+    if out["is_admin"] and settings.google_enabled:
+        # 後台的小紅點：有幾個人在等審核
+        out["pending_users"] = users.counts().get("pending", 0)
+    return out
+
+
+# ------------------------- 帳號管理（限管理員） -------------------------
+class UserPatch(BaseModel):
+    status: Optional[str] = None
+    role: Optional[str] = None       # owner / viewer
+    note: Optional[str] = None
+
+
+def _last_owner(uid: int) -> bool:
+    """他是不是最後一個能用的管理員。
+
+    要擋住的是「管理員把自己停權／降級，結果整個服務沒有人有權限」的死局 ——
+    這種狀態沒有辦法從網頁介面救回來，只能去改資料庫。
+    """
+    rec = users.by_id(uid)
+    if not rec or rec.get("role") != users.OWNER or rec.get("status") != "approved":
+        return False
+    n = db.q1("SELECT COUNT(*) c FROM app_user WHERE role='owner' AND status='approved'")
+    return (n["c"] if n else 0) <= 1
+
+
+@router.get("/users")
+def user_list(status: Optional[str] = None, limit: int = 200,
+              _: str = Depends(admin_only)):
+    return {"items": users.listing(status, limit), "counts": users.counts(),
+            "google_login": settings.google_enabled}
+
+
+@router.patch("/users/{uid}")
+def user_patch(uid: int, p: UserPatch, request: Request, _: str = Depends(admin_only)):
+    rec = users.by_id(uid)
+    if not rec:
+        raise HTTPException(404, "找不到這個帳號")
+    if (p.status and p.status != "approved") or (p.role and p.role != users.OWNER):
+        if _last_owner(uid):
+            raise HTTPException(400, "這是最後一個管理員，不能停權或降級")
+    try:
+        if p.role is not None:
+            rec = users.set_role(uid, p.role)
+        if p.status is not None:
+            rec = users.set_status(uid, p.status, by=auth.identity(request))
+        if p.note is not None:
+            rec = users.set_note(uid, p.note)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return rec
+
+
+@router.delete("/users/{uid}")
+def user_delete(uid: int, _: str = Depends(admin_only)):
+    if not users.by_id(uid):
+        raise HTTPException(404, "找不到這個帳號")
+    if _last_owner(uid):
+        raise HTTPException(400, "這是最後一個管理員，不能刪除")
+    users.delete(uid)
+    return {"ok": True}
 
 
 @router.get("/library")
@@ -307,11 +376,10 @@ class Prefs(BaseModel):
 
 
 def _prefs_key(request: Request) -> str:
-    """設定先照角色分開存。
-
-    在有真正的帳號之前，至少別讓唯讀使用者把管理員的字幕大小、快轉秒數蓋掉 ——
-    以前是全站共用一份。等 Google 登入接上就改成每人一份。
-    """
+    """設定的存放位置：有帳號就每人一份，只有密碼登入時退回照角色分。"""
+    uid = auth.user_id(request)
+    if uid:
+        return f"player_prefs:u{uid}"
     return f"player_prefs:{auth.role_of(request)}"
 
 
@@ -454,6 +522,90 @@ def reprobe(file_id: int, _: str = Depends(admin_only)):
     scanner._probe_one(dict(row))
     r = db.q1("SELECT probe_state, probe_error, play_mode, duration FROM media_file WHERE id=?", (file_id,))
     return dict(r)
+
+
+# ------------------------------- 相片庫 -------------------------------
+@router.get("/photos")
+def photos(folder: Optional[str] = None, q: Optional[str] = None,
+           sort: str = "taken", page: int = 1, page_size: int = 60):
+    """相片列表。folder 給了就只看那個資料夾。"""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    where, params = ["probe_state='ok'"], []
+    if folder:
+        where.append("folder=?")
+        params.append(folder)
+    if q:
+        where.append("(filename LIKE ? OR folder LIKE ?)")
+        params += [f"%{q}%", f"%{q}%"]
+    sql_where = " WHERE " + " AND ".join(where)
+    # 排序走白名單，使用者輸入不會進到 SQL
+    order = {"taken": "COALESCE(taken_at, mtime) DESC, id DESC",
+             "name": "filename COLLATE NOCASE",
+             "size": "size DESC",
+             "added": "added_at DESC, id DESC"}.get(sort, "COALESCE(taken_at, mtime) DESC, id DESC")
+    total = db.q1(f"SELECT COUNT(*) c FROM photo{sql_where}", tuple(params))["c"]
+    rows = db.q(f"""SELECT id, folder, filename, ext, size, mtime, width, height,
+                           taken_at, thumb
+                    FROM photo{sql_where} ORDER BY {order} LIMIT ? OFFSET ?""",
+                tuple(params) + (page_size, (page - 1) * page_size))
+    return {"total": total, "page": page, "page_size": page_size,
+            "items": [db.row_to_dict(r) for r in rows]}
+
+
+@router.get("/photos/folders")
+def photo_folders():
+    """有相片的資料夾清單，附張數與代表縮圖。"""
+    rows = db.q("""SELECT folder, COUNT(*) c, MAX(COALESCE(taken_at, mtime)) latest,
+                          MIN(COALESCE(taken_at, mtime)) earliest,
+                          SUM(size) bytes,
+                          (SELECT thumb FROM photo p2
+                            WHERE p2.folder = p.folder AND p2.thumb IS NOT NULL
+                            ORDER BY COALESCE(p2.taken_at, p2.mtime) DESC LIMIT 1) cover
+                   FROM photo p WHERE probe_state='ok'
+                   GROUP BY folder ORDER BY latest DESC""")
+    return {"items": [db.row_to_dict(r) for r in rows]}
+
+
+@router.get("/photos/stats")
+def photo_stats():
+    def c(sql):
+        return db.q1(sql)["c"]
+    return {
+        "total": c("SELECT COUNT(*) c FROM photo WHERE probe_state='ok'"),
+        "pending": c("SELECT COUNT(*) c FROM photo WHERE probe_state='pending'"),
+        "failed": c("SELECT COUNT(*) c FROM photo WHERE probe_state='failed'"),
+        "folders": c("SELECT COUNT(DISTINCT folder) c FROM photo WHERE probe_state='ok'"),
+        "bytes": db.q1("SELECT COALESCE(SUM(size),0) c FROM photo")["c"],
+    }
+
+
+@router.get("/photos/{photo_id}")
+def photo_detail(photo_id: int):
+    r = db.q1("SELECT * FROM photo WHERE id=?", (photo_id,))
+    if not r:
+        raise HTTPException(404, "找不到相片")
+    d = db.row_to_dict(r) or {}
+    d["download_url"] = f"/api/photo/{photo_id}/full"
+    d["thumb_url"] = f"/api/photo/{photo_id}/thumb.jpg" if d.get("thumb") else None
+    return d
+
+
+@router.get("/audit/logins")
+def audit_logins(limit: int = 100, _: str = Depends(admin_only)):
+    """最近的登入紀錄，含來源 IP 與 Cloudflare 判斷的位置。"""
+    limit = max(1, min(int(limit), 500))
+    rows = db.q("""SELECT at, event, role, ip, country, region, city, timezone,
+                          latitude, longitude, user_agent, email, user_id, detail
+                   FROM login_audit ORDER BY at DESC LIMIT ?""", (limit,))
+    out = []
+    for r in rows:
+        d = db.row_to_dict(r) or {}
+        d["where"] = geo.describe(d)
+        out.append(d)
+    return {"items": out,
+            # 位置標頭要在 Cloudflare 後台開 Managed Transforms 才會送
+            "geo_available": any(x.get("country") for x in out)}
 
 
 @router.get("/diagnostics")

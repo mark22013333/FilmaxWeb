@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
-from . import db, ftpclient, media, nameparser
+from . import db, ftpclient, media, nameparser, photo
 from .config import settings
 from .scraper import normalize_details, tmdb
 
@@ -29,6 +29,9 @@ class ScanStatus:
     scraped: int = 0
     probed: int = 0
     probe_total: int = 0
+    photos_found: int = 0
+    photos_read: int = 0
+    photo_total: int = 0
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     error: str = ""
@@ -81,6 +84,12 @@ def _run(full: bool) -> None:
             return
         status.phase = "probing"
         _probe_files(force=full)
+        if _cancel.is_set():
+            status.phase = "cancelled"
+            return
+        # 相片放最後：影片是主要用途，先讓它可以播
+        status.phase = "photos"
+        _read_photos()
         status.phase = "done"
         status.note("掃描完成")
     except Exception as e:  # pragma: no cover
@@ -98,6 +107,7 @@ def _run(full: bool) -> None:
 # --------------------------------------------------------------------------
 def _scan_files() -> None:
     seen_paths: List[str] = []
+    seen_photos: List[str] = []
     subtitle_map: Dict[str, List[ftpclient.FtpEntry]] = {}
 
     for root in settings.library_roots:
@@ -107,7 +117,7 @@ def _scan_files() -> None:
                 return
             status.dirs_seen += 1
             status.current = cur
-            vids = [f for f in files if f.ext in ftpclient.VIDEO_EXTS and f.size >= settings.min_file_mb * 1024 * 1024]
+            vids = [f for f in files if _wanted(f)]
             subs = [f for f in files if f.ext in ftpclient.SUBTITLE_EXTS]
             if subs:
                 subtitle_map[cur] = subs
@@ -116,6 +126,11 @@ def _scan_files() -> None:
                 seen_paths.append(f.path)
                 _index_file(f, root)
 
+            for f in files:
+                if _wanted_photo(f):
+                    seen_photos.append(f.path)
+                    _index_photo(f)
+
     # 標記已消失的檔案
     if seen_paths and not _cancel.is_set():
         with db.tx() as conn:
@@ -123,9 +138,108 @@ def _scan_files() -> None:
             conn.execute("DELETE FROM _seen")
             conn.executemany("INSERT OR IGNORE INTO _seen(p) VALUES(?)", [(p,) for p in seen_paths])
             conn.execute("DELETE FROM media_file WHERE ftp_path NOT IN (SELECT p FROM _seen)")
+    if seen_photos and not _cancel.is_set():
+        with db.tx() as conn:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _seenp(p TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM _seenp")
+            conn.executemany("INSERT OR IGNORE INTO _seenp(p) VALUES(?)", [(p,) for p in seen_photos])
+            conn.execute("DELETE FROM photo WHERE ftp_path NOT IN (SELECT p FROM _seenp)")
             conn.execute("DELETE FROM media_item WHERE id NOT IN (SELECT DISTINCT item_id FROM media_file WHERE item_id IS NOT NULL)")
     db.kv_set("external_subtitles", {k: [s.path for s in v] for k, v in subtitle_map.items()})
     status.note(f"索引完成：{status.files_found} 個影片檔，新增 {status.files_new} 個")
+
+
+def _wanted_photo(f) -> bool:
+    """圖片要不要收進相片庫。
+
+    副檔名排除清單對圖片一樣有效，但**大小門檻不套用** —— MIN_FILE_MB 是
+    為了濾掉預告片與樣本檔而設的（預設 50MB），拿來套在照片上會把幾乎
+    所有圖片都濾掉。改用一個小很多的門檻，濾掉圖示與版面用的小圖。
+    """
+    ext = (f.ext or "").lower()
+    if ext not in ftpclient.IMAGE_EXTS:
+        return False
+    if ext in settings.exclude_exts:
+        return False
+    only = settings.only_exts
+    if only and ext not in only:
+        return False
+    return f.size >= settings.min_photo_kb * 1024
+
+
+def _wanted(f) -> bool:
+    """這個檔案要不要收進媒體庫。
+
+    順序是刻意的：先看副檔名限制，再看大小。排除清單優先於白名單 ——
+    兩邊都寫到同一個副檔名時，使用者的意思幾乎都是「不要」。
+    """
+    ext = (f.ext or "").lower()
+    if ext not in ftpclient.VIDEO_EXTS:
+        return False
+    if ext in settings.exclude_exts:
+        return False
+    only = settings.only_exts
+    if only and ext not in only:
+        return False
+    return f.size >= settings.min_file_mb * 1024 * 1024
+
+
+def _index_photo(entry: ftpclient.FtpEntry) -> None:
+    """把圖片登記進相片庫。真正讀 EXIF 與產縮圖是後面那一輪做的。"""
+    existing = db.q1("SELECT id, size FROM photo WHERE ftp_path=?", (entry.path,))
+    if existing and (existing["size"] or 0) == entry.size:
+        db.execute("UPDATE photo SET seen_at=? WHERE id=?", (db.now(), existing["id"]))
+        return
+    folder = posixpath.dirname(entry.path) or "/"
+    if existing:
+        db.execute("""UPDATE photo SET size=?, mtime=?, probe_state='pending',
+                          probe_error=NULL, seen_at=? WHERE id=?""",
+                   (entry.size, entry.mtime, db.now(), existing["id"]))
+    else:
+        db.execute("""INSERT INTO photo(ftp_path, folder, filename, ext, size, mtime,
+                                        probe_state, seen_at, added_at)
+                      VALUES(?,?,?,?,?,?,'pending',?,?)""",
+                   (entry.path, folder, entry.name, (entry.ext or "").lower(),
+                    entry.size, entry.mtime, db.now(), db.now()))
+    status.photos_found += 1
+
+
+def _read_photos() -> None:
+    """把還沒讀過的相片抓下來讀 EXIF 並產縮圖。
+
+    圖片檔小，整個抓下來比做 Range 請求單純，也才讀得到尾端的 EXIF。
+    但還是要有上限：FTP 上偶爾會出現幾百 MB 的 TIFF 或掃描檔。
+    """
+    rows = db.q("SELECT id, ftp_path, size FROM photo WHERE probe_state!='ok' ORDER BY id")
+    status.photo_total = len(rows)
+    limit = settings.max_photo_mb * 1024 * 1024
+    for r in rows:
+        if _cancel.is_set():
+            return
+        pid, path, size = r["id"], r["ftp_path"], r["size"] or 0
+        try:
+            if size > limit:
+                raise ValueError(f"檔案過大（{size / 1048576:.0f} MB，上限 {settings.max_photo_mb} MB）")
+            stream = ftpclient.FtpReadStream(path, 0)
+            data = b"".join(stream.iter_chunks(limit=limit))
+            info = photo.read_info(data)
+            if not info["width"]:
+                raise ValueError("不是能辨識的圖片格式")
+            thumb = photo.make_thumb(data, f"ph_{pid}.jpg")
+            db.execute("""UPDATE photo SET width=?, height=?, format=?, mode=?,
+                              taken_at=?, camera=?, lens=?, exposure=?, aperture=?,
+                              iso=?, focal_len=?, orientation=?, thumb=?,
+                              probe_state='ok', probe_error=NULL WHERE id=?""",
+                       (info["width"], info["height"], info["format"], info["mode"],
+                        info["taken_at"], info["camera"], info["lens"], info["exposure"],
+                        info["aperture"], info["iso"], info["focal_len"],
+                        info["orientation"], thumb, pid))
+        except Exception as e:
+            db.execute("UPDATE photo SET probe_state='failed', probe_error=? WHERE id=?",
+                       (str(e)[:300], pid))
+            log.warning("讀相片失敗 %s: %s", path, e)
+        finally:
+            status.photos_read += 1
 
 
 def _index_file(entry: ftpclient.FtpEntry, root) -> None:

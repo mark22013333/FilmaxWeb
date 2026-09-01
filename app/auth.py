@@ -134,6 +134,74 @@ def check_token(token: Optional[str]) -> bool:
     return read_token(token) is not None
 
 
+# ---------------------------------------------------------------- Google 帳號 session
+# 密碼登入的 token 是 "role.exp.sig"（3 段）；帳號登入是 "u.uid.exp.sig"（4 段）。
+# 段數不同就分得開，不必再加版本旗標。
+class Session:
+    __slots__ = ("role", "uid", "email")
+
+    def __init__(self, role: str, uid: Optional[int] = None, email: str = ""):
+        self.role, self.uid, self.email = role, uid, email
+
+
+def _sign_user(uid: int, exp: int, sess_ver: int, db_role: str) -> str:
+    """簽章內容綁住這個人當下的角色與 sess_ver。
+
+    綁 sess_ver 的用意：停權或降權時把 sess_ver +1，對方手上那張 token
+    的簽章就對不起來了，立刻失效。不然「拔掉權限」要等到 token 過期才算數，
+    等於出事的時候沒有煞車。
+    """
+    payload = f"{_TOKEN_VER}|u|{uid}|{exp}|{_session_epoch()}|{sess_ver}|{db_role}".encode()
+    sig = hmac.new(_secret(), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+
+def make_user_token(uid: int, days: Optional[int] = None) -> str:
+    from . import users
+    st = users.session_state(int(uid))
+    if not st:
+        raise ValueError("使用者不存在")
+    exp = int(time.time()) + int((days if days is not None else settings.session_days) * 86400)
+    return f"u.{int(uid)}.{exp}.{_sign_user(int(uid), exp, int(st.get('sess_ver') or 0), st.get('role') or '')}"
+
+
+def _read_user_token(parts: list) -> Optional["Session"]:
+    from . import users
+    _, uid_s, exp_s, sig_s = parts
+    if not uid_s.isdigit() or len(uid_s) > 12:
+        return None
+    if not exp_s.isdigit() or len(exp_s) > 12:
+        return None
+    if int(exp_s) < time.time():
+        return None
+    if not sig_s.isascii():
+        return None
+    st = users.session_state(int(uid_s))
+    if not st:
+        return None
+    want = _sign_user(int(uid_s), int(exp_s), int(st.get("sess_ver") or 0), st.get("role") or "")
+    if not hmac.compare_digest(sig_s, want):
+        return None
+    # 簽章對了還要看狀態：被停權或退回待審核的人不能繼續用舊 token。
+    if st.get("status") != "approved":
+        return None
+    return Session(users.role_to_auth(st.get("role") or ""), int(uid_s), st.get("email") or "")
+
+
+def read_session(token: Optional[str]) -> Optional["Session"]:
+    """驗證 cookie，回傳 Session（密碼登入時 uid 為 None），失敗回 None。"""
+    try:
+        if not token:
+            return None
+        parts = token.split(".")
+        if len(parts) == 4 and parts[0] == "u":
+            return _read_user_token(parts)
+        role = read_token(token)
+        return Session(role) if role else None
+    except Exception:
+        return None
+
+
 def role_for_password(pw: str) -> Optional[str]:
     """輸入的密碼對應哪個角色。比對兩組都走 compare_digest，避免時序差異。"""
     matched = None
@@ -278,10 +346,16 @@ def clear_failures(ip: str) -> None:
 # ---------------------------------------------------------------- ASGI 中介層
 # 不用 BaseHTTPMiddleware：它會包住 response body，對 Range 串流和 HLS 分段
 # 這種大量串流輸出不理想。純 ASGI 中介層只看 request，完全不碰回應內容。
-PUBLIC_PATHS = ("/login", "/logout", "/healthz", "/static/", "/favicon.ico")
+PUBLIC_PATHS = ("/login", "/logout", "/healthz", "/static/", "/favicon.ico",
+                "/auth/google/")
+
+# 沒開驗證時，外部連線一律擋掉，只有這幾條例外
+OPEN_GUARD_ALLOW = ("/healthz", "/favicon.ico")
 
 # 中介層驗證完把角色掛在 scope 上，路由再從這裡讀
 ROLE_KEY = "filmax_role"
+USER_KEY = "filmax_uid"        # Google 帳號登入才有；密碼登入是 None
+EMAIL_KEY = "filmax_email"
 
 
 def role_of(request) -> str:
@@ -294,6 +368,21 @@ def is_admin(request) -> bool:
     return role_of(request) == ADMIN
 
 
+def user_id(request) -> Optional[int]:
+    scope = getattr(request, "scope", request)
+    return scope.get(USER_KEY)
+
+
+def user_email(request) -> str:
+    scope = getattr(request, "scope", request)
+    return scope.get(EMAIL_KEY) or ""
+
+
+def identity(request) -> str:
+    """給稽核紀錄用的一行身分：有帳號就用 email，沒有就用角色名。"""
+    return user_email(request) or f"({role_of(request)})"
+
+
 class AuthMiddleware:
     def __init__(self, app):
         self.app = app
@@ -302,7 +391,17 @@ class AuthMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         if not settings.auth_enabled:
-            # 沒開驗證時大家都是管理員，行為跟以前一樣
+            # 沒開驗證時，區網內的人都是管理員 —— 這是原本的區網用法。
+            #
+            # 但外面來的連線一律擋掉。把服務接上 Cloudflare Tunnel 或反向代理
+            # 卻忘了打開 AUTH_ENABLED，整個媒體庫就會對全世界敞開，而且每個
+            # 訪客都是管理員：可以下載原始檔、瀏覽 FTP、觸發掃描。
+            # 這種失誤不該只靠人記得，所以在這裡擋死。
+            # /healthz 要放行，否則外部的監控會把「設定沒做好」誤判成服務掛掉
+            if (scope.get("path", "") not in OPEN_GUARD_ALLOW
+                    and not is_local_network(client_ip(scope))):
+                await self._deny_open(scope, send)
+                return
             scope[ROLE_KEY] = ADMIN
             return await self.app(scope, receive, send)
 
@@ -338,12 +437,39 @@ class AuthMiddleware:
                 token = val
                 break
 
-        role = read_token(token)
-        if role:
-            scope[ROLE_KEY] = role
+        sess = read_session(token)
+        if sess:
+            scope[ROLE_KEY] = sess.role
+            scope[USER_KEY] = sess.uid
+            scope[EMAIL_KEY] = sess.email
             return await self.app(scope, receive, send)
 
         await self._deny(scope, send, path)
+
+    async def _deny_open(self, scope, send) -> None:
+        """沒開驗證卻被外部存取 —— 明講原因，不要讓人以為是壞掉。"""
+        ip = client_ip(scope)
+        log.error("擋下外部連線 %s：AUTH_ENABLED=false。"
+                  "服務已經對外開放但沒有登入驗證，請在 .env 設定 "
+                  "AUTH_ENABLED=true 與 AUTH_PASSWORD 後重新啟動。", ip)
+        body = (
+            "<!doctype html><meta charset=utf-8>"
+            "<title>尚未設定登入驗證</title>"
+            "<style>body{font:15px/1.7 system-ui,sans-serif;max-width:640px;"
+            "margin:12vh auto;padding:0 24px;color:#222}code{background:#f2f2f2;"
+            "padding:2px 6px;border-radius:4px}</style>"
+            "<h2>這個服務尚未設定登入驗證</h2>"
+            "<p>為了避免整個媒體庫對外公開，來自外部網路的連線已被拒絕。</p>"
+            "<p>若這是你的服務，請在 <code>.env</code> 設定："
+            "<br><code>AUTH_ENABLED=true</code>"
+            "<br><code>AUTH_PASSWORD=你的密碼</code>"
+            "<br>然後重新啟動。</p>"
+        ).encode("utf-8")
+        await send({"type": "http.response.start", "status": 403,
+                    "headers": [(b"content-type", b"text/html; charset=utf-8"),
+                                (b"content-length", str(len(body)).encode()),
+                                (b"cache-control", b"no-store")]})
+        await send({"type": "http.response.body", "body": body})
 
     async def _deny(self, scope, send, path: str) -> None:
         wants_html = path.startswith(("/player", "/")) and not path.startswith("/api/")

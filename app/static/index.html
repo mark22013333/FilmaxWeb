@@ -15,6 +15,7 @@
     <button data-kind="" class="on">全部</button>
     <button data-kind="movie">電影</button>
     <button data-kind="tv">影集</button>
+    <button data-kind="photo">相片</button>
   </nav>
   <div class="spacer"></div>
   <div class="search">
@@ -23,6 +24,9 @@
   </div>
   <button class="btn" id="btnScan">掃描媒體庫</button>
   <button class="btn" id="btnStats" title="狀態">ⓘ</button>
+  <button class="btn" id="btnAccount" title="帳號">
+    <span id="acctBadge" class="badge" hidden></span><span id="acctName">帳號</span>
+  </button>
 </header>
 
 <div class="toolbar">
@@ -40,7 +44,24 @@
   <div class="section-title" id="libTitle">媒體庫 <span id="libCount"></span></div>
   <div class="grid" id="grid"></div>
   <div id="pager"></div>
+
+  <!-- 相片牆。跟影片共用同一塊區域，切分頁時互相顯示/隱藏 -->
+  <div id="photoView" hidden>
+    <div class="folder-bar" id="folderBar"></div>
+    <div class="section-title" id="photoTitle">相片 <span id="photoCount"></span></div>
+    <div class="pgrid" id="pgrid"></div>
+    <div id="ppager"></div>
+  </div>
 </main>
+
+<!-- 燈箱：看大圖與拍攝資訊 -->
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" id="lbClose" title="關閉 (Esc)">×</button>
+  <button class="lb-nav prev" id="lbPrev" title="上一張 (←)">‹</button>
+  <button class="lb-nav next" id="lbNext" title="下一張 (→)">›</button>
+  <div class="lb-stage"><img id="lbImg" alt=""></div>
+  <div class="lb-info" id="lbInfo"></div>
+</div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 

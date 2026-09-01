@@ -20,21 +20,36 @@
   button[type=submit]:hover{background:var(--accent-2)}
   .err{background:#241618;border:1px solid #5c2b2b;color:#ffb0b0;border-radius:9px;
        padding:10px 12px;font-size:13px;margin-bottom:16px;text-align:center}
+  .gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;
+       padding:11px;border-radius:9px;background:#fff;color:#1f1f1f;font-weight:700;
+       font-size:14px;text-decoration:none;border:1px solid #dadce0;transition:.15s}
+  .gbtn:hover{background:#f4f5f7}
+  .sep{display:flex;align-items:center;gap:10px;margin:18px 0;color:var(--dim);font-size:12px}
+  .sep::before,.sep::after{content:'';flex:1;height:1px;background:var(--line)}
 </style>
 </head>
 <body>
 <form class="box" method="post" action="/login">
   <div class="brand"><i>F</i>FilmaxWeb</div>
-  <p>請輸入密碼</p>
+  <p>請登入後使用</p>
   <div class="err" id="err">{{ERROR}}</div>
-  <label for="pw">密碼</label>
-  <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
+  {{GOOGLE}}
+  <div class="pwpart">
+    <div class="sep" id="sep">或</div>
+    <label for="pw">密碼</label>
+    <input id="pw" type="password" name="password" autocomplete="current-password" required>
+    <button type="submit">登入</button>
+  </div>
   <input type="hidden" name="next" value="{{NEXT}}">
-  <button type="submit">登入</button>
 </form>
 <script>
   const e = document.getElementById('err');
   if (!e.textContent.trim()) e.style.display = 'none';
+  // 沒有 Google 按鈕時「或」這條分隔線就是多餘的
+  const sep = document.getElementById('sep');
+  if (sep && !document.querySelector('.gbtn')) sep.style.display = 'none';
+  const pw = document.getElementById('pw');
+  if (pw && pw.offsetParent !== null && !document.querySelector('.gbtn')) pw.focus();
 </script>
 </body>
 </html>

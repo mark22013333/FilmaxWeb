@@ -1,5 +1,9 @@
 # FilmaxWeb 資料庫
 
+> **資料庫位址不寫在版控裡。** `flyway.conf` 只有 `your-db-host` 佔位字串；
+> 真實位址由 `migrate.bat` 第一次執行時詢問，寫進 `flyway.local.conf`，
+> 那個檔案已被 `.gitignore` 排除。要換位址就把它刪掉重跑。
+
 使用者帳號存在 MSSQL，結構異動一律走 Flyway。
 
 ## 在哪裡跑？

@@ -250,6 +250,20 @@ def list_dir(path: str) -> List[FtpEntry]:
         return out2
 
 
+def _skip_dir(name: str) -> bool:
+    """這個資料夾要不要整個跳過。
+
+    三道：內建的垃圾目錄清單、隱藏目錄、使用者自訂的名稱前綴。
+    比對的是資料夾「名稱」而非完整路徑，所以同名資料夾放在哪一層都會被跳過。
+    整個子樹都不會被走訪 —— 這正是重點：省下的是整棵樹的列目錄時間。
+    """
+    low = name.lower()
+    if low in SKIP_DIRS or name.startswith("."):
+        return True
+    prefixes = settings.exclude_dir_prefixes
+    return bool(prefixes and low.startswith(prefixes))
+
+
 def walk(root: str, max_depth: int = 8, on_dir=None) -> Iterator[Tuple[str, List[FtpEntry], List[FtpEntry]]]:
     """遞迴走訪。yield (目前路徑, 子目錄清單, 檔案清單)。"""
     stack: List[Tuple[str, int]] = [("/" + root.strip("/") if root.strip("/") else "/", 0)]
@@ -266,7 +280,7 @@ def walk(root: str, max_depth: int = 8, on_dir=None) -> Iterator[Tuple[str, List
         except Exception as e:
             log.warning("列目錄失敗 %s: %s", cur, e)
             continue
-        dirs = [e for e in entries if e.is_dir and e.name.lower() not in SKIP_DIRS and not e.name.startswith(".")]
+        dirs = [e for e in entries if e.is_dir and not _skip_dir(e.name)]
         files = [e for e in entries if not e.is_dir]
         yield cur, dirs, files
         if depth < max_depth:

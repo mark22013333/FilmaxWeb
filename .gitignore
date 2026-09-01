@@ -7,6 +7,8 @@
 .env.local
 data/
 *.key
+# 真實資料庫位址寫在這裡，不進版控。flyway.conf 只放佔位字串。
+db/flyway.local.conf
 
 # Python
 .venv/

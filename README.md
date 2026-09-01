@@ -79,6 +79,11 @@ TMDB_API_KEY=你的金鑰
 TMDB_LANGUAGE=zh-TW
 
 MIN_FILE_MB=50              # 小於這個大小的檔案不收錄（濾掉預告片/樣本檔）
+SCAN_EXCLUDE_DIR_PREFIXES=_,temp  # 略過名稱以這些開頭的資料夾（整棵子樹）
+SCAN_EXCLUDE_EXTS=iso,ts    # 掃描時略過這些副檔名（大小寫不分，加不加點都行）
+SCAN_ONLY_EXTS=             # 只收這些副檔名，留空=不限制
+MIN_PHOTO_KB=40             # 小於這個大小的圖片不收（濾掉圖示）
+MAX_PHOTO_MB=80             # 超過這個大小的圖片不讀
 FFMPEG_HWACCEL=nvenc        # NVIDIA 獨顯。也可填 auto 讓程式自己實測挑一個
 TRANSCODE_MAX_HEIGHT=1080   # 4K 片源轉成 1080p 播，省 CPU 也省頻寬
 PORT=8080
@@ -86,10 +91,29 @@ PORT=8080
 AUTH_ENABLED=true
 AUTH_PASSWORD=管理員密碼      # 完整權限
 VIEWER_PASSWORD=唯讀密碼      # 只能看與播，要分享給別人就給這組
+
+# Google 帳號登入（可選）。設了之後登入頁會多一顆「使用 Google 帳號登入」，
+# 密碼登入仍然保留；只填這一段不設密碼，就是純帳號制。
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+PUBLIC_BASE_URL=https://video.example.com
+GOOGLE_ADMIN_EMAILS=你的Gmail  # 第一個管理員，沒設的話所有人都會卡在待審核
 ```
 
 完整清單看 `.env.example`，每一項都有註解。**版本更新後記得回頭看一次**，
 可能有新增的設定項目。
+
+> 資料庫、海報快取與轉碼分段預設放在專案底下的 `data/`。轉碼快取會長到好幾 GB，
+> 想搬到別的磁碟就設**環境變數** `FILMAX_DATA_DIR`（要真的設在環境變數，
+> 不能寫在 `.env` —— 路徑在載入 `.env` 之前就要決定好）。
+
+`SCAN_EXCLUDE_DIR_PREFIXES` 比對的是**資料夾名稱的開頭**（不是完整路徑），
+所以同名資料夾放在哪一層都會被跳過，而且是**整棵子樹都不走訪** ——
+省下的是列目錄的時間，不只是過濾檔案。設 `_,temp` 的話 `_old`、`TempWork`
+都會被跳過；注意前綴比對的必然結果是 `Temperature` 這種也會中。
+
+除此之外，`@eaDir`、`#recycle`、`sample`、`BDMV` 等常見的雜訊目錄
+與所有 `.` 開頭的隱藏目錄本來就會跳過，不必自己設定。
 
 `LIBRARY_ROOTS` 的類型欄位很有用：標成 `tv` 的目錄即使檔名沒有 `S01E01`，也會被當影集處理；
 標成 `auto` 就交給檔名解析器自己判斷。
@@ -200,9 +224,16 @@ filmax-web/
    ├─ hls.py                隨選分段轉碼與快取
    ├─ scanner.py            掃描流程編排
    ├─ auth.py               登入驗證、角色、session token、來源 IP 判斷
-   ├─ routers/api.py        媒體庫 API
+   ├─ oauth.py              Google OAuth：state/nonce/PKCE、id_token 驗證
+   ├─ users.py              使用者帳號（欄位對齊 MSSQL 的 filmax_users）
+   ├─ geo.py                從 Cloudflare 標頭取來源位置
+   ├─ photo.py              圖片尺寸與 EXIF（刻意不讀 GPS）、縮圖
+   ├─ routers/api.py        媒體庫 API、帳號審核 API
+   ├─ routers/auth_google.py  /auth/google/start 與 /callback
    ├─ routers/stream.py     串流 / HLS / 字幕端點
    └─ static/               海報牆、播放器前端（含 hls.js）
+
+cloudflare/                 Cloudflare Tunnel 設定腳本與說明
 
 db/                         MSSQL 使用者資料表（第三期用）
 ├─ 00_create_database.sql   建立資料庫與兩組帳號
@@ -210,6 +241,7 @@ db/                         MSSQL 使用者資料表（第三期用）
 └─ sql/V*.sql               遷移檔
 
 e2e_test.py                 端對端測試（只用標準函式庫）
+tests/oauth_test.py         Google 登入的端對端與攻擊面測試
 安裝.bat                     一鍵安裝：Python、ffmpeg、venv、套件
 ```
 
@@ -230,7 +262,7 @@ ffmpeg 只看到一個支援 Range 的乾淨 HTTP 來源，可以任意 seek。
 
 | 端點 | 說明 | |
 |---|---|---|
-| `GET /api/me` | 目前登入者的角色 | |
+| `GET /api/me` | 目前登入者：角色、email、頭像、待審核人數 | |
 | `GET /api/library?kind=&genre=&q=&sort=&page=` | 媒體庫列表 | |
 | `GET /api/items/{id}` | 詳情（影集含季/集/檔案） | |
 | `GET /api/play/{file_id}?h=&a=` | 播放資訊：模式、時長、音軌、字幕軌、續播位置。`h` 指定畫質、`a` 指定音軌 | |
@@ -238,7 +270,7 @@ ffmpeg 只看到一個支援 Range 的乾淨 HTTP 來源，可以任意 seek。
 | `GET /api/hls/{file_id}/index.m3u8?p=` | HLS 播放清單 | |
 | `GET /api/subtitle/{file_id}/embedded/{index}.vtt` | 內嵌字幕轉 WebVTT（邊抽邊送） | |
 | `GET /api/subtitle/{file_id}/external.vtt?path=` | 影片旁的外掛字幕轉 WebVTT | |
-| `GET /api/prefs` · `POST /api/prefs` | 播放器偏好（依角色分開存） | |
+| `GET /api/prefs` · `POST /api/prefs` | 播放器偏好（Google 帳號每人一份，密碼登入依角色分） | |
 | `POST /api/progress` · `GET /api/continue` | 播放進度與繼續觀看 | |
 | `GET /api/download/{file_id}` | 下載原始檔 | 🔒 |
 | `POST /api/scan` | 開始掃描（`?full=true` 全部重刮） | 🔒 |
@@ -248,7 +280,20 @@ ffmpeg 只看到一個支援 Range 的乾淨 HTTP 來源，可以任意 seek。
 | `GET /api/ftp/browse?path=` | 瀏覽 FTP 目錄（限 `LIBRARY_ROOTS` 之內） | 🔒 |
 | `GET /api/diagnostics` | ffmpeg / FTP / TMDB 一次檢查 | 🔒 |
 | `POST /api/cache/clear` | 清除轉碼與字幕快取 | 🔒 |
+| `GET /api/photos?folder=&q=&sort=&page=` | 相片列表 | |
+| `GET /api/photos/folders` | 有相片的資料夾與張數 | |
+| `GET /api/photos/stats` | 相片庫統計 | |
+| `GET /api/photos/{id}` | 單張詳情（尺寸、EXIF） | |
+| `GET /api/photo/{id}/thumb.jpg` | 縮圖 | |
+| `GET /api/photo/{id}/full` | 原圖 | |
+| `GET /api/audit/logins?limit=` | 最近的登入紀錄（IP、位置、UA、email） | 🔒 |
 | `POST /api/session/revoke-all` | 讓所有裝置的登入立刻失效 | 🔒 |
+| `GET /api/users?status=` | 使用者清單與各狀態人數 | 🔒 |
+| `PATCH /api/users/{id}` | 核准／拒絕／停權、改角色、加備註 | 🔒 |
+| `DELETE /api/users/{id}` | 刪除帳號 | 🔒 |
+
+Google 登入另外有兩個不在 `/api` 底下的端點（不需登入即可存取）：
+`GET /auth/google/start?next=` 開始授權、`GET /auth/google/callback` 接 Google 的回呼。
 
 ---
 
@@ -274,6 +319,65 @@ SESSION_DAYS=30
 > 但它沒有瀏覽器的 cookie。程式在每次啟動時產生一組隨機 token，
 > **只有從 127.0.0.1 且帶著這組 token 的請求**才會被放行，其他一律要登入。
 
+### Google 帳號登入（審核制）
+
+密碼登入的問題是「一組密碼給很多人」：誰在看、什麼時候看、要收回某一個人的權限，
+全都做不到。設定 Google 登入之後，每個人有自己的帳號、自己的進度與偏好，
+權限可以單獨收回。
+
+```ini
+GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=xxx
+PUBLIC_BASE_URL=https://video.example.com
+GOOGLE_ADMIN_EMAILS=你的Gmail          # 第一個管理員
+GOOGLE_ALLOWED_DOMAINS=               # 限定網域，留空 = 任何 Google 帳號都能申請
+GOOGLE_AUTO_APPROVE=false             # 新帳號自動核准，對外開放時建議維持 false
+```
+
+**申請憑證**（Google Cloud Console）：
+
+1. 建立專案 → **API 和服務 → OAuth 同意畫面**，User type 選「外部」，
+   然後按 **發布應用程式**。留在「測試中」的話只有你加進測試名單的人能登入，
+   而且 refresh token 七天就過期。
+2. **憑證 → 建立憑證 → OAuth 用戶端 ID → 網頁應用程式**
+3. 「已授權的重新導向 URI」填 `PUBLIC_BASE_URL` + `/auth/google/callback`，
+   例如 `https://video.example.com/auth/google/callback`。
+   Google 只接受 **https**（`http://localhost` 例外），純 IP 位址一律不收，
+   而且必須一字不差 —— 結尾多一個斜線都會被拒。
+4. 把用戶端 ID 與密鑰貼進 `.env`，重新啟動。
+
+**設了 Google 登入就會自動打開 `AUTH_ENABLED`。** 不然會出現一個很糟的組合：
+登入頁上有 Google 按鈕，但中介層在 `AUTH_ENABLED=false` 時根本不驗證，
+等於前門上鎖、後門大開。
+
+**流程**：任何人都可以用 Google 帳號送出申請，但**預設不會放行** ——
+第一次登入只會看到「等待管理員核准」，看不到任何影片。管理員在右上角
+**帳號** 面板核准之後，對方用同一個帳號再登入一次就能進來，不必重新申請。
+
+`GOOGLE_ADMIN_EMAILS` 是**第一個管理員的唯一入口**。沒設的話所有人都會卡在待審核，
+而且沒有任何人有權限去核准 —— 服務啟動時偵測到這個狀況會印警告。
+名單裡的信箱一登入就是管理員且免審核；已經存在的帳號也會在下次登入時被提升
+（讓你可以「先登入、事後才想到要設名單」而不必去改資料庫）。
+
+**帳號狀態**：`pending`（待審核）→ `approved`（可用）／`rejected`／`disabled`。
+只有 `approved` 進得來，而且**每一個請求都會再確認一次**，不是只在發 cookie 的時候看。
+停權或降級會讓對方手上的 session **立刻失效**（角色與版本號都納入 token 簽章），
+不必等 30 天過期。
+
+> 最後一個管理員不能停權、不能降級、不能刪除。這不是體貼，是避免一個無法從
+> 網頁救回來的死局 —— 一旦沒有任何管理員，就只剩下去改資料庫一條路。
+
+**安全設計**：授權用 authorization code + PKCE(S256)；`state` 與 `nonce` 放在
+HMAC 簽章的短效 cookie 裡（10 分鐘），回呼時兩邊要對得上，擋掉 CSRF 與
+把 `id_token` 拿去重放。`id_token` 是我們自己用 client secret 直接向 Google 的
+token endpoint 換來的（TLS + 憑證驗證），依 OIDC Core 3.1.3.7 這種情形不必另外驗簽；
+但 `iss` / `aud` / `exp` / `nonce` / `email_verified` 一項都不會少。
+登入後的轉址目標只收單斜線開頭的站內路徑，`//host` 這類開放轉址會被丟掉。
+
+**記錄**：註冊當下與最近一次登入的 IP、國家、城市、User-Agent 都寫在帳號上，
+完整歷程在 `login_audit`（`GET /api/audit/logins`）。位置來自 Cloudflare 標頭，
+要在後台開 Managed Transforms 才會送。
+
 ### 遠端自動降畫質
 
 家用光纖的**上傳**頻寬通常遠小於下載，直接把 4K 原檔推出去一定會卡。
@@ -296,6 +400,7 @@ COOKIE_SECURE=false         # 對外開放時務必設 true
 | 項目 | 設定 |
 |---|---|
 | 密碼 | `AUTH_PASSWORD` 換成夠長的隨機字串；要分享看片就另設 `VIEWER_PASSWORD` |
+| Google 登入 | 用 `GOOGLE_ADMIN_EMAILS` 指定第一個管理員；`GOOGLE_AUTO_APPROVE` 維持 `false` |
 | 簽章金鑰 | 設 `AUTH_SECRET`，或確認 `data/secret.key` 存在且權限收好 |
 | Cookie | `COOKIE_SECURE=true` |
 | 代理標頭 | 前面真的有 cloudflared / nginx 才設 `TRUST_PROXY=true` |
@@ -305,22 +410,28 @@ COOKIE_SECURE=false         # 對外開放時務必設 true
 
 ### 兩種角色
 
-| | 管理員（`AUTH_PASSWORD`） | 唯讀（`VIEWER_PASSWORD`） |
+角色有兩種，跟你用哪種方式登入無關：密碼登入時由 `AUTH_PASSWORD` / `VIEWER_PASSWORD`
+決定，Google 登入時由帳號上的 `role` 決定（`owner` = 管理員、`viewer` = 唯讀）。
+
+| | 管理員（`AUTH_PASSWORD` / `owner`） | 唯讀（`VIEWER_PASSWORD` / `viewer`） |
 |---|---|---|
 | 瀏覽片庫、播放、字幕、續看進度 | ✅ | ✅ |
 | 下載原始檔 | ✅ | ❌ |
 | 瀏覽 FTP 目錄 | ✅ | ❌ |
 | 掃描、重新分析、重新刮削、清快取 | ✅ | ❌ |
 | 診斷資訊（FTP 位址、片庫路徑、硬體） | ✅ | ❌ |
+| 使用者審核與角色調整 | ✅ | ❌ |
 | 播放器設定（字幕外觀等） | 各自一份 | 各自一份 |
 
-要分享給別人看片，就給 `VIEWER_PASSWORD` 那組。留空就是不開放唯讀登入。
+要分享給別人看片，就給 `VIEWER_PASSWORD` 那組，或請對方用 Google 帳號申請再核准。
+`VIEWER_PASSWORD` 留空就是不開放唯讀密碼登入。
 
 角色是寫進 session token 並納入簽章的，改不了也偽造不了。介面上會隱藏唯讀
 使用者用不到的按鈕，但真正的把關在後端 —— 直接打 API 一樣會被擋（403）。
 
 **撤銷 session**：改掉某一組密碼，用那組密碼登入的既有 session 會自動失效
-（密碼指紋有納入簽章）。不想改密碼但要把所有人踢掉，用管理員身分打
+（密碼指紋有納入簽章）；Google 帳號則是停權或改角色就立刻失效。
+不想動任何設定但要把所有人一次踢掉，用管理員身分打
 `POST /api/session/revoke-all`。
 
 服務本身會送出這些安全標頭：CSP、`X-Frame-Options: DENY`、`X-Content-Type-Options`、
@@ -348,14 +459,83 @@ PGS、VobSub 這類**圖形字幕**是一張張圖片而不是文字，沒辦法
 > **用 Tailscale 的話注意**：它的 `100.64.0.0/10` 在 Python 眼中不算私有網段，
 > 預設會被判成遠端。想維持原畫質就設 `LOCAL_NETWORKS=100.64.0.0/10`。
 
-### 建議做法
+### 對外開放：Cloudflare Tunnel
 
-先用 **Tailscale / WireGuard** 而不是直接開 port —— 零攻擊面，設定也簡單。
-真的要公開網址再打開 `AUTH_ENABLED`，並放在有 HTTPS 的反向代理後面。
+想用自己的網域對外開放，走 **Cloudflare Tunnel** 是最省事也最安全的做法：
+不必在路由器開任何連接埠，你的機器在公網上沒有可掃到的入口，
+HTTPS 憑證與 DDoS 防護都由 Cloudflare 處理。
+
+設定方式看 [`cloudflare/README.md`](cloudflare/README.md)。有兩條路：
+從 Cloudflare 後台建立通道再拿權杖回來安裝（建議，不必跑瀏覽器授權），
+或用 `cloudflared tunnel login` 從指令列建立。兩個腳本都在 `cloudflare/`。
+
+跑完之後 `.env` 一定要改：
+
+```ini
+HOST=127.0.0.1        # 只讓同機的 cloudflared 連得到
+TRUST_PROXY=true      # 前面確實有代理時才開
+COOKIE_SECURE=true
+```
+
+`HOST` 留在 `0.0.0.0` 的話，區網裡的人仍可繞過 Cloudflare 直連，
+那條路徑沒有 WAF 也沒有 HTTPS。
+
+**沒開驗證時，外部連線會被直接擋掉。** `AUTH_ENABLED=false` 的情況下，
+只有來自區網／本機的連線可以使用（維持原本的區網用法），
+從外部進來的一律回 403 並說明原因。這是為了避免接上 Tunnel 或反向代理
+卻忘了打開驗證——那會讓整個媒體庫對外公開，而且每個訪客都是管理員。
+`/healthz` 不受影響，監控不會誤判。
+
+### 登入紀錄
+
+每次登入（成功、失敗、被鎖）都會寫進本機的 `login_audit`，含來源 IP、
+國家／地區／城市、時區、經緯度與 User-Agent。管理員可以打
+`GET /api/audit/logins` 查看。
+
+位置資訊來自 Cloudflare 的標頭，要在後台開
+**Rules → Managed Transforms → Add visitor location headers** 才會送。
+沒開的話只有國家，其餘顯示「位置未知」——那不是壞掉。
+
+> 經緯度是**城市中心點**，不是使用者的實際位置，精度大概到城市等級。
+
+### 不想公開網址的話
+
+**Tailscale / WireGuard** 仍然是最單純的選擇 —— 零對外攻擊面。
+用 Tailscale 時記得設 `LOCAL_NETWORKS=100.64.0.0/10`，否則會被判成遠端而降畫質。
 
 ---
 
-## 9. 播放器
+## 9. 相片庫
+
+掃描時會把 `LIBRARY_ROOTS` 底下的圖片（jpg / jpeg / png / webp）一併收進來，
+在首頁上方切到「相片」分頁瀏覽。依資料夾分組，點縮圖開燈箱看大圖，
+`←` `→` 翻頁、`Esc` 關閉。
+
+每張顯示：尺寸、格式、色彩模式、檔案大小、修改時間，以及 EXIF 裡的
+拍攝時間、相機、鏡頭、快門、光圈、ISO、焦距。沒有 EXIF 的圖會明講
+「這張圖沒有 EXIF」，而不是留一片空白。
+
+幾個實作上的決定：
+
+**不讀 GPS。** EXIF 的 GPSInfo 是拍攝者的實際座標，精度到公尺等級 ——
+相片一旦分享出去就等於公開了住家或行蹤。程式用**白名單**只讀需要的欄位，
+而不是「全讀再刪掉 GPS」：白名單漏掉東西只是少一格資訊，
+黑名單漏掉就是把座標寫進資料庫。原始檔案不會被修改，只是不讀進來。
+
+**尺寸回報的是「看到的」而不是「存的」。** 手機直式照片常常是以橫式像素
+加上 EXIF orientation 旗標存下來的。照原始像素顯示的話，介面會說 1200×800、
+使用者看到的卻是 800×1200。縮圖也會依 orientation 轉正。
+
+**圖片的大小門檻跟影片分開。** `MIN_FILE_MB` 預設 50MB 是為了濾掉預告片，
+套在照片上會把幾乎所有圖片濾掉，所以圖片改用 `MIN_PHOTO_KB`（預設 40KB）。
+
+> 唯讀角色看得到相片，但沒有「下載原圖」按鈕。要注意的是，
+> **看大圖本身就是在取得原始檔案** —— 相片不像影片可以只給轉碼串流，
+> 所以這個限制對相片來說主要是介面上的提示，不是真正的技術隔離。
+
+---
+
+## 10. 播放器
 
 自製播放器，沒有用瀏覽器原生控制列。字幕**不是**交給 `<track>`，
 而是自己解析 WebVTT 後用 DOM 畫出來 —— `::cue` 的跨瀏覽器支援很差，
@@ -390,7 +570,7 @@ PGS、VobSub 這類**圖形字幕**是一張張圖片而不是文字，沒辦法
 
 ---
 
-## 10. 端對端測試 (e2e_test.py)
+## 11. 端對端測試 (e2e_test.py)
 
 服務啟動後，隨時可以跑一遍完整鏈路檢查，逐層告訴你問題出在哪一環：
 
@@ -413,9 +593,22 @@ python e2e_test.py --base http://192.168.1.5:8080
 
 只用 Python 標準函式庫，不需要額外套件。網頁右上角 **ⓘ** 也有同一份診斷的摘要版。
 
+### Google 登入測試 (tests/oauth_test.py)
+
+登入流程沒辦法靠肉眼看出「安全」，所以另外有一份不連 Google 的端對端測試：
+
+```
+.venv\Scripts\python tests\oauth_test.py
+```
+
+它會用暫存資料夾當資料庫（跑完就刪，不會動到你的 `data/`），自己扮演 Google
+回傳 `id_token`，然後驗 58 項：完整的申請→審核→登入流程、停權與降級是否立刻生效、
+最後一個管理員的保護，以及 `state` 不符／`nonce` 重放／`aud` 不對／`iss` 造假／
+`id_token` 過期／email 未驗證／竄改 state cookie／開放轉址／畸形輸入不能變成 500。
+
 ---
 
-## 11. 疑難排解
+## 12. 疑難排解
 
 **播放時出現「分析失敗：[WinError 2] 系統找不到指定的檔案」**
 → 這是找不到 `ffprobe`。注意 **ffmpeg 和 ffprobe 是兩支獨立的執行檔**，
@@ -466,16 +659,17 @@ Windows 防火牆放行該連接埠，其他裝置開 `http://你的電腦IP:808
 - **播放** — 直接串流（HTTP Range）與隨選分段 HLS 轉碼自動選擇、HDR→SDR tonemap、H.264 level 自動選擇、遠端自動降畫質、轉碼快取與預轉
 - **播放器** — 自製控制列、字幕自繪（大小/顏色/位置/描邊/字體/延遲）、多音軌切換、畫質切換、片源資訊、設定跨裝置同步
 - **字幕** — 內嵌與外掛字幕轉 WebVTT、**邊抽邊送**（大檔案第一句字幕約 0.3 秒出現，而非等整部片 demux 完）、抽好存快取、**自動挑繁體中文**（先看語言標籤，標籤分不出繁簡時看實際內容用字判斷）、圖形字幕（PGS/VobSub）標示為無法顯示
-- **權限** — 管理員／唯讀兩種角色，角色寫進 session token 並納入簽章；改密碼自動讓既有 session 失效
+- **相片庫** — 掃描圖片、讀尺寸與 EXIF、產縮圖、相片牆與燈箱檢視
+- **帳號** — Google 登入（authorization code + PKCE）、審核制註冊、後台審核介面、註冊與登入的 IP 與地理位置記錄
+- **權限** — 管理員／唯讀兩種角色，角色寫進 session token 並納入簽章；改密碼或停權／降級都會讓既有 session 立刻失效
 - **安全** — 內部憑證走標頭不走網址、來源 IP 判斷不採信可偽造的標頭、CSP 等安全標頭、輸入驗證與速率限制
-- **維運** — 一鍵安裝腳本、端對端測試腳本、診斷 API、MSSQL 資料表的 Flyway 遷移檔
+- **對外開放** — Cloudflare Tunnel 一鍵設定（含 Windows 服務）、登入紀錄含來源 IP 與地理位置
+- **維運** — 一鍵安裝腳本、端對端測試腳本（含 Google 登入的攻擊面測試）、診斷 API、MSSQL 資料表的 Flyway 遷移檔
 
 ### 進行中 / 規劃中
 
-- Cloudflare Tunnel + 自訂網域對外開放
-- Google 帳號登入與註冊審核流程
-- 使用者資料改存 MSSQL（含登入 IP 與地理位置記錄）
-- 每位使用者各自的播放進度與偏好設定
+- 使用者資料改存 MSSQL（目前存在本機 SQLite，欄位已對齊 `dbo.filmax_users`，換儲存只需改 `app/users.py`）
+- 每位使用者各自的播放進度（偏好設定已經是每人一份）
 - Remux 直通（影像不轉碼只換容器），H.264 片源可望接近秒開
 
 ---

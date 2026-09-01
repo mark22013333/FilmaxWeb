@@ -20,6 +20,20 @@ let me = { role: 'admin', is_admin: true };
 async function loadMe() {
   try { me = await api('/api/me'); } catch {}
   document.body.classList.toggle('viewer', !me.is_admin);
+  paintAccount();
+}
+
+function paintAccount() {
+  const btn = $('#btnAccount');
+  if (!btn) return;
+  // 沒開驗證時整顆按鈕都沒意義（區網直接進來，沒有「誰」可言）
+  btn.hidden = !me.auth_enabled;
+  $('#acctName').textContent = me.display_name || me.email || (me.is_admin ? '管理員' : '唯讀');
+  const n = me.pending_users || 0;
+  const b = $('#acctBadge');
+  b.hidden = !n;
+  b.textContent = n;
+  btn.title = me.email ? `${me.email}（${me.is_admin ? '管理員' : '唯讀'}）` : '帳號';
 }
 
 let toastTimer;
@@ -252,6 +266,95 @@ window.recheckHw = async () => {
   } catch (e) { toast('重測失敗：' + e.message); }
 };
 
+/* ------------------------- 帳號與使用者管理 ------------------------- */
+const ST_TEXT = { pending: '待審核', approved: '已核准', rejected: '已拒絕', disabled: '已停權' };
+
+function userRow(u, lastOwner) {
+  const initial = esc((u.display_name || u.email || '?').trim()[0].toUpperCase());
+  const av = u.picture_url
+    ? `<img src="${esc(u.picture_url)}" alt="" referrerpolicy="no-referrer">` : initial;
+  const where = [u.last_login_city, u.last_login_country].filter(Boolean).join(' / ');
+  const meta = [u.last_login_at ? '上次登入 ' + new Date(u.last_login_at * 1000)
+      .toLocaleString('zh-TW', { hour12: false }) : '從未登入',
+    u.last_login_ip ? u.last_login_ip + (where ? `（${where}）` : '') : ''
+  ].filter(Boolean).join(' · ');
+  const acts = [];
+  if (u.status !== 'approved') acts.push(`<button class="btn primary" onclick="patchUser(${u.id},{status:'approved'})">核准</button>`);
+  if (u.status === 'pending') acts.push(`<button class="btn" onclick="patchUser(${u.id},{status:'rejected'})">拒絕</button>`);
+  // 最後一個管理員不給停權也不給降級 —— 後端會擋（400），這裡不要放
+  // 一顆按了必定失敗的按鈕出來。
+  if (u.status === 'approved' && !lastOwner) acts.push(`<button class="btn" onclick="patchUser(${u.id},{status:'disabled'})">停權</button>`);
+  if (!lastOwner) acts.push(u.role === 'owner'
+    ? `<button class="btn" onclick="patchUser(${u.id},{role:'viewer'})">改唯讀</button>`
+    : `<button class="btn" onclick="patchUser(${u.id},{role:'owner'})">升管理員</button>`);
+  if (lastOwner) acts.push('<span style="font-size:11.5px;color:var(--dim)">唯一的管理員</span>');
+  return `<div class="urow">
+    <div class="uav">${av}</div>
+    <div class="uinfo">
+      <b>${esc(u.display_name || u.email)}${u.id === me.uid ? '（你）' : ''}</b>
+      <small>${esc(u.email)}</small>
+      <small>${esc(meta)}</small>
+    </div>
+    <span class="st ${u.status}">${ST_TEXT[u.status] || esc(u.status)}</span>
+    ${u.role === 'owner' ? '<span class="st owner">管理員</span>' : ''}
+    <div class="uacts">${acts.join('')}</div>
+  </div>`;
+}
+
+window.patchUser = async (id, body) => {
+  try {
+    await api('/api/users/' + id, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    toast('已更新');
+    await loadMe();
+    // 改到自己身上時（例如把自己降成唯讀）整頁重讀，
+    // 不然畫面上還留著已經沒有權限的按鈕
+    if (id === me.uid) return location.reload();
+    openAccount();
+  } catch (e) { toast('更新失敗：' + e.message); }
+};
+
+window.openAccount = async () => {
+  $('#overlay').classList.add('show');
+  $('#modal').innerHTML = '<div class="loading">載入中…</div>';
+  let users = null;
+  if (me.is_admin && me.google_login) {
+    try { users = await api('/api/users'); } catch {}
+  }
+  const who = `<div class="urow">
+      <div class="uav">${me.picture_url
+        ? `<img src="${esc(me.picture_url)}" alt="" referrerpolicy="no-referrer">`
+        : esc((me.display_name || me.email || (me.is_admin ? 'A' : 'V'))[0].toUpperCase())}</div>
+      <div class="uinfo"><b>${esc(me.display_name || me.email || (me.is_admin ? '管理員（密碼登入）' : '唯讀（密碼登入）'))}</b>
+        <small>${esc(me.email || '這個 session 是用密碼登入的，沒有對應的帳號')}</small></div>
+      <span class="st ${me.is_admin ? 'owner' : 'approved'}">${me.is_admin ? '管理員' : '唯讀'}</span>
+      <div class="uacts"><a class="btn" href="/logout">登出</a></div>
+    </div>`;
+
+  let list = '';
+  if (users) {
+    const c = users.counts || {};
+    const pend = (users.items || []).filter(u => u.status === 'pending');
+    const owners = (users.items || []).filter(u => u.role === 'owner' && u.status === 'approved').length;
+    list = `<h3 style="margin:24px 0 6px;font-size:15px">使用者
+        <span style="color:var(--dim);font-weight:500;font-size:12.5px">
+          共 ${c.total || 0} 人${c.pending ? ` · ${c.pending} 人待審核` : ''}</span></h3>
+      ${pend.length ? '' : '<div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">目前沒有待審核的申請。</div>'}
+      ${(users.items || []).map(u => userRow(u, owners === 1 && u.role === 'owner' && u.status === 'approved')).join('') || '<div class="loading">還沒有人用 Google 登入過</div>'}`;
+  } else if (me.is_admin && !me.google_login) {
+    list = `<div style="font-size:12.5px;color:var(--dim);margin-top:20px;line-height:1.7">
+      尚未啟用 Google 登入。在 <code>.env</code> 設定 <code>GOOGLE_CLIENT_ID</code>、
+      <code>GOOGLE_CLIENT_SECRET</code> 與 <code>PUBLIC_BASE_URL</code> 後重新啟動，
+      這裡就會出現帳號審核清單。</div>`;
+  }
+  $('#modal').innerHTML = `<div class="modal-body"><button class="close" onclick="closeModal()">×</button>
+    <h2 style="margin-top:0">帳號</h2>${who}${list}</div>`;
+};
+
+$('#btnAccount').onclick = openAccount;
+
 $('#btnStats').onclick = async () => {
   $('#overlay').classList.add('show');
   $('#modal').innerHTML = '<div class="loading">檢查中…</div>';
@@ -287,15 +390,158 @@ window.testFtp = async () => {
 };
 window.api = api; window.toast = toast; window.pollScan = pollScan; window.openItem = openItem;
 
+/* ------------------------- 相片牆 ------------------------- */
+const pstate = { folder: '', page: 1, sort: 'taken', items: [], total: 0 };
+
+const fmtBytes = b => !b ? '—'
+  : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GB'
+  : b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+
+// 資料夾名稱只顯示最後一層，前面的路徑當提示就好
+const shortFolder = f => (f || '').split('/').filter(Boolean).pop() || '/';
+
+async function loadFolders() {
+  let d;
+  try { d = await api('/api/photos/folders'); } catch { return; }
+  const bar = $('#folderBar');
+  const all = `<div class="fchip ${pstate.folder ? '' : 'on'}" data-folder="">
+      <span class="fc-n">全部</span></div>`;
+  bar.innerHTML = all + d.items.map(f => `
+    <div class="fchip ${pstate.folder === f.folder ? 'on' : ''}" data-folder="${esc(f.folder)}"
+         title="${esc(f.folder)}">
+      ${f.cover ? `<img loading="lazy" src="/api/image/${esc(f.cover)}" alt="">` : ''}
+      <span><span class="fc-n">${esc(shortFolder(f.folder))}</span>
+      <span class="fc-c"> ${f.c}</span></span>
+    </div>`).join('');
+  bar.querySelectorAll('[data-folder]').forEach(el => el.onclick = () => {
+    pstate.folder = el.dataset.folder; pstate.page = 1; loadPhotos();
+  });
+}
+
+async function loadPhotos() {
+  const grid = $('#pgrid');
+  grid.innerHTML = '<div class="loading">載入中…</div>';
+  const p = new URLSearchParams({ page: pstate.page, page_size: 60, sort: pstate.sort });
+  if (pstate.folder) p.set('folder', pstate.folder);
+  if (state.q) p.set('q', state.q);
+  let d;
+  try { d = await api('/api/photos?' + p); }
+  catch (e) { grid.innerHTML = `<div class="loading">載入失敗：${esc(e.message)}</div>`; return; }
+  pstate.items = d.items; pstate.total = d.total;
+  $('#photoCount').textContent = d.total ? `共 ${d.total} 張` : '';
+  if (!d.items.length) {
+    grid.innerHTML = `<div class="empty"><h3>沒有相片</h3>
+      <p>把圖片放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
+    $('#ppager').innerHTML = ''; return;
+  }
+  grid.innerHTML = d.items.map((x, i) => `
+    <div class="ph" data-i="${i}" title="${esc(x.filename)}">
+      <img loading="lazy" src="/api/photo/${x.id}/thumb.jpg" alt="${esc(x.filename)}"
+           onerror="this.style.display='none'">
+      <div class="ph-meta">${esc(x.filename)}</div>
+    </div>`).join('');
+  grid.querySelectorAll('.ph').forEach(el => el.onclick = () => openPhoto(+el.dataset.i));
+
+  const pages = Math.ceil(d.total / d.page_size);
+  $('#ppager').innerHTML = pages > 1 ? `
+    <button class="btn" ${pstate.page <= 1 ? 'disabled' : ''} data-pp="-1">上一頁</button>
+    <span style="padding:0 12px;color:var(--dim)">${pstate.page} / ${pages}</span>
+    <button class="btn" ${pstate.page >= pages ? 'disabled' : ''} data-pp="1">下一頁</button>` : '';
+  $('#ppager').querySelectorAll('[data-pp]').forEach(b => b.onclick = () => {
+    pstate.page += +b.dataset.pp; loadPhotos(); window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+}
+
+/* ------------------------- 燈箱 ------------------------- */
+let lbIndex = -1;
+
+async function openPhoto(i) {
+  if (i < 0 || i >= pstate.items.length) return;
+  lbIndex = i;
+  const brief = pstate.items[i];
+  const lb = $('#lightbox');
+  lb.hidden = false;
+  document.body.style.overflow = 'hidden';
+  // 先放縮圖當預覽，原圖載好再換掉 —— 大圖從 FTP 拉要一點時間
+  const img = $('#lbImg');
+  img.src = `/api/photo/${brief.id}/thumb.jpg`;
+  $('#lbInfo').innerHTML = `<h3>${esc(brief.filename)}</h3><div class="sub">載入中…</div>`;
+  const full = new Image();
+  full.onload = () => { if (lbIndex === i) img.src = full.src; };
+  full.src = `/api/photo/${brief.id}/full`;
+
+  let d;
+  try { d = await api('/api/photos/' + brief.id); }
+  catch { return; }
+  if (lbIndex !== i) return;              // 使用者已經翻到別張了
+  const row = (k, v) => v ? `<div class="row"><span>${k}</span><b>${esc(v)}</b></div>` : '';
+  const shot = [row('拍攝時間', d.taken_at), row('相機', d.camera), row('鏡頭', d.lens),
+                row('快門', d.exposure), row('光圈', d.aperture),
+                row('ISO', d.iso), row('焦距', d.focal_len)].join('');
+  $('#lbInfo').innerHTML = `
+    <h3>${esc(d.filename)}</h3>
+    <div class="sub">${esc(d.folder)}</div>
+    <h4>檔案</h4>
+    ${row('尺寸', d.width && d.height ? `${d.width} × ${d.height}` : '')}
+    ${row('格式', [d.format, d.mode].filter(Boolean).join(' · '))}
+    ${row('大小', fmtBytes(d.size))}
+    ${row('修改時間', d.mtime)}
+    ${shot ? '<h4>拍攝資訊</h4>' + shot : '<h4>拍攝資訊</h4><div class="row"><b style="color:var(--dim)">這張圖沒有 EXIF</b></div>'}
+    ${me.is_admin ? `<div style="margin-top:20px">
+      <a class="btn" href="${d.download_url}" download>下載原圖</a>
+    </div>` : ''}
+    <div style="margin-top:14px;font-size:11.5px;color:var(--dim);line-height:1.6">
+      不讀取也不顯示 GPS 座標。原始檔案沒有被修改。
+    </div>`;
+}
+
+function closePhoto() {
+  $('#lightbox').hidden = true;
+  document.body.style.overflow = '';
+  $('#lbImg').src = '';
+  lbIndex = -1;
+}
+
+$('#lbClose').onclick = closePhoto;
+$('#lightbox').onclick = e => { if (e.target.id === 'lightbox' || e.target.classList.contains('lb-stage')) closePhoto(); };
+$('#lbPrev').onclick = e => { e.stopPropagation(); openPhoto(lbIndex - 1); };
+$('#lbNext').onclick = e => { e.stopPropagation(); openPhoto(lbIndex + 1); };
+document.addEventListener('keydown', e => {
+  if ($('#lightbox').hidden) return;
+  if (e.key === 'Escape') closePhoto();
+  else if (e.key === 'ArrowLeft') openPhoto(lbIndex - 1);
+  else if (e.key === 'ArrowRight') openPhoto(lbIndex + 1);
+});
+
 /* ------------------------- 事件 ------------------------- */
+function showPhotoView(on) {
+  $('#photoView').hidden = !on;
+  for (const id of ['#grid', '#pager', '#libTitle', '#continue']) {
+    const el = $(id); if (el) el.hidden = on;
+  }
+  $('.toolbar').hidden = on;              // 類型與排序是影片用的
+  $('#q').placeholder = on ? '搜尋檔名或資料夾…' : '搜尋片名或檔名…';
+}
+
 $$('nav button').forEach(b => b.onclick = () => {
   $$('nav button').forEach(x => x.classList.remove('on'));
-  b.classList.add('on'); state.kind = b.dataset.kind; state.page = 1; loadLibrary();
+  b.classList.add('on');
+  if (b.dataset.kind === 'photo') {
+    showPhotoView(true);
+    loadFolders(); loadPhotos();
+    return;
+  }
+  showPhotoView(false);
+  state.kind = b.dataset.kind; state.page = 1; loadLibrary();
 });
 let qTimer;
 $('#q').oninput = e => {
   clearTimeout(qTimer);
-  qTimer = setTimeout(() => { state.q = e.target.value.trim(); state.page = 1; loadLibrary(); }, 320);
+  qTimer = setTimeout(() => {
+    state.q = e.target.value.trim();
+    if (!$('#photoView').hidden) { pstate.page = 1; loadPhotos(); }
+    else { state.page = 1; loadLibrary(); }
+  }, 320);
 };
 $('#sort').onchange = e => { state.sort = e.target.value; state.page = 1; loadLibrary(); };
 

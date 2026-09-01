@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
@@ -25,8 +25,8 @@ if not exist ".git" (
 )
 
 REM ---------- 2. 身分 ----------
-git config user.name  >nul 2>&1 || git config user.name "Cheng®"
-git config user.email >nul 2>&1 || git config user.email "mark22013333@gmail.com"
+git config user.name  >nul 2>&1 || git config user.name "mark22013333"
+git config user.email >nul 2>&1 || git config user.email "mark22013333@users.noreply.github.com"
 
 REM ---------- 3. 安全檢查：機密檔案絕對不能進版控 ----------
 echo [2/6] 檢查機密檔案有沒有被排除...

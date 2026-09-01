@@ -100,6 +100,55 @@ CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
     v TEXT
 );
+
+-- 相片庫。跟影片分開一張表：欄位差太多，硬塞同一張表只會兩邊都難用。
+CREATE TABLE IF NOT EXISTS photo (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ftp_path    TEXT UNIQUE NOT NULL,
+    folder      TEXT NOT NULL,
+    filename    TEXT NOT NULL,
+    ext         TEXT,
+    size        INTEGER,
+    mtime       TEXT,
+    width       INTEGER,
+    height      INTEGER,
+    format      TEXT,          -- JPEG / PNG / WEBP…
+    mode        TEXT,          -- RGB / RGBA / L…
+    taken_at    TEXT,          -- EXIF 拍攝時間
+    camera      TEXT,          -- 廠牌 + 型號
+    lens        TEXT,
+    exposure    TEXT,          -- 1/250s
+    aperture    TEXT,          -- f/2.8
+    iso         INTEGER,
+    focal_len   TEXT,          -- 35mm
+    orientation INTEGER,
+    thumb       TEXT,
+    probe_state TEXT DEFAULT 'pending',   -- pending / ok / failed
+    probe_error TEXT,
+    seen_at     REAL,
+    added_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_photo_folder ON photo(folder);
+CREATE INDEX IF NOT EXISTS idx_photo_taken ON photo(taken_at DESC);
+CREATE INDEX IF NOT EXISTS idx_photo_probe ON photo(probe_state);
+
+-- 登入紀錄。之後接上 MSSQL 帳號系統時會改存那邊，但本機這份仍然有用：
+-- 資料庫連不上的時候，至少還看得到誰在什麼時候從哪裡登入。
+CREATE TABLE IF NOT EXISTS login_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          REAL    NOT NULL,
+    event       TEXT    NOT NULL,      -- success / failed / locked
+    role        TEXT,
+    ip          TEXT,
+    country     TEXT,
+    region      TEXT,
+    city        TEXT,
+    timezone    TEXT,
+    latitude    REAL,                  -- 城市中心點，不是使用者的實際位置
+    longitude   REAL,
+    user_agent  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_login_at ON login_audit(at DESC);
 """
 
 
@@ -137,6 +186,11 @@ def tx():
 # 既有資料庫要補的欄位。SQLite 沒有 IF NOT EXISTS 的 ADD COLUMN，
 # 所以自己比對一次；這比要求使用者砍掉重建資料庫友善得多。
 _ADDED_COLUMNS = {
+    "login_audit": [
+        ("email", "TEXT"),          # Google 帳號登入才有
+        ("user_id", "INTEGER"),
+        ("detail", "TEXT"),
+    ],
     "media_file": [
         ("pix_fmt", "TEXT"),
         ("color_transfer", "TEXT"),
@@ -211,3 +265,25 @@ def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
 
 def now() -> float:
     return time.time()
+
+
+def log_login(event: str, role: Optional[str], ip: str, loc: Dict[str, Any],
+              email: Optional[str] = None, user_id: Optional[int] = None,
+              detail: Optional[str] = None) -> None:
+    """寫一筆登入事件。
+
+    寫失敗絕對不能影響登入本身 —— 稽核紀錄再重要，也不該讓人因為它壞掉而登不進來。
+    """
+    try:
+        execute(
+            """INSERT INTO login_audit
+                   (at, event, role, ip, country, region, city, timezone,
+                    latitude, longitude, user_agent, email, user_id, detail)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now(), event, role, ip, loc.get("country"), loc.get("region"),
+             loc.get("city"), loc.get("timezone"), loc.get("latitude"),
+             loc.get("longitude"), loc.get("user_agent"), email, user_id,
+             (detail or None) and str(detail)[:300]),
+        )
+    except Exception as e:
+        log.warning("登入紀錄寫入失敗: %s", e)
