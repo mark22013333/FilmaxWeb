@@ -75,3 +75,22 @@ def describe(rec: Dict[str, Any]) -> str:
             seen.add(p)
             out.append(p)
     return " / ".join(out) if out else "位置未知"
+
+
+def ip_source(scope) -> str:
+    """這個請求的來源位址是怎麼判斷出來的：cloudflare / lan / direct / internal。
+
+    值域由 dbo.filmax_audit 的 CHECK 限制決定（見 db/sql/V2__create_audit.sql）。
+    有意義的地方在於「這個 IP 可不可信」：cloudflare 是 Cloudflare 自己填的，
+    direct 則是有人繞過 Tunnel 直接連進來 —— 那件事本身就值得注意。
+    """
+    from . import auth
+    h = _headers(scope)
+    peer = auth.peer_ip(scope)
+    if auth.is_loopback(peer) and h.get(b"x-filmax-internal"):
+        return "internal"
+    if h.get(b"cf-connecting-ip"):
+        return "cloudflare"
+    if auth.is_local_network(auth.client_ip(scope)):
+        return "lan"
+    return "direct"

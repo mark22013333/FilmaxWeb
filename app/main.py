@@ -7,14 +7,15 @@ import re
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, db, ftpclient, geo, media, scanner, users
+from . import (audit, auth, db, ftpclient, geo, media, mssql, params,
+               paramstore, purge, scanner, users)
 from .config import settings
 from .routers import api, auth_google, stream
 
@@ -30,9 +31,79 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        settings.check_stores()
+    except ValueError as e:
+        log.error("=" * 78)
+        log.error("儲存後端設定有問題：%s", e)
+        log.error("=" * 78)
+        raise
+
+    # .env 裡的值無效就讓啟動失敗。理由：.env 是使用者明確寫下的指令，
+    # 寫錯了還默默用預設值跑起來，使用者會以為設定生效了。
+    # （資料庫裡的壞值不一樣 —— 那退回預設就好，不該讓服務開不了機。）
+    # 秘密的日誌過濾要盡早掛上 —— 掛得比第一行可能洩漏的日誌晚就沒意義了
+    params.install_log_filter()
+
+    bad = paramstore.validate_env()
+    if bad:
+        log.error("=" * 78)
+        log.error(".env 裡有無效的設定值，服務不會啟動：")
+        for b in bad:
+            log.error("  • %s", b)
+        log.error("=" * 78)
+        raise ValueError("；".join(bad))
+
+    # 打錯字的設定鍵。TMDB_API_KAY=xxx 這種現在是完全靜默失效的：
+    # 程式讀不到那個鍵，使用者以為設好了，而沒有任何一行訊息提到它。
+    for key, guess in params.unknown_env_keys():
+        if guess:
+            log.warning(".env 有一個程式不認得的設定 %s —— 是不是想打 %s？", key, guess)
+        else:
+            log.warning(".env 有一個程式不認得的設定：%s", key)
+
     db.init_db()
-    users.init()
-    log.info("資料庫就緒")
+    log.info("媒體庫資料庫就緒（%s）", settings.media_store)
+
+    # 被環境變數蓋掉的後台設定。**絕不自動刪** —— 使用者可能只是暫時用
+    # 環境變數覆蓋（測試、容器編排），刪掉他們在後台設過的東西是不可逆的。
+    try:
+        d = paramstore.drift()
+        if d:
+            log.warning("有 %s 項後台設定被環境變數蓋掉（後台會顯示，不會自動刪）：%s",
+                        len(d), "、".join(x["key"] for x in d))
+    except Exception as e:
+        log.debug("漂移檢查失敗：%s", e)
+
+    # 啟動時只**回報**孤兒，刻意不修。
+    # 啟動路徑自動刪資料是很糟的預設行為，尤其在剛還原備份、剛換過儲存後端
+    # 之後 —— 那時候「看起來像孤兒」的東西特別多，而它們多半只是還沒對上。
+    # 要清的話有掃描後的自動清掃，以及後台的按鈕（可以先 dry-run 看清單）。
+    try:
+        r = purge.sweep("report")
+        if r["total"]:
+            log.warning("發現 %s 筆孤兒資料：%s", r["total"],
+                        "、".join(f"{k}×{v}" for k, v in r["found"].items() if v))
+            log.warning("（啟動時不會自動清理。掃描結束後會清，或用後台的清掃功能。）")
+    except Exception as e:
+        log.warning("孤兒檢查失敗：%s", e)
+
+    # 使用者資料可能在 MSSQL。連不上就大聲講，而且要講「怎麼修」——
+    # 這裡不 raise：服務照樣起來，/healthz 與這段日誌才看得到，
+    # 直接讓 uvicorn 起不來的話，使用者只會看到一個沒頭沒尾的堆疊。
+    try:
+        users.init()
+        log.info("使用者資料：%s", users.describe())
+    except Exception as e:
+        log.error("=" * 78)
+        log.error("使用者資料庫不可用：%s", e)
+        log.error("")
+        log.error("在這個狀態下沒有人登得進來（Google 登入會顯示錯誤訊息）。")
+        log.error("請依序確認：")
+        log.error("  1. 在專案目錄跑 db\\檢查連線.bat，它會逐項告訴你卡在哪一關")
+        log.error("  2. 表還沒建的話，先跑 db\\migrate.bat 套用 Flyway 遷移")
+        log.error("  3. 不想接 MSSQL 就把 .env 的 MSSQL_HOST 清空，會改用本機 SQLite")
+        log.error("=" * 78)
     log.info("FTP 目標 %s:%s  根目錄 %s", settings.ftp_host, settings.ftp_port,
              [r.path for r in settings.library_roots])
     tools = media.tool_status()
@@ -85,14 +156,25 @@ async def lifespan(app: FastAPI):
         log.warning("要對外開放請在 .env 設定 AUTH_ENABLED=true 與 AUTH_PASSWORD 後重新啟動。")
         log.warning("=" * 78)
 
+    if settings.mssql_configured:
+        st = mssql.ping()
+        if st["ok"]:
+            log.info("MSSQL 連線正常：%s", st["version"] or mssql.safe_target())
+        elif st["missing"]:
+            log.error("MSSQL 連得上但缺少：%s —— 請跑 db\\migrate.bat",
+                      "、".join(st["missing"]))
+
     if settings.auto_scan_on_start:
         threading.Timer(2.0, lambda: scanner.start(full=False)).start()
     yield
     ftpclient.pool.close_all()
+    mssql.close_all()
 
 
+# docs_url / openapi_url 設成 None，改用下面自己掛的管理員限定版本。
+# FastAPI 內建那兩條只受登入保護、不分角色，唯讀使用者看得到完整 API 清單。
 app = FastAPI(title="FilmaxWeb", version="1.0", lifespan=lifespan,
-              docs_url="/api/docs", openapi_url="/api/openapi.json")
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -141,8 +223,11 @@ SECURITY_HEADERS = [
     # 之後把那些清乾淨就可以拿掉。
     (b"content-security-policy",
      b"default-src 'self'; "
-     # 大頭貼放在 Google 的 CDN 上。只開這一個網域，其他外部圖片一律擋掉。
-     b"img-src 'self' data: blob: https://lh3.googleusercontent.com; "
+     # 大頭貼在 Google 的 CDN、TMDB 的搜尋結果縮圖在 image.tmdb.org
+     # （「手動指定 TMDB」那個畫面直接引用它，少了這一條整排都是破圖）。
+     # 只開這兩個網域，其他外部圖片一律擋掉。
+     b"img-src 'self' data: blob: https://lh3.googleusercontent.com "
+     b"https://image.tmdb.org; "
      b"media-src 'self' blob:; "
      b"script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; "
      b"style-src 'self' 'unsafe-inline'; "
@@ -169,14 +254,54 @@ def player():
     return FileResponse(STATIC_DIR / "player.html")
 
 
+@app.get("/admin", include_in_schema=False)
+def admin_page(request: Request):
+    """管理後台。
+
+    **這裡要自己檢查角色。** 中介層只驗「有沒有登入」，不驗「是不是管理員」——
+    掛在中介層上的保護對這個頁面來說是不夠的。
+
+    頁面本身（admin.html / admin.js）不含任何敏感資訊，真正的保護在每一個
+    API 端點的 admin_only 上；這一關是為了不要讓唯讀使用者看到一個
+    到處都是錯誤訊息的空後台。
+    """
+    if not auth.is_admin(request):
+        if not auth.role_of(request):
+            return RedirectResponse("/login?next=" + quote("/admin"), status_code=303)
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>需要管理員權限</title>"
+            "<style>body{font:15px/1.7 system-ui,sans-serif;max-width:520px;"
+            "margin:15vh auto;padding:0 24px;color:#222}</style>"
+            "<h2>需要管理員權限</h2><p>你的帳號是唯讀角色，看不到管理後台。</p>"
+            "<p><a href=\"/\">回到媒體庫</a></p>", status_code=403)
+    return FileResponse(STATIC_DIR / "admin.html")
+
+
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return {"ok": True}
 
 
+@app.get("/api/openapi.json", include_in_schema=False)
+def openapi_json(request: Request):
+    if not auth.is_admin(request):
+        raise HTTPException(403, "需要管理員權限")
+    return app.openapi()
+
+
+@app.get("/api/docs", include_in_schema=False)
+def api_docs(request: Request):
+    if not auth.is_admin(request):
+        raise HTTPException(403, "需要管理員權限")
+    from fastapi.openapi.docs import get_swagger_ui_html
+    return get_swagger_ui_html(openapi_url="/api/openapi.json", title="FilmaxWeb API")
+
+
 # ------------------------------- 登入 -------------------------------
-def _record_login(event: str, role, ip: str, loc: dict) -> None:
-    db.log_login(event, role, ip, loc)
+def _record_login(event: str, role, ip: str, loc: dict,
+                  scope=None) -> None:
+    audit.record(event, role=role, ip=ip, loc=loc,
+                 ip_source=geo.ip_source(scope) if scope is not None else None)
 
 
 def _login_page(error: str = "", nxt: str = "") -> HTMLResponse:
@@ -230,7 +355,7 @@ async def login_submit(request: Request):
     ip = auth.client_ip(request.scope)
     loc = geo.from_scope(request.scope)
     if auth.too_many_failures(ip):
-        _record_login("locked", None, ip, loc)
+        _record_login("locked", None, ip, loc, request.scope)
         return _login_page("嘗試次數過多，請等 15 分鐘後再試", next)
     if not settings.auth_password and not settings.viewer_password:
         msg = ("這個服務只開放 Google 帳號登入" if settings.google_enabled
@@ -239,7 +364,7 @@ async def login_submit(request: Request):
     role = auth.role_for_password(password)
     if not role:
         auth.note_failure(ip)
-        _record_login("failed", None, ip, loc)
+        _record_login("failed", None, ip, loc, request.scope)
         log.warning("登入失敗，來源 %s（%s）", ip, geo.describe(loc))
         return _login_page("密碼不正確", next)
 
@@ -260,7 +385,7 @@ async def login_submit(request: Request):
                     max_age=settings.session_days * 86400,
                     httponly=True, samesite="lax", path="/",
                     secure=settings.cookie_secure)
-    _record_login("success", role, ip, loc)
+    _record_login("success", role, ip, loc, request.scope)
     log.info("登入成功（%s），來源 %s（%s）", role, ip, geo.describe(loc))
     return resp
 

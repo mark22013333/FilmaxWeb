@@ -69,10 +69,17 @@ if not errorlevel 1 (
   pause & exit /b 1
 )
 
+REM 提交訊息：可以直接當參數帶進來，例如
+REM     推送到GitHub.bat 加入 Google 帳號登入
+REM 沒帶就問一次，直接按 Enter 用預設值。
+set "MSG=%*"
+if not defined MSG set /p "MSG=請輸入這次的提交訊息（直接 Enter 用「更新 FilmaxWeb」）： "
+if not defined MSG set "MSG=更新 FilmaxWeb"
+
 git diff --cached --quiet
 if errorlevel 1 (
-  git commit -q -m "更新 FilmaxWeb" || (echo [x] 提交失敗 & pause & exit /b 1)
-  echo     已提交
+  git commit -q -m "!MSG!" || (echo [x] 提交失敗 & pause & exit /b 1)
+  echo     已提交：!MSG!
 ) else (
   echo     沒有變更需要提交
 )

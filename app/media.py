@@ -247,14 +247,52 @@ def scrub_bytes(data: bytes) -> bytes:
     return _TOK_QS_B.sub(rb"\1***", _TOKEN_RE_B.sub(rb"\1***", data))
 
 
-def _run(cmd: List[str], timeout: int = 120) -> Tuple[int, bytes, bytes]:
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    # 統一在這裡遮掉憑證：底下所有呼叫端拿到的都已經是安全的，
-    # 不必每個錯誤處理點都記得自己過濾（漏一個就前功盡棄）。
-    return p.returncode, scrub_bytes(p.stdout), scrub_bytes(p.stderr)
+class Cancelled(RuntimeError):
+    """外部要求中止，子行程已經被終止。
+
+    跟「失敗」要分開：失敗的檔案下次掃描會重試，被中止的不該被標成失敗。
+    """
 
 
-def _ffprobe_json(file_id: int, timeout: int = 90) -> Dict[str, Any]:
+def _run(cmd: List[str], timeout: int = 120, cancel=None) -> Tuple[int, bytes, bytes]:
+    """跑一支外部工具。傳了 cancel（threading.Event）就是可中止版本。
+
+    為什麼需要可中止版本：subprocess.run 一旦開始就只能等它自己結束或逾時，
+    而 ffprobe 的逾時是 90 秒。使用者按下「停止掃描」之後，正在跑的每一支
+    都還要跑完，併發 3 就是最多等 4 分半 —— 看起來就是「按了沒反應」。
+    光在函式進入點檢查旗標解決不了這件事，要能真的把子行程殺掉。
+    """
+    if cancel is None:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        # 統一在這裡遮掉憑證：底下所有呼叫端拿到的都已經是安全的，
+        # 不必每個錯誤處理點都記得自己過濾（漏一個就前功盡棄）。
+        return p.returncode, scrub_bytes(p.stdout), scrub_bytes(p.stderr)
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            # 逾時後再呼叫一次 communicate 不會掉資料（CPython 有保證），
+            # 所以可以拿它當「每 0.4 秒回頭看一眼旗標」的輪詢迴圈用。
+            out, err = proc.communicate(timeout=0.4)
+            return proc.returncode, scrub_bytes(out), scrub_bytes(err)
+        except subprocess.TimeoutExpired:
+            pass
+        stop = cancel.is_set()
+        if not stop and time.monotonic() < deadline:
+            continue
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()             # 不理 SIGTERM 的話就不客氣了
+            proc.communicate()
+        if stop:
+            raise Cancelled("已中止")
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+
+def _ffprobe_json(file_id: int, timeout: int = 90, cancel=None) -> Dict[str, Any]:
     cmd = [
         resolve_tool("ffprobe"), "-v", "error",
         *source_headers(),
@@ -263,7 +301,7 @@ def _ffprobe_json(file_id: int, timeout: int = 90) -> Dict[str, Any]:
         "-show_format", "-show_streams",
         source_url(file_id),
     ]
-    code, out, err = _run(cmd, timeout=timeout)
+    code, out, err = _run(cmd, timeout=timeout, cancel=cancel)
     if code != 0:
         raise RuntimeError((err or b"").decode("utf-8", "ignore")[:500] or f"ffprobe exit {code}")
     return json.loads(out.decode("utf-8", "ignore"))
@@ -285,11 +323,11 @@ _CHANNELS = {"mono": 1, "stereo": 2, "2.1": 3, "quad": 4, "5.0": 5,
              "5.1": 6, "6.1": 7, "7.1": 8}
 
 
-def _ffmpeg_probe(file_id: int, timeout: int = 120) -> Dict[str, Any]:
+def _ffmpeg_probe(file_id: int, timeout: int = 120, cancel=None) -> Dict[str, Any]:
     cmd = [resolve_tool("ffmpeg"), "-hide_banner", "-rw_timeout", "30000000",
            *source_headers(), "-i", source_url(file_id)]
     # 沒指定輸出檔，ffmpeg 一定以非 0 結束，資訊在 stderr —— 這是預期行為
-    code, _, err = _run(cmd, timeout=timeout)
+    code, _, err = _run(cmd, timeout=timeout, cancel=cancel)
     text = (err or b"").decode("utf-8", "ignore")
     if "Input #0" not in text:
         raise RuntimeError(text.strip().splitlines()[-1][:400] if text.strip()
@@ -364,11 +402,15 @@ def _ffmpeg_probe(file_id: int, timeout: int = 120) -> Dict[str, Any]:
 _warned_fallback = False
 
 
-def ffprobe(file_id: int, timeout: int = 90) -> Dict[str, Any]:
-    """優先用 ffprobe；沒有 ffprobe 時退回解析 ffmpeg 的輸出。"""
+def ffprobe(file_id: int, timeout: int = 90, cancel=None) -> Dict[str, Any]:
+    """優先用 ffprobe；沒有 ffprobe 時退回解析 ffmpeg 的輸出。
+
+    掃描時把 cancel 事件傳進來，按下「停止掃描」才能真的把子行程殺掉，
+    而不是等滿 90 秒的逾時。
+    """
     global _warned_fallback
     try:
-        return _ffprobe_json(file_id, timeout=timeout)
+        return _ffprobe_json(file_id, timeout=timeout, cancel=cancel)
     except FileNotFoundError:
         pass          # ffprobe 不存在 → 走備援
     except OSError as e:
@@ -380,7 +422,7 @@ def ffprobe(file_id: int, timeout: int = 90) -> Dict[str, Any]:
         _warned_fallback = True
         log.warning("找不到 ffprobe，改用解析 ffmpeg 輸出的備援方式取得影片資訊。"
                     "建議還是安裝完整的 ffmpeg（winget install Gyan.FFmpeg）。")
-    return _ffmpeg_probe(file_id, timeout=max(timeout, 120))
+    return _ffmpeg_probe(file_id, timeout=max(timeout, 120), cancel=cancel)
 
 
 # 只有文字字幕轉得成 WebVTT。PGS/VobSub 這類是「圖片」字幕，要嘛燒進畫面、
@@ -792,13 +834,16 @@ def h264_level_for(height: int) -> str:
     return "5.2"
 
 
-def hdr_mode_for(src_w: Optional[int], src_h: Optional[int]) -> str:
+def hdr_mode_for(src_w: Optional[int], src_h: Optional[int],
+                 setting: Optional[str] = None) -> str:
     """決定這個片源要用哪種 HDR 處理。
 
     auto 的判斷是成本導向：完整 tonemap 慢約 1.8 倍，4K 片源在 CPU 上
     會掉到即時速度以下而卡頓，所以 4K 自動改用 fast。
+
+    setting 讓呼叫端指定要試哪一種（轉碼實測會逐一試過）。
     """
-    mode = (settings.hdr_tonemap or "auto").lower()
+    mode = (setting or settings.hdr_tonemap or "auto").lower()
     if mode in ("off", "fast", "quality"):
         return mode
     pixels = (src_w or 1920) * (src_h or 1080)
@@ -806,8 +851,14 @@ def hdr_mode_for(src_w: Optional[int], src_h: Optional[int]) -> str:
 
 
 def build_video_filters(src_w: Optional[int], src_h: Optional[int], target_h: Optional[int],
-                        is_hdr: bool) -> Tuple[List[str], int]:
-    """組出影像濾鏡鏈，並回傳實際的輸出高度。"""
+                        is_hdr: bool, tonemap: Optional[str] = None) -> Tuple[List[str], int]:
+    """組出影像濾鏡鏈，並回傳實際的輸出高度。
+
+    tonemap 是「這一次要用哪種 HDR 處理」，只給轉碼實測用。
+    原本實測是暫時改掉全域的 settings.hdr_tonemap 再改回來 —— 那有兩個問題：
+    實測進行中**每一個正在看片的人**都會跟著換設定，而且設定現在是即時解析的
+    property，根本不能指派。改成把值當參數傳下去。
+    """
     src_h = src_h or 1080
     src_w = src_w or 1920
     want = target_h if (target_h and target_h > 0) else src_h
@@ -820,7 +871,7 @@ def build_video_filters(src_w: Optional[int], src_h: Optional[int], target_h: Op
         # 嚴格說 tonemap 應該在線性光下對原解析度做，但那個代價在這台機器上划不來。
         chain.append(f"scale=-2:{out_h}:flags=bicubic")
 
-    mode = hdr_mode_for(src_w, src_h) if is_hdr else "off"
+    mode = hdr_mode_for(src_w, src_h, tonemap) if is_hdr else "off"
     if mode != "off" and can_tonemap():
         if mode == "fast":
             # 直接做轉換特性/色域轉換，不進線性光。高光會被削掉而不是滾降，
@@ -866,36 +917,31 @@ def bench_transcode(file_id: int, start: float = 60.0, seconds: float = 6.0,
             combos += [(f"硬體解碼 + fast 轉色彩", settings.decode_hwaccel, "fast"),
                        (f"硬體解碼 + quality tonemap", settings.decode_hwaccel, "quality")]
 
-    saved = settings.hdr_tonemap
     results = []
-    try:
-        for label, dec, hdr in combos:
-            settings.hdr_tonemap = hdr
-            vf, out_h = build_video_filters(src_w, src_h, height, is_hdr)
-            cmd = [ff, "-v", "error", "-nostdin", "-y"]
-            if dec != "none":
-                cmd += ["-hwaccel", dec]
-            cmd += ["-ss", f"{start:.3f}", "-rw_timeout", "30000000",
-                    *source_headers(), "-i", source_url(file_id), "-t", f"{seconds:.3f}",
-                    "-map", "0:v:0", "-an", "-sn", "-dn"]
-            if vf:
-                cmd += ["-vf", ",".join(vf)]
-            cmd += ["-c:v", "libx264"] + _encoder_quality_args("libx264") + [
-                "-profile:v", "high", "-level", h264_level_for(out_h),
-                "-f", "null", "-"]
-            t0 = time.time()
-            try:
-                code, _, err = _run(cmd, timeout=300)
-                dt = time.time() - t0
-                results.append({"設定": label, "耗時秒": round(dt, 1),
-                                "倍速": round(seconds / dt, 2) if dt else None,
-                                "ok": code == 0,
-                                "錯誤": None if code == 0 else _pick_cause(
-                                    (err or b"").decode("utf-8", "ignore"), "libx264")})
-            except Exception as e:
-                results.append({"設定": label, "ok": False, "錯誤": str(e)[:200]})
-    finally:
-        settings.hdr_tonemap = saved
+    for label, dec, hdr in combos:
+        vf, out_h = build_video_filters(src_w, src_h, height, is_hdr, tonemap=hdr)
+        cmd = [ff, "-v", "error", "-nostdin", "-y"]
+        if dec != "none":
+            cmd += ["-hwaccel", dec]
+        cmd += ["-ss", f"{start:.3f}", "-rw_timeout", "30000000",
+                *source_headers(), "-i", source_url(file_id), "-t", f"{seconds:.3f}",
+                "-map", "0:v:0", "-an", "-sn", "-dn"]
+        if vf:
+            cmd += ["-vf", ",".join(vf)]
+        cmd += ["-c:v", "libx264"] + _encoder_quality_args("libx264") + [
+            "-profile:v", "high", "-level", h264_level_for(out_h),
+            "-f", "null", "-"]
+        t0 = time.time()
+        try:
+            code, _, err = _run(cmd, timeout=300)
+            dt = time.time() - t0
+            results.append({"設定": label, "耗時秒": round(dt, 1),
+                            "倍速": round(seconds / dt, 2) if dt else None,
+                            "ok": code == 0,
+                            "錯誤": None if code == 0 else _pick_cause(
+                                (err or b"").decode("utf-8", "ignore"), "libx264")})
+        except Exception as e:
+            results.append({"設定": label, "ok": False, "錯誤": str(e)[:200]})
 
     return {
         "檔案": row["filename"],

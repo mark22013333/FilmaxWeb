@@ -98,6 +98,16 @@ GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 PUBLIC_BASE_URL=https://video.example.com
 GOOGLE_ADMIN_EMAILS=你的Gmail  # 第一個管理員，沒設的話所有人都會卡在待審核
+
+# 使用者資料存 MSSQL（留空 = 存本機 SQLite）
+MSSQL_HOST=
+MSSQL_DATABASE=filmax
+MSSQL_USER=filmax_app
+MSSQL_PASSWORD=
+
+# 明講要用哪一份。留空 = 自動判斷（MSSQL 設好就走 MSSQL）
+USER_STORE=          # sqlite / mssql
+MEDIA_STORE=         # 媒體庫預設一律 sqlite，要搬過去必須自己填 mssql
 ```
 
 完整清單看 `.env.example`，每一項都有註解。**版本更新後記得回頭看一次**，
@@ -205,6 +215,27 @@ x264 會警告 `MB rate > level limit` 但**照樣把 4.1 蓋進串流**，產�
 
 之後新增檔案只要再按一次掃描，已存在且大小沒變的檔案會直接跳過，很快。
 
+> 影集被拆成一張一張卡片的話（刮不到 TMDB 的片子最常見），按右上角的
+> **重新分組**。它不重掃 FTP，只把已經在資料庫裡的檔名重新解析一次 ——
+> 幾秒就跑完，不必等一次完整掃描。分組規則見下一節。
+
+### 檔名怎麼被分成「一部影集」
+
+`S01E02` 這種標準寫法一向沒問題，難的是沒有標準寫法的那些。多加了兩條規則：
+
+**一集一個資料夾。** `火影忍者/01/`、`火影忍者/02/`⋯⋯ 這種結構，
+資料夾名字本身就是集數。要**同層至少有兩個純數字資料夾**才成立，
+免得把單一個叫 `2` 的資料夾當成影集。
+
+**檔名結尾的數字。** `名偵探柯南 1.mkv`、`名偵探柯南 2.mkv`⋯⋯
+要**同層至少兩個檔案前綴相同、數字不同**才算。
+
+兩條規則都還要再過一關：那串數字**看起來像不像集數**。
+判準是「有沒有補零」（`01`、`02` → 是集數）或「有沒有從頭開始編號」
+（最小值 ≤ 2 → 是集數）。這一關是為了擋掉續集電影 ——
+`玩命關頭 7/8/9` 同層、前綴相同、數字不同，完全符合前兩條規則，
+但它們是三部電影不是三集，而 7、8、9 既沒補零也不從 1 開始。
+
 ---
 
 ## 6. 專案結構
@@ -225,9 +256,19 @@ filmax-web/
    ├─ scanner.py            掃描流程編排
    ├─ auth.py               登入驗證、角色、session token、來源 IP 判斷
    ├─ oauth.py              Google OAuth：state/nonce/PKCE、id_token 驗證
-   ├─ users.py              使用者帳號（欄位對齊 MSSQL 的 filmax_users）
+   ├─ users.py              使用者帳號的門面：政策、快取、挑後端
+   ├─ users_sqlite.py       帳號存本機 SQLite
+   ├─ users_mssql.py        帳號存 dbo.filmax_users
+   ├─ mssql.py              MSSQL 連線、重連、時間換算、健康檢查
+   ├─ audit.py              稽核紀錄（本機一定寫，MSSQL 有設就一起寫）
+   ├─ dbcheck.py            MSSQL 逐項檢查與資料搬移（python -m app.dbcheck）
    ├─ geo.py                從 Cloudflare 標頭取來源位置
    ├─ photo.py              圖片尺寸與 EXIF（刻意不讀 GPS）、縮圖
+   ├─ timeparse.py          FTP／EXIF 的五種時間格式 → epoch 整數
+   ├─ purge.py              唯一的刪除進入點與孤兒清掃
+   ├─ params.py             系統參數登記表：分層、生效方式、秘密加密、日誌過濾
+   ├─ paramstore.py         設定解析（env > DB > 預設）與 CLI 救援路徑
+   ├─ ftpprobe.py           量 FTP 連線上限與速度，推薦併發數（python -m app.ftpprobe）
    ├─ routers/api.py        媒體庫 API、帳號審核 API
    ├─ routers/auth_google.py  /auth/google/start 與 /callback
    ├─ routers/stream.py     串流 / HLS / 字幕端點
@@ -235,13 +276,26 @@ filmax-web/
 
 cloudflare/                 Cloudflare Tunnel 設定腳本與說明
 
-db/                         MSSQL 使用者資料表（第三期用）
-├─ 00_create_database.sql   建立資料庫與兩組帳號
-├─ flyway.conf              Flyway 設定（密碼走環境變數）
-└─ sql/V*.sql               遷移檔
+db/                         MSSQL 使用者資料表
+├─ 00_create_database.sql   建立資料庫與兩組帳號（只跑一次）
+├─ flyway.conf              Flyway 設定（真實位址在 gitignore 的 flyway.local.conf）
+├─ migrate.bat              套用 Flyway 遷移
+├─ 檢查連線.bat              逐項檢查連線、權限、資料表
+└─ sql/V1~V5.sql            遷移檔
+
+docs/規格需求書.md          後續開發的規格（管理後台、系統參數、媒體庫上 MSSQL）
 
 e2e_test.py                 端對端測試（只用標準函式庫）
-tests/oauth_test.py         Google 登入的端對端與攻擊面測試
+tests/oauth_test.py         Google 登入的端對端與攻擊面測試（可切兩種儲存後端）
+tests/mssql_test.py         MSSQL 後端的時區、欄位長度、斷線行為
+tests/fake_pyodbc.py        測試用的 pyodbc 頂替品（後面接 SQLite）
+tests/phase1_test.py        分組規則、時間解析、相片過濾
+tests/scan_e2e_test.py      對真的 FTP 伺服器跑完整掃描
+tests/sql_params_test.py    SQL 佔位符與參數數量（AST 靜態檢查）
+tests/phase2_test.py        批次寫入、purge 連帶刪除、sweep 寬限期、時間值域
+tests/phase3_test.py        設定解析順序、分層、秘密、漂移、後台權限
+tests/env_drift_test.py     程式讀的設定 ↔ .env.example
+tests/browser_test.py       真的 Chromium：換頁捲動、全螢幕、手機版面
 安裝.bat                     一鍵安裝：Python、ffmpeg、venv、套件
 ```
 
@@ -278,7 +332,7 @@ ffmpeg 只看到一個支援 Range 的乾淨 HTTP 來源，可以任意 seek。
 | `POST /api/probe/{file_id}` | 重新分析單一檔案 | 🔒 |
 | `POST /api/rescrape/{item_id}?tmdb_id=` | 手動指定 TMDB 配對 | 🔒 |
 | `GET /api/ftp/browse?path=` | 瀏覽 FTP 目錄（限 `LIBRARY_ROOTS` 之內） | 🔒 |
-| `GET /api/diagnostics` | ffmpeg / FTP / TMDB 一次檢查 | 🔒 |
+| `GET /api/diagnostics` | ffmpeg / FTP / TMDB / 使用者資料庫 一次檢查 | 🔒 |
 | `POST /api/cache/clear` | 清除轉碼與字幕快取 | 🔒 |
 | `GET /api/photos?folder=&q=&sort=&page=` | 相片列表 | |
 | `GET /api/photos/folders` | 有相片的資料夾與張數 | |
@@ -375,8 +429,64 @@ token endpoint 換來的（TLS + 憑證驗證），依 OIDC Core 3.1.3.7 這種�
 登入後的轉址目標只收單斜線開頭的站內路徑，`//host` 這類開放轉址會被丟掉。
 
 **記錄**：註冊當下與最近一次登入的 IP、國家、城市、User-Agent 都寫在帳號上，
-完整歷程在 `login_audit`（`GET /api/audit/logins`）。位置來自 Cloudflare 標頭，
+完整歷程在稽核表（`GET /api/audit/logins`）。位置來自 Cloudflare 標頭，
 要在後台開 Managed Transforms 才會送。
+
+### 使用者資料存哪裡：SQLite 還是 MSSQL
+
+預設存本機 SQLite（`data/library.db` 的 `app_user`）。填了下面這幾項就改存
+MSSQL 的 `dbo.filmax_users`：
+
+```ini
+MSSQL_HOST=你的資料庫位址
+MSSQL_PORT=1433
+MSSQL_DATABASE=filmax
+MSSQL_USER=filmax_app
+MSSQL_PASSWORD=
+MSSQL_DRIVER=ODBC Driver 18 for SQL Server
+MSSQL_TRUST_CERT=false        # 內網自簽憑證要設 true
+```
+
+**沒有「連不上就自動退回 SQLite」這種行為，而且是刻意的。** 那看起來很貼心，
+實際上是把權限判斷變成兩個各說各話的來源：在 MSSQL 核准的人在 SQLite 不存在，
+反過來也一樣，而且沒有人會發現自己正在用哪一份。設定了就是要用它，
+連不上就明講連不上（登入頁會顯示 503，日誌與 `/api/diagnostics` 有原因）。
+
+**接上去的步驟**：
+
+1. Windows 安裝 **Microsoft ODBC Driver 18 for SQL Server**（不是 SQL Server 本身）
+2. `pip install pyodbc`
+3. 資料庫還沒建的話，用 sysadmin 帳號跑一次 `db/00_create_database.sql`
+4. `db\migrate.bat` 套用 Flyway 遷移（V1～V5）
+5. `.env` 填上面那幾項
+6. **`db\檢查連線.bat`** —— 這一步不要跳過
+
+第 6 步會逐項檢查驅動、連線、資料表與欄位、定序、實際的讀寫權限
+（真的寫一筆再刪掉）、稽核表的 `action` 限制式、清理程序的執行權限，
+並在每一關失敗時告訴你要修什麼。已經有本機帳號的話：
+
+```
+db\檢查連線.bat --migrate
+```
+
+會把 SQLite 的 `app_user` 搬進 MSSQL（同 email 的跳過不覆蓋），SQLite 的舊資料
+刻意保留不刪，等你確認過再自己清。
+
+> **Flyway 的 V4 原本會失敗。** V1／V2 後來補上了 V4 想加的那些欄位，
+> 於是在全新的資料庫上 `ALTER TABLE ... ADD` 會撞到
+> `Column names in each table must be unique`，Flyway 停在 V4，
+> 而錯誤訊息看起來像是「Flyway 壞了」。現在 V4 每一句都包在
+> `IF COL_LENGTH(...) IS NULL` 裡，舊資料庫照樣補得到欄位，新資料庫安靜通過。
+> 修的是 V4 而不是回頭改 V1／V2 —— Flyway 記了每個檔案的 checksum，
+> 只要在任何一台機器套用過，事後修改就會讓 `validate` 失敗。
+
+**兩張表**：`dbo.filmax_users`（帳號、角色、狀態、註冊與最近登入的來源）與
+`dbo.filmax_audit`（每一筆事件的完整來源）。程式只讀寫資料，**不會建表也不會改表** ——
+服務用的 `filmax_app` 帳號被明確 `DENY` 掉 DDL，結構一律走 Flyway。
+
+**時間**一律以 epoch 秒在程式裡流動；MSSQL 存 `DATETIME2`（UTC），
+換算集中在 `app/mssql.py`。這是最容易出錯的地方：`DATETIME2` 讀回來是**沒有時區**的
+`datetime`，直接 `.timestamp()` 在 UTC+8 會整整差 8 小時。
 
 ### 遠端自動降畫質
 
@@ -529,13 +639,182 @@ COOKIE_SECURE=true
 **圖片的大小門檻跟影片分開。** `MIN_FILE_MB` 預設 50MB 是為了濾掉預告片，
 套在照片上會把幾乎所有圖片濾掉，所以圖片改用 `MIN_PHOTO_KB`（預設 40KB）。
 
+**影片的海報不算相片。** 影片資料夾裡的 `poster.jpg`、`fanart.jpg`、`cover.png`
+這類固定檔名，以及跟同資料夾影片同名的圖（`玩命關頭.mkv` 旁邊的 `玩命關頭.jpg`），
+掃描時會跳過。不跳的話點「相片」會看到一整牆的影片封面，
+真正的照片被埋在裡面。要全部收進來就把 `PHOTO_EXCLUDE_VIDEO_ARTWORK` 設 false。
+
+**排序看的是拍攝時間，不是掃描時間。** 相片牆依 `sort_ts` 由新到舊排 ——
+有 EXIF 拍攝時間就用它，沒有就退回檔案修改時間。這些時間在資料庫裡存的是
+**epoch 整數**而不是字串：FTP 伺服器回的時間格式有五種以上
+（MLSD 的 ISO、EXIF 的 `2024:03:09 14:05:22`、LIST 的 `Mar 15 10:22`
+與沒有年份的 `Mar 15  2024`、DOS 的 `03-15-24 10:22AM`），
+存字串就等於用字典序排時間，同一天內的順序會亂掉。
+解析集中在 `app/timeparse.py`，認不出來的一律留空而不是猜一個。
+
 > 唯讀角色看得到相片，但沒有「下載原圖」按鈕。要注意的是，
 > **看大圖本身就是在取得原始檔案** —— 相片不像影片可以只給轉碼串流，
 > 所以這個限制對相片來說主要是介面上的提示，不是真正的技術隔離。
 
 ---
 
-## 10. 播放器
+## 10. 資料層：批次寫入與刪除
+
+**寫入是批次的。** 原本掃描時每個檔案一句 `db.execute()`，而每一句都是一個
+獨立交易 —— WAL 底下就是一次 fsync。109 個影片檔加 679 張相片就是快 800 次。
+現在走訪期間的寫入全部進緩衝，累積到 500 筆才一起送出。實測（真的 FTP 伺服器、
+上面那個規模）：**首次掃描 784 → 125 個交易，重掃 784 → 5 個。**
+
+不是每張表都適合批次：
+
+| 表 | 批次 | 為什麼 |
+|---|---|---|
+| `media_file` / `photo` | 可以 | 純 upsert，寫完不需要當場拿到 id |
+| `media_item` / `episode` | **不批次** | 要先有 `item_id` 才寫得了檔案列 |
+
+條目改用行程內註冊表：掃描開始時把既有的 `guess_key → id` 全部載進記憶體，
+之後在記憶體裡查，新建的順手記下來。省掉的是每個檔案一次 `SELECT`。
+硬把條目做成批次只會製造難修的競態 —— 兩個地方同時建立同一個 `guess_key`，
+同一部影集就變成兩張海報，一張 12 集一張 1 集。
+
+**刪除只有一個進入點。** `app/purge.py` 的 `purge()` 是唯一會刪媒體庫資料的地方，
+`reason` 必填而且會進 `purge_log`。SQLite 其實有外鍵也有 `ON DELETE CASCADE`，
+但外鍵管不到兩件事，而那兩件正是實際會出問題的：
+
+- **磁碟上的檔案。** 海報、底圖、縮圖都是 `data/images/` 底下的真檔案。
+  資料列被 CASCADE 掉之後，檔案就永遠留在那裡，沒有任何東西記得它存在。
+- **換一個後端就不一樣了。** 規格 A-5 的 MSSQL 媒體庫刻意不做外鍵。
+  刪除邏輯藏在 CASCADE 裡的話，換後端等於整套刪除行為靜默改變。
+
+相片縮圖是**內容雜湊**命名的（見 §9），所以兩張一模一樣的照片會共用同一個檔案。
+刪掉其中一張就順手刪檔，另一張會變破圖 —— 所以刪檔前一定要數參照。
+
+**孤兒清掃**分三個時機，模式不一樣：
+
+| 時機 | 模式 | 為什麼 |
+|---|---|---|
+| 掃描的 `finally` | 修 | 「被取消」與「出錯」正是孤兒最多的結局，只掛成功路徑等於永遠不清最需要清的那次 |
+| 服務啟動 | 只回報 | **刻意不修**。啟動路徑自動刪資料很糟，尤其剛還原備份或剛換後端之後 |
+| `POST /api/maintenance/sweep` | 兩種 | 預設 `report`，先看清單再決定 |
+
+第 5、6、7 類孤兒（沒有檔案的條目／集數、沒人參照的圖片）有 **1 小時寬限期**：
+索引流程是「先建條目、再寫檔案列」，兩步之間那個條目是完全合法的孤兒。
+
+孤兒計數露在 `/api/stats`。沒有外鍵的資料庫，這個數字就是體溫計 ——
+它持續往上，代表刪除路徑有地方漏了。
+
+---
+
+## 11. 管理後台與系統參數
+
+`/admin`，只有管理員進得去，手機可用。六個分區：
+
+| 分區 | 有什麼 |
+|---|---|
+| 總覽 | 執行時間、影片／相片／容量計數、磁碟剩餘、孤兒計數、最近 10 筆活動、進行中的掃描、問題警示 |
+| 媒體庫 | 掃描控制與即時進度（含相片階段）、未刮削清單、失敗檔案與錯誤、FTP 目錄瀏覽器、孤兒清掃 |
+| 使用者 | 清單與狀態篩選、核准／拒絕／停權／改角色／刪除、備註、最後登入來源 |
+| 播放與轉碼 | ffmpeg 狀態、硬體加速探測、編碼器深度診斷、轉碼實測、FTP 併發量測、GPU、清快取 |
+| 系統 | 資料庫狀態、FTP 測試、TMDB 狀態、系統參數設定 |
+| 紀錄 | 登入稽核（伺服器端分頁）、掃描日誌、設定變更稽核 |
+
+`/admin` 這條路由**自己檢查角色** —— 中介層只驗「有沒有登入」，不驗「是不是管理員」。
+`admin.js` 放在 `/static/` 底下，不需登入就下載得到，所以裡面沒有任何敏感資訊；
+真正的保護在每一個 API 端點上。
+
+手機版斷點 768px。表格換成卡片，**不是**用 CSS 把欄位藏起來 ——
+藏起來等於資料消失而且沒有替代入口。iOS 刻意不做邊緣滑動開啟抽屜，
+那會跟系統的返回手勢打架。
+
+### 系統參數：`.env` 與資料庫怎麼共存
+
+兩邊比大小的話，兩個方向各有一種很惡毒的失效模式：
+
+| 誰贏 | 失效模式 |
+|---|---|
+| 資料庫贏 | **改 `.env` 沒反應。** `.env` 是自架使用者唯一熟悉的介面，變成裝飾品之後使用者會認定程式壞了。輪替金鑰時只改 `.env`、以為換好了、實際仍用舊值 —— 那是安全事故等級 |
+| `.env` 贏 | **存了但沒生效。** 在後台改值、按存檔、看到成功提示、行為完全沒變，也沒有警告 |
+
+選 **`.env` 贏**，因為它的失效模式是純 UX 問題，而 UX 問題可以用 UI 解決。
+所以解法不是比大小，是**把「誰在管這一項」變成畫面上看得見的東西**：
+
+```
+.env / 環境變數  >  資料庫  >  程式內建預設值
+```
+
+一條規則，沒有例外清單。API 不只回生效值，還回三個候選值與兩個旗標：
+
+```json
+{ "key": "TRANSCODE_CRF",
+  "effective": { "value": 21, "source": "env" },
+  "candidates": { "env": 21, "db": 23, "default": 21 },
+  "locked": true, "shadowed": true, "applyMode": "hot", "secret": false }
+```
+
+`shadowed` 一個欄位就解決「`.env` 改了但資料庫已經有值」的全部歧義。
+被鎖住的欄位在後台是**停用**的，旁邊寫明「此項由環境變數設定」，
+而且不給儲存鈕 —— 停用的欄位絕不能是「送出之後才在後端報錯」。
+
+### 哪些設定放得進後台
+
+分層是四個機械化問句問出來的，不是憑感覺：
+
+| 問句 | 答「是」 | 例 |
+|---|---|---|
+| 改錯了會不會讓我連後台都進不去？（或讀它時資料庫還沒連上） | 只能放 `.env` | MSSQL 連線、`HOST`/`PORT`、`AUTH_SECRET`、`USER_STORE`/`MEDIA_STORE` |
+| 這個值會被當命令、路徑或程式碼執行嗎？ | 不放 UI | `FFMPEG_PATH`、`LIBRARY_ROOTS`、`TRUST_PROXY`、`LOCAL_NETWORKS` |
+| 洩漏了是外部系統倒楣嗎？ | 秘密（唯寫） | `TMDB_API_KEY`、`FTP_PASSWORD`、`GOOGLE_CLIENT_SECRET` |
+| 啟動時被拿去建立長生命週期的東西了嗎？ | 需重啟／重載 | 探測併發數、快取上限、FTP 連線資訊 |
+| 以上都不是 | **後台可改，即時生效** | 掃描排除、轉碼參數、遠端畫質、相片門檻、TMDB 語言 |
+
+> Tier 4 有先例：Navidrome 把轉碼設定的 UI 預設關閉，理由寫在他們的安全文件裡 ——
+> 「它讓攻擊者可以在你的伺服器上執行任意命令」。`FFMPEG_PATH` 是同一類東西。
+
+**「秘密」跟分層是獨立的兩件事。** 分層講的是「可以在哪裡設定」，秘密講的是
+「可不可以讀出來」。`AUTH_PASSWORD` 只能放 `.env`（改錯了會把自己鎖在外面），
+但它同時是不折不扣的密碼。一開始把秘密寫成分層的衍生屬性，結果就是 CLI
+把 `AUTH_PASSWORD` 明文印在畫面上。
+
+### 即時生效是怎麼做到的
+
+即時生效的那些設定**不是 dataclass 欄位，是每次讀都重新解析的 property**。
+dataclass 欄位在 import 時就定案了 —— 後台改了值、存進資料庫、UI 顯示「已生效」，
+而程式仍然在用啟動當下讀到的那個數字。
+
+同樣的道理，**任何模組都不可以在頂層寫 `CRF = settings.crf`**。那等於又把它
+凍回 import 當下的值，而 UI 仍然顯示「已生效」。這種退步不會出任何錯，
+只是沒有作用，所以 `tests/phase3_test.py` 有一項用 AST 掃過每個模組的頂層釘住它。
+
+### 其他機制
+
+- **啟動時漂移掃描** —— 被環境變數蓋掉的後台設定會在日誌與後台橫幅上列出來，
+  但**絕不自動刪**：使用者可能只是暫時用環境變數覆蓋（測試、容器編排）。
+- **`.env` 的錯字抓得出來。** `TMDB_API_KAY=xxx` 本來是完全靜默失效的，
+  現在會說「是不是想打 `TMDB_API_KEY`？」
+- **大小寫與別名不算「設錯了」。** `HDR_TONEMAP=AUTO` 與 `FTP_ENCODING=cp950`
+  都收得下 —— 升級之後因為大小寫而開不起來，對使用者來說就是「你們改壞了」，
+  而他什麼都沒動。編碼名稱刻意不列白名單，改成問 Python 認不認得。
+- **驗證嚴格度兩邊不同，這是刻意的。** `.env` 的值無效 → **啟動失敗**
+  （那是使用者明確寫下的指令，錯了還默默跑起來他會以為生效了）；
+  資料庫的值無效 → 退回預設並在後台標示（一個舊版留下的壞值不該讓機器開不了機）。
+- **秘密**存資料庫時加密，密文帶固定前綴，加密金鑰本身只能放 `.env`。
+  支援 `XXX_FILE` 從檔案讀。日誌過濾掛成 **logger filter** 而不是在每個呼叫點
+  各自處理 —— 逐點處理只能防住你想得到的那些點。
+- **設定變更稽核**：誰、何時、哪一項、從什麼改成什麼。
+  秘密只記「已變更」，**連遮罩後的值都不記** —— 長度也是情報。
+- **CLI 救援路徑**，後台進不去時唯一的出路：
+
+```
+python -m app.paramstore list [區段]
+python -m app.paramstore get TRANSCODE_CRF
+python -m app.paramstore set TRANSCODE_CRF 20
+python -m app.paramstore unset TRANSCODE_CRF
+python -m app.paramstore diff          # 只列跟預設值不同的
+```
+
+---
+
+## 12. 播放器
 
 自製播放器，沒有用瀏覽器原生控制列。字幕**不是**交給 `<track>`，
 而是自己解析 WebVTT 後用 DOM 畫出來 —— `::cue` 的跨瀏覽器支援很差，
@@ -549,6 +828,44 @@ COOKIE_SECURE=true
 用它的時間排序就會讓其他裝置的設定永遠同步不上去。
 
 **快轉秒數**可選 3 / 5 / 10 / 30 秒。
+
+### 全螢幕：手機上有兩種，而且 iPhone 只有一種
+
+桌機按 `F` 就是瀏覽器全螢幕，沒什麼好說的。手機是另一回事：
+
+- **iOS Safari 沒有 `Element.requestFullscreen`**。整個播放器容器要全螢幕
+  在 iPhone 上是做不到的 —— 那支 API 根本不存在，呼叫下去只會拿到
+  `undefined is not a function`。iPhone 唯一能全螢幕的是 `<video>` 元素本身，
+  透過 `video.webkitEnterFullscreen()`。
+- 但走原生全螢幕就等於把畫面交給系統播放器，**自繪字幕會消失**
+  （它是 DOM，不在 video 裡）。
+
+所以設定面板給兩個模式，預設**自動**：
+
+| 模式 | 做什麼 | 字幕 |
+|---|---|---|
+| 網頁全螢幕 | 播放器容器撐滿可視區域（`100dvh` + 安全區內距），控制列與自繪字幕全部保留 | 自繪，全部設定都有效 |
+| 原生全螢幕 | 交給系統播放器，可以轉到橫向、狀態列會收起來 | 自動塞進 `<video>` 的字幕軌，樣式由系統決定 |
+
+面板顯示的是**實際會發生的那一個**，不是設定值。挑到瀏覽器做不到的模式時
+會自動退回另一種，而面板上跟著改 —— 顯示「原生」但實際跑網頁全螢幕
+是最難查的那種 bug。
+
+進原生全螢幕時，自繪字幕會即時餵進 `<video>` 的 TextTrack（去掉 HTML 標籤），
+退出時關掉並還原自繪。切換字幕軌會清掉舊的句子 —— 這裡有個坑：
+`TextTrack.cues` 在 `mode === 'disabled'` 時是 `null`，
+用 `disabled` 藏字幕的話清除迴圈會安靜地什麼都沒做，中英文字幕就疊在一起了。
+所以平常是 `'hidden'`（有在跑但不顯示）而不是 `'disabled'`。
+
+### 換頁不會跳回最上面
+
+海報牆換頁時捲到**格線頂端**，不是文件頂端 —— 捲到文件頂端會停在標頭、
+搜尋列、分類標籤之上，離第一列還有一大段，等於每次換頁都要再往下捲一次。
+sticky 標頭的高度是動態量的，不是寫死：手機上標頭會換行，高度跟桌機不一樣。
+
+本來就在最上面的話就不捲。這裡有個不明顯的地方：**這個判斷必須在換內容之前做**。
+換頁時格線會先被清成「載入中」，頁面高度瞬間塌掉，瀏覽器把捲動位置夾到 0 ——
+這時候才問「使用者是不是已經在上面了」，答案永遠是「是」，於是永遠不捲。
 
 ### 音軌
 
@@ -570,7 +887,7 @@ COOKIE_SECURE=true
 
 ---
 
-## 11. 端對端測試 (e2e_test.py)
+## 13. 端對端測試 (e2e_test.py)
 
 服務啟動後，隨時可以跑一遍完整鏈路檢查，逐層告訴你問題出在哪一環：
 
@@ -606,9 +923,55 @@ python e2e_test.py --base http://192.168.1.5:8080
 最後一個管理員的保護，以及 `state` 不符／`nonce` 重放／`aud` 不對／`iss` 造假／
 `id_token` 過期／email 未驗證／竄改 state cookie／開放轉址／畸形輸入不能變成 500。
 
+同一套測試可以切到 MSSQL 那條程式碼路徑：
+
+```
+.venv\Scripts\python tests\oauth_test.py --mssql
+.venv\Scripts\python tests\mssql_test.py
+```
+
+後面接的是 `tests/fake_pyodbc.py`（把 pyodbc 換掉，底下用 SQLite），
+所以**不需要真的 SQL Server**。它驗得到的是 SQL 欄位對齊、參數順序、
+時間轉換、欄位長度截斷、斷線時不會變成 500、密碼不會漏進日誌。
+
+它**驗不到**的是方言層面的東西：定序、`DATETIME2` 精度、`OUTPUT` 在有觸發程序時的
+行為、實際權限。那些要在真的資料庫上跑 `db\檢查連線.bat`。這個分工是刻意的 ——
+與其寫一套「看起來全綠但其實沒碰到真資料庫」的測試，不如把驗不到的部分交給
+一支你在自己機器上跑得動的工具。
+
+### 其他測試
+
+全部都不需要外部服務，跑完就刪暫存資料夾，不會動到你的 `data/`。
+
+```
+.venv\Scripts\python tests\phase1_test.py       # 分組規則、時間解析、相片過濾、靜態檢查
+.venv\Scripts\python tests\phase2_test.py       # 批次寫入、purge／sweep、時間值域、取消
+.venv\Scripts\python tests\phase3_test.py       # 設定分層與解析、秘密、後台權限
+.venv\Scripts\python tests\scan_e2e_test.py     # 開一台真的 FTP 伺服器掃一遍
+.venv\Scripts\python tests\sql_params_test.py   # SQL 佔位符與參數數量對不對
+.venv\Scripts\python tests\env_drift_test.py    # 程式讀的設定 ↔ .env.example
+.venv\Scripts\python tests\browser_test.py      # 開真的 Chromium 按按看（需要 playwright）
+```
+
+後三支是為了擋掉**同一類**的錯，而不是為了某一個 bug：
+
+- `sql_params_test.py` 用 AST 數每一句 SQL 的 `?` 跟傳進去的參數個數。
+  這類錯只有在該條路徑真的被走到時才爆，而 `UPDATE` 分支往往要第二次掃描才進得去 ——
+  第一次掃描的測試全綠，錯還在裡面。
+- `env_drift_test.py` 比對 `config.py` 讀的鍵跟 `.env.example` 寫的鍵。
+  加了設定忘了寫進範例檔，使用者永遠不知道它存在；範例檔留著早就刪掉的鍵，
+  使用者照著設卻毫無作用 —— 兩種都不會有任何錯誤訊息。
+- `browser_test.py` 開真的瀏覽器。靜態檢查只能證明「程式碼改了」，
+  證明不了「畫面會動」；捲動與全螢幕這兩件事，除了真的按下去以外沒有別的驗法。
+
+> `browser_test.py` 裡的分頁鈕是用 JS 觸發 click 的，不是 Playwright 的
+> `page.click()`。因為 `page.click()` 會**先把元素捲進視窗**才按 ——
+> 分頁鈕在第一屏之外，於是每次點擊當下的捲動位置都是 Playwright 捲過去的那個，
+> 不是測試設定的那個。那樣量到的是 Playwright 的行為，不是 app 的。
+
 ---
 
-## 12. 疑難排解
+## 14. 疑難排解
 
 **播放時出現「分析失敗：[WinError 2] 系統找不到指定的檔案」**
 → 這是找不到 `ffprobe`。注意 **ffmpeg 和 ffprobe 是兩支獨立的執行檔**，
@@ -655,20 +1018,26 @@ Windows 防火牆放行該連接埠，其他裝置開 `http://你的電腦IP:808
 
 ### 已完成
 
-- **媒體庫** — FTP 遞迴掃描、檔名解析（中英片名、年份、季集、動畫集數）、TMDB 刮削、海報牆、分類與搜尋、繼續觀看
+- **媒體庫** — FTP 遞迴掃描、檔名解析（中英片名、年份、季集、動畫集數、一集一資料夾、檔名結尾數字）、TMDB 刮削、海報牆、分類與搜尋、繼續觀看、不重掃 FTP 的重新分組
 - **播放** — 直接串流（HTTP Range）與隨選分段 HLS 轉碼自動選擇、HDR→SDR tonemap、H.264 level 自動選擇、遠端自動降畫質、轉碼快取與預轉
 - **播放器** — 自製控制列、字幕自繪（大小/顏色/位置/描邊/字體/延遲）、多音軌切換、畫質切換、片源資訊、設定跨裝置同步
 - **字幕** — 內嵌與外掛字幕轉 WebVTT、**邊抽邊送**（大檔案第一句字幕約 0.3 秒出現，而非等整部片 demux 完）、抽好存快取、**自動挑繁體中文**（先看語言標籤，標籤分不出繁簡時看實際內容用字判斷）、圖形字幕（PGS/VobSub）標示為無法顯示
-- **相片庫** — 掃描圖片、讀尺寸與 EXIF、產縮圖、相片牆與燈箱檢視
+- **相片庫** — 掃描圖片、讀尺寸與 EXIF、產縮圖、相片牆與燈箱檢視、依拍攝時間排序、排除影片海報
 - **帳號** — Google 登入（authorization code + PKCE）、審核制註冊、後台審核介面、註冊與登入的 IP 與地理位置記錄
+- **使用者資料** — 可存本機 SQLite 或 MSSQL（`dbo.filmax_users`），Flyway 管結構，附連線與權限的逐項檢查工具、SQLite→MSSQL 搬移
+- **稽核** — 註冊／登入／被拒／核准／停權／改角色都留紀錄，本機一定寫，MSSQL 有設就一起寫
 - **權限** — 管理員／唯讀兩種角色，角色寫進 session token 並納入簽章；改密碼或停權／降級都會讓既有 session 立刻失效
 - **安全** — 內部憑證走標頭不走網址、來源 IP 判斷不採信可偽造的標頭、CSP 等安全標頭、輸入驗證與速率限制
 - **對外開放** — Cloudflare Tunnel 一鍵設定（含 Windows 服務）、登入紀錄含來源 IP 與地理位置
+- **管理後台** — `/admin` 六個分區，手機可用；系統參數同時支援 `.env` 與資料庫（`.env` 優先，逐欄位標示鎖定與遮蔽），秘密加密唯寫，設定變更稽核，CLI 救援路徑
+- **資料層** — 掃描寫入批次化（重掃的交易數少兩個數量級）、單一刪除進入點含磁碟檔與稽核、孤兒清掃與計數、時間欄位一律 epoch 整數並有值域守門
 - **維運** — 一鍵安裝腳本、端對端測試腳本（含 Google 登入的攻擊面測試）、診斷 API、MSSQL 資料表的 Flyway 遷移檔
 
 ### 進行中 / 規劃中
 
-- 使用者資料改存 MSSQL（目前存在本機 SQLite，欄位已對齊 `dbo.filmax_users`，換儲存只需改 `app/users.py`）
+規格見 [`docs/規格需求書.md`](docs/規格需求書.md)。
+
+- **媒體庫上 MSSQL**（規劃中）— 目前 `MEDIA_STORE` 預設且只支援 sqlite
 - 每位使用者各自的播放進度（偏好設定已經是每人一份）
 - Remux 直通（影像不轉碼只換容器），H.264 片源可望接近秒開
 

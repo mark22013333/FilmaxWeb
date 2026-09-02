@@ -1,16 +1,19 @@
 """媒體庫 API：清單、詳情、搜尋、掃描控制、播放資訊、續播進度。"""
 from __future__ import annotations
 
+import anyio
 import json
 import posixpath
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from .. import auth, db, ftpclient, geo, hls, media, scanner, users
-from ..config import IMAGE_DIR, settings
+from .. import (audit, auth, db, ftpclient, geo, hls, media, mssql, params,
+                paramstore, purge, scanner, users)
+from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
 router = APIRouter()
@@ -74,8 +77,7 @@ def _last_owner(uid: int) -> bool:
     rec = users.by_id(uid)
     if not rec or rec.get("role") != users.OWNER or rec.get("status") != "approved":
         return False
-    n = db.q1("SELECT COUNT(*) c FROM app_user WHERE role='owner' AND status='approved'")
-    return (n["c"] if n else 0) <= 1
+    return users.owner_count() <= 1
 
 
 @router.get("/users")
@@ -93,15 +95,28 @@ def user_patch(uid: int, p: UserPatch, request: Request, _: str = Depends(admin_
     if (p.status and p.status != "approved") or (p.role and p.role != users.OWNER):
         if _last_owner(uid):
             raise HTTPException(400, "這是最後一個管理員，不能停權或降級")
+    who = auth.identity(request)
+    ip = auth.client_ip(request.scope)
     try:
         if p.role is not None:
             rec = users.set_role(uid, p.role)
         if p.status is not None:
-            rec = users.set_status(uid, p.status, by=auth.identity(request))
+            rec = users.set_status(uid, p.status, by=who)
         if p.note is not None:
             rec = users.set_note(uid, p.note)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # 誰把誰改成什麼，一定要留下來 —— 權限變動是事後追查時第一個要看的東西
+    if p.status in ("approved", "rejected", "disabled"):
+        audit.record({"approved": "approve", "rejected": "reject",
+                      "disabled": "disable"}[p.status],
+                     ip=ip, loc=geo.from_scope(request.scope), email=rec.get("email"),
+                     user_id=uid, detail=f"by {who}", ip_source=geo.ip_source(request.scope))
+    if p.role is not None:
+        audit.record("role_change",
+                     ip=ip, loc=geo.from_scope(request.scope), email=rec.get("email"),
+                     user_id=uid, detail=f"role={p.role} by {who}",
+                     ip_source=geo.ip_source(request.scope))
     return rec
 
 
@@ -190,6 +205,12 @@ def stats(request: Request):
         "total_size": db.q1("SELECT COALESCE(SUM(size),0) c FROM media_file")["c"],
         "tmdb_enabled": tmdb.enabled,
     }
+    # 沒有外鍵可以靠的資料庫，孤兒計數就是體溫計 ——
+    # 這個數字持續往上，代表刪除路徑有地方漏了。
+    try:
+        out["orphans"] = purge.counts()
+    except Exception:
+        out["orphans"] = None
     # FTP 位址、片庫路徑、硬體資訊對「能看片」沒有用處，卻是很好的偵察材料
     if auth.is_admin(request):
         out.update({
@@ -443,9 +464,99 @@ def continue_watching(limit: int = 20):
 
 
 # ------------------------- 掃描 -------------------------
+# --------------------------------------------------------------------------
+# 系統參數（規格 B+）
+# --------------------------------------------------------------------------
+def _actor(request: Request) -> str:
+    return auth.user_email(request) or auth.role_of(request) or "?"
+
+
+@router.get("/params")
+def params_list(_: str = Depends(admin_only)):
+    """所有可在後台調整的設定。
+
+    每一項都回三個候選值與 locked / shadowed，不是只回生效值 ——
+    只回生效值的話，使用者改了一個被 .env 蓋住的項目會看到「儲存成功」
+    而行為完全沒變，畫面上找不到任何線索。
+    """
+    items = paramstore.describe_all()
+    return {
+        "sections": [s for s in params.SECTIONS
+                     if any(i["section"] == s for i in items)],
+        "items": items,
+        "drift": [d["key"] for d in paramstore.drift()],
+        "needsRestart": paramstore.needs_restart(),
+        "unknownEnvKeys": [{"key": k, "guess": g} for k, g in params.unknown_env_keys()],
+        "startedAt": paramstore.STARTED_AT,
+    }
+
+
+class ParamSet(BaseModel):
+    value: object = None
+
+
+@router.put("/params/{key}")
+def params_set(key: str, body: ParamSet, request: Request,
+               _: str = Depends(admin_only)):
+    """改一項設定。
+
+    被鎖住的欄位前端會停用，但這裡仍然要擋。前端的停用是提示，不是防線 ——
+    而「停用的欄位送出之後才在後端報錯」是規格點名要避免的那個 bug。
+    """
+    try:
+        return paramstore.set_value(key, body.value, actor=_actor(request))
+    except paramstore.NotEditable as e:
+        raise HTTPException(403, str(e))
+    except KeyError:
+        raise HTTPException(404, f"沒有這個設定：{key}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.delete("/params/{key}")
+def params_clear(key: str, request: Request, _: str = Depends(admin_only)):
+    """刪掉後台儲存的值，回到 .env 或預設值。"""
+    if key not in params.REGISTRY:
+        raise HTTPException(404, f"沒有這個設定：{key}")
+    return paramstore.clear(key, actor=_actor(request))
+
+
+@router.get("/params/audit")
+def params_audit(limit: int = Query(default=100, ge=1, le=500),
+                 _: str = Depends(admin_only)):
+    """設定變更紀錄。秘密只記「已變更」，不記值也不記長度。"""
+    return {"entries": paramstore.audit(limit)}
+
+
+@router.post("/maintenance/sweep")
+def sweep(mode: str = Query(default="report", pattern="^(report|fix)$"),
+          _: str = Depends(admin_only)):
+    """清掃孤兒資料。
+
+    預設是 report —— 先看清單再決定要不要動手。這個順序是刻意的：
+    「按一下就刪掉一些東西，而且不知道刪了什麼」在資料清理工具上是最差的設計。
+    """
+    return purge.sweep(mode, reason="admin_sweep")
+
+
+@router.get("/maintenance/purge-log")
+def purge_log(limit: int = Query(default=50, ge=1, le=500),
+              _: str = Depends(admin_only)):
+    """最近的刪除紀錄。使用者說「我的東西不見了」時，這是第一個要看的地方。"""
+    return {"entries": [db.row_to_dict(r) for r in db.q(
+        "SELECT * FROM purge_log ORDER BY at DESC LIMIT ?", (limit,))]}
+
+
 @router.post("/scan")
-def scan_start(full: bool = Query(default=False), _: str = Depends(admin_only)):
-    if not scanner.start(full=full):
+def scan_start(full: bool = Query(default=False),
+               reparse: bool = Query(default=False),
+               _: str = Depends(admin_only)):
+    """開始掃描。
+
+    full=true    重新刮削所有條目、重新分析所有檔案
+    reparse=true 強制重新解析檔名並重新分組（改了解析規則之後要用）
+    """
+    if not scanner.start(full=full, reparse=reparse):
         return JSONResponse({"ok": False, "message": "掃描已在進行中"}, status_code=409)
     return {"ok": True}
 
@@ -456,9 +567,19 @@ def scan_cancel(_: str = Depends(admin_only)):
     return {"ok": True}
 
 
+# 掃描日誌裡有 FTP 的完整路徑，唯讀使用者不該看到片庫的目錄結構。
+# 但「現在是不是在掃描」是無害的，而且前端的空狀態畫面需要它 ——
+# 所以不是整支擋掉，是把敏感欄位拿掉。
+_SCAN_PUBLIC = ("running", "phase", "files_found", "items_total",
+                "photos_found", "photo_total", "elapsed")
+
+
 @router.get("/scan/status")
-def scan_status():
-    return scanner.status_dict()
+def scan_status(request: Request):
+    st = scanner.status_dict()
+    if auth.is_admin(request):
+        return st
+    return {k: st.get(k) for k in _SCAN_PUBLIC}
 
 
 @router.post("/rescrape/{item_id}")
@@ -540,13 +661,16 @@ def photos(folder: Optional[str] = None, q: Optional[str] = None,
         params += [f"%{q}%", f"%{q}%"]
     sql_where = " WHERE " + " AND ".join(where)
     # 排序走白名單，使用者輸入不會進到 SQL
-    order = {"taken": "COALESCE(taken_at, mtime) DESC, id DESC",
+    # sort_ts 是寫入時算好的排序鍵。原本是 COALESCE(taken_at, mtime)，
+    # 而那兩欄是格式不同的字串 —— 字串比大小的結果是「同一天裡只有 mtime 的
+    # 照片永遠排在有 EXIF 的前面」，因為 ' '(0x20) < 'T'(0x54)。
+    order = {"taken": "sort_ts DESC, id DESC",
              "name": "filename COLLATE NOCASE",
              "size": "size DESC",
-             "added": "added_at DESC, id DESC"}.get(sort, "COALESCE(taken_at, mtime) DESC, id DESC")
+             "added": "added_at DESC, id DESC"}.get(sort, "sort_ts DESC, id DESC")
     total = db.q1(f"SELECT COUNT(*) c FROM photo{sql_where}", tuple(params))["c"]
     rows = db.q(f"""SELECT id, folder, filename, ext, size, mtime, width, height,
-                           taken_at, thumb
+                           taken_at, sort_ts, thumb
                     FROM photo{sql_where} ORDER BY {order} LIMIT ? OFFSET ?""",
                 tuple(params) + (page_size, (page - 1) * page_size))
     return {"total": total, "page": page, "page_size": page_size,
@@ -556,12 +680,12 @@ def photos(folder: Optional[str] = None, q: Optional[str] = None,
 @router.get("/photos/folders")
 def photo_folders():
     """有相片的資料夾清單，附張數與代表縮圖。"""
-    rows = db.q("""SELECT folder, COUNT(*) c, MAX(COALESCE(taken_at, mtime)) latest,
-                          MIN(COALESCE(taken_at, mtime)) earliest,
+    rows = db.q("""SELECT folder, COUNT(*) c, MAX(sort_ts) latest,
+                          MIN(sort_ts) earliest,
                           SUM(size) bytes,
                           (SELECT thumb FROM photo p2
                             WHERE p2.folder = p.folder AND p2.thumb IS NOT NULL
-                            ORDER BY COALESCE(p2.taken_at, p2.mtime) DESC LIMIT 1) cover
+                            ORDER BY p2.sort_ts DESC LIMIT 1) cover
                    FROM photo p WHERE probe_state='ok'
                    GROUP BY folder ORDER BY latest DESC""")
     return {"items": [db.row_to_dict(r) for r in rows]}
@@ -592,25 +716,139 @@ def photo_detail(photo_id: int):
 
 
 @router.get("/audit/logins")
-def audit_logins(limit: int = 100, _: str = Depends(admin_only)):
-    """最近的登入紀錄，含來源 IP 與 Cloudflare 判斷的位置。"""
-    limit = max(1, min(int(limit), 500))
-    rows = db.q("""SELECT at, event, role, ip, country, region, city, timezone,
-                          latitude, longitude, user_agent, email, user_id, detail
-                   FROM login_audit ORDER BY at DESC LIMIT ?""", (limit,))
+def audit_logins(limit: int = 25, offset: int = 0, event: str = "",
+                 _: str = Depends(admin_only)):
+    """最近的登入紀錄，含來源 IP 與 Cloudflare 判斷的位置。
+
+    伺服器端分頁。一次把幾千筆全部送到瀏覽器再讓它自己切，
+    在手機上就是一段可見的卡頓，而且那些資料多半沒有人會看。
+    """
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    where, args = "", []
+    if event:
+        where = " WHERE event=?"
+        args.append(event)
+    total = db.q1(f"SELECT COUNT(*) c FROM login_audit{where}", tuple(args))["c"]
+    rows = db.q(f"""SELECT at, event, role, ip, country, region, city, timezone,
+                           latitude, longitude, user_agent, email, user_id, detail
+                    FROM login_audit{where} ORDER BY at DESC LIMIT ? OFFSET ?""",
+                tuple(args) + (limit, offset))
     out = []
     for r in rows:
         d = db.row_to_dict(r) or {}
         d["where"] = geo.describe(d)
         out.append(d)
-    return {"items": out,
+    return {"items": out, "total": total, "limit": limit, "offset": offset,
             # 位置標頭要在 Cloudflare 後台開 Managed Transforms 才會送
             "geo_available": any(x.get("country") for x in out)}
+
+
+@router.post("/admin/ftp-probe")
+async def admin_ftp_probe(max_n: int = Query(default=12, ge=2, le=64),
+                          speed: bool = Query(default=True),
+                          _: str = Depends(admin_only)):
+    """量 FTP 的併發上限與有效併發。
+
+    會開好幾條連線並下載一小段資料，可能要跑一分鐘以上，所以丟到執行緒去跑，
+    不要卡住整個事件迴圈（卡住的話所有人的播放都會停）。
+    """
+    from .. import ftpprobe
+
+    def run():
+        limit, first_fail, errs = ftpprobe.find_limit(max_n, float(settings.ftp_timeout or 20))
+        sp = {}
+        picked = None
+        if speed and limit >= 2:
+            picked = ftpprobe._pick_file(float(settings.ftp_timeout or 20))
+            if picked:
+                levels = sorted({n for n in (1, 2, 3, 4, 6, 8) if n <= limit})
+                sp = ftpprobe.measure_speed(levels, float(settings.ftp_timeout or 20), picked[0])
+        value, notes = ftpprobe.recommend(limit, first_fail, sp)
+        return {"limit": limit, "firstFail": first_fail, "errors": errs[:5],
+                "speed": {str(k): {"mbps": v[0], "rounds": v[1]} for k, v in sp.items()},
+                "sample": picked[0] if picked else None,
+                "recommend": value, "notes": notes}
+
+    return await anyio.to_thread.run_sync(run)
+
+
+@router.get("/admin/overview")
+def admin_overview(_: str = Depends(admin_only)):
+    """後台總覽。一頁看完「這台機器現在好不好」。"""
+    import platform
+    import shutil as _sh
+    from ..config import DATA_DIR
+
+    def c(sql, args=()):
+        return db.q1(sql, args)["c"]
+
+    try:
+        du = _sh.disk_usage(str(DATA_DIR))
+        disk = {"total": du.total, "used": du.used, "free": du.free,
+                "path": str(DATA_DIR),
+                "percent": round(du.used * 100 / du.total, 1) if du.total else None}
+    except OSError as e:
+        disk = {"error": str(e)}
+
+    # 快取會長到好幾 GB，而它跟剩餘空間是同一件事的兩面
+    cache = 0
+    try:
+        for f in CACHE_DIR.rglob("*"):
+            if f.is_file():
+                cache += f.stat().st_size
+    except OSError:
+        pass
+
+    return {
+        "startedAt": paramstore.STARTED_AT,
+        "uptime": time.time() - paramstore.STARTED_AT,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "counts": {
+            "movies": c("SELECT COUNT(*) c FROM media_item WHERE kind='movie'"),
+            "shows": c("SELECT COUNT(*) c FROM media_item WHERE kind='tv'"),
+            "episodes": c("SELECT COUNT(*) c FROM episode"),
+            "files": c("SELECT COUNT(*) c FROM media_file"),
+            "photos": c("SELECT COUNT(*) c FROM photo"),
+            "size": db.q1("SELECT COALESCE(SUM(size),0) c FROM media_file")["c"],
+            "unscraped": c("SELECT COUNT(*) c FROM media_item WHERE scrape_state!='ok'"),
+            "failed": c("SELECT COUNT(*) c FROM media_file WHERE probe_state='failed'"),
+        },
+        "disk": disk,
+        "cacheBytes": cache,
+        "orphans": purge.counts(),
+        "pendingUsers": users.counts().get("pending", 0) if settings.google_enabled else 0,
+        "scan": scanner.status_dict(),
+        "recent": [db.row_to_dict(r) for r in db.q(
+            "SELECT at, event, role, ip, email FROM login_audit ORDER BY at DESC LIMIT 10")],
+        "configDrift": [d["key"] for d in paramstore.drift()],
+        "needsRestart": paramstore.needs_restart(),
+    }
+
+
+@router.get("/admin/problems")
+def admin_problems(_: str = Depends(admin_only)):
+    """未刮削與探測失敗的清單。總覽只給數字，這裡給名字。"""
+    return {
+        "unscraped": [db.row_to_dict(r) for r in db.q(
+            "SELECT id, kind, title, year, scrape_state FROM media_item "
+            "WHERE scrape_state!='ok' ORDER BY added_at DESC LIMIT 200")],
+        "failed": [db.row_to_dict(r) for r in db.q(
+            "SELECT f.id, f.filename, f.ftp_path, f.probe_error, i.title "
+            "FROM media_file f LEFT JOIN media_item i ON i.id=f.item_id "
+            "WHERE f.probe_state='failed' ORDER BY f.id DESC LIMIT 200")],
+    }
 
 
 @router.get("/diagnostics")
 def diagnostics(_: str = Depends(admin_only)):
     """一次看完所有外部相依：ffmpeg / ffprobe / FTP / TMDB。"""
+    user_db = {"store": users.store_name(), "detail": users.describe(), "ok": True}
+    if settings.mssql_configured:
+        st = mssql.ping()
+        user_db.update(ok=st["ok"], missing=st["missing"], error=st["error"],
+                       version=st["version"])
     media.reset_tool_cache()          # 重新找一次，使用者剛裝好 ffmpeg 也能立刻抓到
     tools = media.tool_status()
     ftp = ftpclient.test_connection()
@@ -623,6 +861,12 @@ def diagnostics(_: str = Depends(admin_only)):
         problems.append(f"FTP 連線失敗：{ftp.get('error')}")
     if not tmdb.enabled:
         problems.append("未設定 TMDB_API_KEY，不會有海報與簡介（不影響播放）")
+    if not user_db["ok"]:
+        # 這一項壞掉代表沒有人登得進來，是所有問題裡最該先看到的
+        problems.insert(0, "使用者資料庫不可用："
+                        + (user_db.get("error")
+                           or "缺少 " + "、".join(user_db.get("missing") or []))
+                        + "　→ 跑 db\\檢查連線.bat 逐項確認")
     failed = db.q1("SELECT COUNT(*) c FROM media_file WHERE probe_state='failed'")["c"]
     sample = db.q1("SELECT probe_error FROM media_file WHERE probe_state='failed' "
                    "AND probe_error IS NOT NULL LIMIT 1")
@@ -636,6 +880,7 @@ def diagnostics(_: str = Depends(admin_only)):
         "tmdb_enabled": tmdb.enabled,
         "probe_failed": failed,
         "probe_error_sample": sample["probe_error"] if sample else None,
+        "user_db": user_db,
         "problems": problems,
     }
 

@@ -1,6 +1,17 @@
 /* ---------------- 播放器 ---------------- */
 body.player{background:#000;overflow:hidden}
-.pl{position:fixed;inset:0;display:flex;flex-direction:column;background:#000}
+.pl{position:fixed;inset:0;display:flex;flex-direction:column;background:#000;
+  /* dvh 會跟著手機瀏覽器工具列的收合調整，vh 不會 ——
+     用 vh 的話 iOS 上底部控制列會被網址列蓋掉一截。
+     舊瀏覽器吃不懂 dvh，所以留一行 vh 當備援（後面的宣告勝出）。 */
+  height:100vh;height:100dvh}
+
+/* 網頁全螢幕：撐滿整個可視區域，保留自訂控制列與自繪字幕。
+   給 iOS 用的 —— 那裡的 div 沒有 requestFullscreen 這個方法。 */
+body.page-fs{overflow:hidden}
+body.page-fs .pl{position:fixed;inset:0;z-index:9999;height:100vh;height:100dvh}
+body.page-fs .pl-top{padding-top:max(14px, env(safe-area-inset-top))}
+body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 
 /* 頂部標題列 */
 .pl-top{
@@ -211,3 +222,7 @@ body.player{background:#000;overflow:hidden}
   .busy::before{animation:none}
   .ctl,.pl-top,.busy{transition:none}
 }
+
+/* 設定面板裡的說明文字 */
+.panel .hint{font-size:11.5px;line-height:1.55;color:var(--dim,#8b93a7);
+  padding:6px 2px 2px;margin:0}

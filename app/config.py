@@ -57,31 +57,18 @@ class Settings:
     ftp_encoding: str = field(default_factory=lambda: _s("FTP_ENCODING", "utf-8"))
     ftp_timeout: int = field(default_factory=lambda: _i("FTP_TIMEOUT", 20))
 
-    tmdb_api_key: str = field(default_factory=lambda: _s("TMDB_API_KEY", ""))
-    tmdb_language: str = field(default_factory=lambda: _s("TMDB_LANGUAGE", "zh-TW"))
-    tmdb_fallback_language: str = field(default_factory=lambda: _s("TMDB_FALLBACK_LANGUAGE", "en-US"))
-    tmdb_rate_limit: int = field(default_factory=lambda: _i("TMDB_RATE_LIMIT", 8))
 
     ffmpeg: str = field(default_factory=lambda: _s("FFMPEG_PATH", "ffmpeg") or "ffmpeg")
     ffprobe: str = field(default_factory=lambda: _s("FFPROBE_PATH", "ffprobe") or "ffprobe")
-    hls_segment_seconds: int = field(default_factory=lambda: _i("HLS_SEGMENT_SECONDS", 6))
     hwaccel: str = field(default_factory=lambda: _s("FFMPEG_HWACCEL", "none").lower() or "none")
     # 解碼加速跟編碼加速是兩套不同的硬體單元（NVDEC vs NVENC），
     # 驅動擋掉編碼不代表解碼也不能用。auto 讓 ffmpeg 自己挑、失敗自動退回 CPU。
     # 實測發現：軟體濾鏡要用畫格時，GPU→CPU 的搬運成本常常比省下的解碼還貴
     # （在 GTX 1070 上實測慢 30%）。所以預設關閉，要開之前先用 /api/diagnostics/bench 量。
     decode_hwaccel: str = field(default_factory=lambda: _s("FFMPEG_DECODE_HWACCEL", "none").lower() or "none")
-    crf: int = field(default_factory=lambda: _i("TRANSCODE_CRF", 21))
     # CPU 編碼速度/畫質取捨。你這台 1080p 有 3x 餘裕，可以往品質那邊調
-    x264_preset: str = field(default_factory=lambda: _s("X264_PRESET", "veryfast") or "veryfast")
     # HDR 轉 SDR：auto（4K 用 fast、其餘用 quality）/ quality / fast / off
-    hdr_tonemap: str = field(default_factory=lambda: _s("HDR_TONEMAP", "auto").lower() or "auto")
-    hdr_tonemap_algo: str = field(default_factory=lambda: _s("HDR_TONEMAP_ALGO", "hable") or "hable")
-    max_height: int = field(default_factory=lambda: _i("TRANSCODE_MAX_HEIGHT", 1080))
-    hls_prefetch: int = field(default_factory=lambda: _i("HLS_PREFETCH_SEGMENTS", 3))
     # 轉碼速度低於這個倍數就停止預轉，把 CPU 全留給使用者正在等的那一段
-    prefetch_min_speed: float = field(
-        default_factory=lambda: float(_s("PREFETCH_MIN_SPEED", "1.5") or 1.5))
     hls_cache_max_mb: int = field(default_factory=lambda: _i("HLS_CACHE_MAX_MB", 4096))
 
     # ---- 登入驗證 ----
@@ -91,7 +78,6 @@ class Settings:
     # 不能瀏覽 FTP、不能觸發掃描或清快取。留空 = 不開放唯讀登入。
     viewer_password: str = field(default_factory=lambda: _s("VIEWER_PASSWORD", ""))
     auth_secret: str = field(default_factory=lambda: _s("AUTH_SECRET", ""))
-    session_days: int = field(default_factory=lambda: _i("SESSION_DAYS", 30))
     trust_proxy: bool = field(default_factory=lambda: _b("TRUST_PROXY", False))
 
     # ---- Google 登入 ----
@@ -106,18 +92,37 @@ class Settings:
     google_redirect_uri: str = field(default_factory=lambda: _s("GOOGLE_REDIRECT_URI", ""))
     # 只允許這些網域的 Google 帳號註冊，逗號分隔；留空 = 任何 Google 帳號都能送出申請
     # （送出不等於能進來，預設仍要管理員審核）。
-    google_allowed_domains: str = field(default_factory=lambda: _s("GOOGLE_ALLOWED_DOMAINS", ""))
     # 這些 email 一登入就是管理員，且免審核。第一個管理員一定要用這個設進來，
     # 否則沒有人有權限去審核別人 —— 會變成所有人都卡在待審核。
-    google_admin_emails: str = field(default_factory=lambda: _s("GOOGLE_ADMIN_EMAILS", ""))
     # 新帳號是否自動核准（角色仍是唯讀）。預設 false：陌生人登入後只會看到
     # 「等待管理員核准」，看不到任何影片。
-    google_auto_approve: bool = field(default_factory=lambda: _b("GOOGLE_AUTO_APPROVE", False))
+
+    # ---- 使用者資料存哪裡 ----
+    # 三個都設了就用 MSSQL（dbo.filmax_users），否則用本機 SQLite。
+    # 刻意不做「連不上就自動退回 SQLite」：那會變成兩份使用者資料各說各話，
+    # 在 A 核准的人在 B 不存在，權限判斷失去單一依據 —— 比連不上更危險。
+    mssql_host: str = field(default_factory=lambda: _s("MSSQL_HOST", ""))
+    mssql_port: int = field(default_factory=lambda: _i("MSSQL_PORT", 1433))
+    mssql_database: str = field(default_factory=lambda: _s("MSSQL_DATABASE", ""))
+    mssql_user: str = field(default_factory=lambda: _s("MSSQL_USER", ""))
+    mssql_password: str = field(default_factory=lambda: _s("MSSQL_PASSWORD", ""))
+    mssql_driver: str = field(
+        default_factory=lambda: _s("MSSQL_DRIVER", "ODBC Driver 18 for SQL Server")
+                                or "ODBC Driver 18 for SQL Server")
+    # Driver 18 起預設就加密。自簽憑證的內網伺服器要把 TRUST_CERT 設 true，
+    # 不然會卡在憑證驗證失敗。對外的正式環境不要打開。
+    mssql_encrypt: bool = field(default_factory=lambda: _b("MSSQL_ENCRYPT", True))
+    mssql_trust_cert: bool = field(default_factory=lambda: _b("MSSQL_TRUST_CERT", False))
+    mssql_timeout: int = field(default_factory=lambda: _i("MSSQL_TIMEOUT", 10))
+    # 上面全部不管，直接給一整串 ODBC 連線字串
+    mssql_odbc_dsn: str = field(default_factory=lambda: _s("MSSQL_ODBC_DSN", ""))
+
+    # 明講要用哪個後端，而不是從「有沒有填連線資訊」推導。
+    # 留空 = 沿用舊行為（有填 MSSQL_HOST 就走 MSSQL），不破壞既有設定。
+    user_store_setting: str = field(default_factory=lambda: _s("USER_STORE", "").lower())
+    media_store_setting: str = field(default_factory=lambda: _s("MEDIA_STORE", "").lower())
 
     # ---- 遠端畫質 ----
-    remote_max_height: int = field(default_factory=lambda: _i("REMOTE_MAX_HEIGHT", 720))
-    remote_bitrate_kbps: int = field(default_factory=lambda: _i("REMOTE_BITRATE_KBPS", 2800))
-    lan_bitrate_kbps: int = field(default_factory=lambda: _i("LAN_BITRATE_KBPS", 0))
     # 轉碼輸出的聲道數。預設 2（降混成立體聲）—— 多聲道 AAC 包在 mpegts 裡，
     # 瀏覽器與 hls.js 的支援度並不一致，降混最穩。
     # 家裡有環繞喇叭又確定播得動的話，設 AUDIO_CHANNELS=6 保留 5.1，0 = 不動原始聲道。
@@ -128,28 +133,21 @@ class Settings:
     # 例：SCAN_EXCLUDE_DIR_PREFIXES=_,temp,備份
     #   → _old、_tmp、TempFiles、備份2024 都會整個跳過，連同底下的子目錄。
     # 比的是資料夾名稱不是完整路徑，所以放在哪一層都有效。
-    scan_exclude_dir_prefixes: str = field(
-        default_factory=lambda: _s("SCAN_EXCLUDE_DIR_PREFIXES", ""))
     # 掃描時要略過的副檔名，逗號分隔，不分大小寫，寫不寫點都可以。
     # 例如 SCAN_EXCLUDE_EXTS=iso,ts,m2ts —— 想跳過藍光原盤或錄影檔時很有用。
-    scan_exclude_exts: str = field(default_factory=lambda: _s("SCAN_EXCLUDE_EXTS", ""))
     # 只收錄這些副檔名（留空 = 不限制）。設了之後排除清單仍然有效，
     # 兩個都符合才會被收進來。
-    scan_only_exts: str = field(default_factory=lambda: _s("SCAN_ONLY_EXTS", ""))
     # 相片庫。MIN_FILE_MB 是為影片設的（預設 50MB），套在圖片上會全部濾掉，
     # 所以另外給一個 KB 級的門檻，用來擋掉圖示與版面小圖。
-    min_photo_kb: int = field(default_factory=lambda: _i("MIN_PHOTO_KB", 40))
     # 超過這個大小的圖片不讀（掃描檔、大張 TIFF），避免一張圖把記憶體吃光
-    max_photo_mb: int = field(default_factory=lambda: _i("MAX_PHOTO_MB", 80))
-    audio_channels: int = field(default_factory=lambda: _i("AUDIO_CHANNELS", 2))
-    audio_bitrate_kbps: int = field(default_factory=lambda: _i("AUDIO_BITRATE_KBPS", 192))
+    # 影片旁邊的封面圖（poster.jpg、與資料夾同名的圖、與某個影片同主檔名的圖）
+    # 不要收進相片庫。關掉的話那些封面會出現在相片牆上。
     # 額外要視為「本地」的網段，逗號分隔。例如把 Tailscale 的 100.64.0.0/10 加進來
     extra_local_networks: str = field(default_factory=lambda: _s("LOCAL_NETWORKS", ""))
 
     host: str = field(default_factory=lambda: _s("HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: _i("PORT", 8080))
     probe_concurrency: int = field(default_factory=lambda: _i("PROBE_CONCURRENCY", 3))
-    min_file_mb: int = field(default_factory=lambda: _i("MIN_FILE_MB", 50))
     auto_scan_on_start: bool = field(default_factory=lambda: _b("AUTO_SCAN_ON_START", False))
 
     def _ext_set(self, raw: str) -> set:
@@ -186,6 +184,53 @@ class Settings:
             if chunk:
                 out.append(chunk)
         return tuple(out)
+
+    @property
+    def mssql_configured(self) -> bool:
+        if self.mssql_odbc_dsn:
+            return True
+        return bool(self.mssql_host and self.mssql_database and self.mssql_user)
+
+    def _store(self, explicit: str, name: str) -> str:
+        """決定一個後端要用哪個實作。
+
+        明講的值優先。沒明講就沿用舊行為（有 MSSQL 連線資訊就走 MSSQL），
+        這樣既有的 .env 不會因為升級而改變行為。
+        """
+        if explicit in ("sqlite", "mssql"):
+            return explicit
+        if explicit:
+            raise ValueError(
+                f"{name}={explicit!r} 不是合法的值，只能是 sqlite 或 mssql")
+        return "mssql" if self.mssql_configured else "sqlite"
+
+    @property
+    def user_store(self) -> str:
+        return self._store(self.user_store_setting, "USER_STORE")
+
+    @property
+    def media_store(self) -> str:
+        # 媒體庫預設 SQLite。要走 MSSQL 必須明講 —— 只填了連線資訊
+        # 不代表想把整個片庫搬過去。
+        if self.media_store_setting in ("sqlite", "mssql"):
+            return self.media_store_setting
+        if self.media_store_setting:
+            raise ValueError(
+                f"MEDIA_STORE={self.media_store_setting!r} 不是合法的值，只能是 sqlite 或 mssql")
+        return "sqlite"
+
+    def check_stores(self) -> None:
+        """啟動時呼叫。設定不合法或不完整就丟例外，不要等到有人登入才爆。"""
+        for name, value in (("USER_STORE", self.user_store),
+                            ("MEDIA_STORE", self.media_store)):
+            if value == "mssql" and not self.mssql_configured:
+                raise ValueError(
+                    f"{name}=mssql 但沒有設定連線資訊。"
+                    f"請在 .env 補上 MSSQL_HOST / MSSQL_DATABASE / MSSQL_USER / MSSQL_PASSWORD，"
+                    f"或把 {name} 改成 sqlite。")
+        if self.media_store == "mssql":
+            raise ValueError(
+                "MEDIA_STORE=mssql 尚未實作（規格書第四期）。目前請設 sqlite。")
 
     @property
     def google_enabled(self) -> bool:
@@ -236,6 +281,76 @@ class Settings:
     def self_base_url(self) -> str:
         """ffmpeg 讀取影片時用的自身位址 (走本機 HTTP，避免 ffmpeg 處理 FTP 編碼問題)。"""
         return f"http://127.0.0.1:{self.port}"
+
+
+# --------------------------------------------------------------------------
+# 即時生效的設定（Tier 2 / applyMode=hot）
+# --------------------------------------------------------------------------
+# 這幾項不是 dataclass 欄位，是每次讀都重新解析的 property。
+#
+# **為什麼一定要這樣做**：dataclass 欄位在 import 時就定案了。後台改了值、
+# 存進資料庫、UI 顯示「已生效」，而程式仍然在用啟動當下讀到的那個數字 ——
+# 這是規格裡點名「最容易悄悄漂移」的那一項，因為它不會出任何錯，
+# 只是沒有作用。改成 property 之後，既有的 settings.crf 這類寫法
+# 完全不用動就變成即時的。
+#
+# 同樣的道理：**任何模組都不可以在頂層寫 CRF = settings.crf**。
+# 那等於又把它凍回 import 當下的值，而 UI 仍然顯示「已生效」。
+# tests/phase3_test.py 有一項專門釘住這件事。
+_HOT_ATTRS = {
+    "tmdb_api_key": "TMDB_API_KEY",
+    "tmdb_language": "TMDB_LANGUAGE",
+    "tmdb_fallback_language": "TMDB_FALLBACK_LANGUAGE",
+    "tmdb_rate_limit": "TMDB_RATE_LIMIT",
+    "crf": "TRANSCODE_CRF",
+    "max_height": "TRANSCODE_MAX_HEIGHT",
+    "x264_preset": "X264_PRESET",
+    "hdr_tonemap": "HDR_TONEMAP",
+    "hdr_tonemap_algo": "HDR_TONEMAP_ALGO",
+    "hls_segment_seconds": "HLS_SEGMENT_SECONDS",
+    "hls_prefetch": "HLS_PREFETCH_SEGMENTS",
+    "prefetch_min_speed": "PREFETCH_MIN_SPEED",
+    "audio_channels": "AUDIO_CHANNELS",
+    "audio_bitrate_kbps": "AUDIO_BITRATE_KBPS",
+    "remote_max_height": "REMOTE_MAX_HEIGHT",
+    "remote_bitrate_kbps": "REMOTE_BITRATE_KBPS",
+    "lan_bitrate_kbps": "LAN_BITRATE_KBPS",
+    "min_file_mb": "MIN_FILE_MB",
+    "scan_exclude_dir_prefixes": "SCAN_EXCLUDE_DIR_PREFIXES",
+    "scan_exclude_exts": "SCAN_EXCLUDE_EXTS",
+    "scan_only_exts": "SCAN_ONLY_EXTS",
+    "min_photo_kb": "MIN_PHOTO_KB",
+    "max_photo_mb": "MAX_PHOTO_MB",
+    "photo_exclude_artwork": "PHOTO_EXCLUDE_VIDEO_ARTWORK",
+    "session_days": "SESSION_DAYS",
+    "google_allowed_domains": "GOOGLE_ALLOWED_DOMAINS",
+    "google_admin_emails": "GOOGLE_ADMIN_EMAILS",
+    "google_auto_approve": "GOOGLE_AUTO_APPROVE",
+}
+# 這幾項舊寫法有 .lower()，保留原本的正規化，否則 FFMPEG_HWACCEL=NVENC
+# 這種大寫輸入會突然變成不認得的值
+_HOT_LOWER = {"hdr_tonemap"}
+
+
+def _hot_prop(key: str, lower: bool):
+    def getter(self):
+        from . import paramstore          # 延後 import：paramstore 會 import 回 config
+        v = paramstore.get(key)
+        return v.lower() if lower and isinstance(v, str) else v
+
+    def setter(self, _v):
+        # 指派全域設定本來就是壞主意 —— 它會影響到每一個正在使用服務的人，
+        # 而且沒有任何紀錄。錯誤訊息直接講出兩條正確的路。
+        raise AttributeError(
+            f"settings.{key.lower()} 不能直接指派。"
+            f"要改值請用 paramstore.set_value({key!r}, ...)（會存進資料庫並留稽核），"
+            f"或設環境變數 {key}（優先度最高）。")
+    getter.__name__ = key
+    return property(getter, setter)
+
+
+for _attr, _key in _HOT_ATTRS.items():
+    setattr(Settings, _attr, _hot_prop(_key, _attr in _HOT_LOWER))
 
 
 settings = Settings()

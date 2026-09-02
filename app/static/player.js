@@ -239,6 +239,47 @@ function pickAutoTrack(exclude = []) {
 
 /* ------------------------------------------------ 字幕 ------------------------------------------------ */
 let cues = [], cueIdx = -1;
+
+/* 原生字幕軌。
+   進 iOS 原生全螢幕時畫面交給系統播放器接管，自繪的那一層會整個不見。
+   但已經解析好的 cue 可以同時餵給一個原生 TextTrack —— 這樣
+   「邊抽邊送」的漸進式載入完全保留（大檔第一句 0.11 秒），
+   只有外觀樣式在原生模式下改由系統決定。 */
+let nativeTrack = null;
+
+function resetNativeTrack(label, lang) {
+  if (!nativeTrack) {
+    try { nativeTrack = v.addTextTrack('subtitles', label || '字幕', lang || 'und'); }
+    catch { nativeTrack = null; }
+  }
+  if (!nativeTrack) return;
+  // 「關著」要用 hidden 不是 disabled。
+  // disabled 狀態下 track.cues 是 null（規格如此），所以下面那個清空迴圈
+  // 會安靜地什麼都不做 —— 換字幕軌時舊的句子會留著，中英文疊在一起。
+  // hidden 是「有在跑但不顯示」，cues 讀得到、清得掉，正是我們要的。
+  nativeTrack.mode = 'hidden';
+  try {
+    while (nativeTrack.cues && nativeTrack.cues.length) {
+      nativeTrack.removeCue(nativeTrack.cues[0]);
+    }
+  } catch {}
+}
+
+function pushNativeCue(c) {
+  if (!nativeTrack || !window.VTTCue) return;
+  try {
+    // 用純文字：系統播放器不吃我們那套 <b>/<i> 的處理，而且
+    // 塞 HTML 進去在某些版本會整句不顯示
+    const txt = String(c.html || '').replace(/<[^>]*>/g, '');
+    if (txt) nativeTrack.addCue(new VTTCue(c.start, c.end, txt));
+  } catch {}
+}
+
+function showNativeTrack(on) {
+  if (nativeTrack) { try { nativeTrack.mode = on ? 'showing' : 'hidden'; } catch {} }
+  // 自繪那層跟原生軌不能同時開，不然會看到兩份字幕
+  $('#subs').style.visibility = on ? 'hidden' : '';
+}
 let subGen = 0;          // 換軌時讓還在跑的舊串流自己收工
 // 唯讀角色沒有下載權限，就別顯示那個按鈕（後端一樣會擋）
 let canDownload = true;
@@ -297,6 +338,7 @@ async function loadSubtitle(idx, opts = {}) {
   curSub = idx;
   const gen = ++subGen;
   cues = []; cueIdx = -1; $('#subs').innerHTML = '';
+  resetNativeTrack(track?.label, track?.lang);
   $('#btnSubs').classList.toggle('on', idx >= 0);
   if (idx < 0 || !info.subtitles[idx]) return;
 
@@ -317,7 +359,10 @@ async function loadSubtitle(idx, opts = {}) {
       const parts = buf.split(/\n{2,}/);
       buf = final ? '' : (parts.pop() ?? '');   // 最後一塊可能被切一半，留到下次
       if (final && buf.trim()) parts.push(buf);
-      for (const b of parts) { const c = parseCueBlock(b); if (c) cues.push(c); }
+      for (const b of parts) {
+        const c = parseCueBlock(b);
+        if (c) { cues.push(c); pushNativeCue(c); }
+      }
     };
 
     // 語言標籤分不出繁簡時看實際內容。收到夠多句就判斷，不必等整份下載完。
@@ -575,10 +620,85 @@ function syncBar() {
   }
 }
 
-function toggleFull() {
-  if (document.fullscreenElement) document.exitFullscreen();
-  else pl.requestFullscreen?.().catch(() => {});
+/* ---------------- 全螢幕 ----------------
+   iOS Safari 上 div.requestFullscreen 這個方法**根本不存在** —— 只有
+   <video> 能進原生全螢幕（webkitEnterFullscreen）。原本寫成
+   pl.requestFullscreen?.() ，那個 ?. 讓它安靜地什麼都不做，
+   所以 iPhone 上按全螢幕毫無反應、連錯誤都不會噴。
+
+   三種模式：
+     auto    桌機／Android 用 Fullscreen API，iPhone 用網頁全螢幕
+     page    網頁全螢幕：CSS 撐滿，保留自訂控制列與自繪字幕
+     native  原生全螢幕：畫面乾淨，但字幕改交給系統渲染
+*/
+const canElementFullscreen = !!(pl.requestFullscreen || pl.webkitRequestFullscreen);
+const canVideoNative = typeof v.webkitEnterFullscreen === 'function';
+
+function fsMode() {
+  const m = cfg.fullscreen || 'auto';
+  // 使用者選了這個瀏覽器做不到的模式時，要回報**實際會發生的事**。
+  // 直接把選項原樣回傳的話，設定面板會顯示「原生」是啟用中的，
+  // 但按下去其實走的是網頁全螢幕 —— 介面在說謊。
+  if (m === 'native') return canVideoNative ? 'native' : 'page';
+  if (m === 'page') return 'page';
+  if (m === 'element') return canElementFullscreen ? 'element' : 'page';
+  return canElementFullscreen ? 'element' : (canVideoNative ? 'native' : 'page');
 }
+
+function inPageFullscreen() { return document.body.classList.contains('page-fs'); }
+
+function setPageFullscreen(on) {
+  document.body.classList.toggle('page-fs', on);
+  $('#btnFull').classList.toggle('on', on);
+  // 鎖住背景捲動，不然 iOS 上兩指一滑整頁會跑掉
+  document.documentElement.style.overflow = on ? 'hidden' : '';
+  if (on) lockLandscape();
+}
+
+function lockLandscape() {
+  // iOS Safari 不支援 screen.orientation.lock，而且它會 reject。
+  // 失敗只是「沒轉成橫的」，不該讓全螢幕整個中止。
+  try { screen.orientation?.lock?.('landscape').catch(() => {}); } catch {}
+}
+
+function toggleFull() {
+  const mode = fsMode();
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+    return;
+  }
+  if (inPageFullscreen()) { setPageFullscreen(false); return; }
+
+  if (mode === 'element' && canElementFullscreen) {
+    const req = pl.requestFullscreen || pl.webkitRequestFullscreen;
+    Promise.resolve(req.call(pl)).then(lockLandscape).catch(() => setPageFullscreen(true));
+  } else if (mode === 'native' && canVideoNative) {
+    enterNativeFullscreen();
+  } else {
+    setPageFullscreen(true);
+  }
+}
+
+function enterNativeFullscreen() {
+  // 進系統播放器之前把字幕交給原生軌，不然全螢幕下就完全沒有字幕了
+  showNativeTrack(true);
+  try {
+    v.webkitEnterFullscreen();
+  } catch {
+    showNativeTrack(false);
+    setPageFullscreen(true);
+  }
+}
+
+v.addEventListener('webkitendfullscreen', () => {
+  // 使用者從系統播放器退出 —— 把字幕交還給自繪那一層
+  showNativeTrack(false);
+  renderCues(true);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && inPageFullscreen()) setPageFullscreen(false);
+});
 $('#btnFull').onclick = toggleFull;
 $('#btnPip').onclick = () => {
   if (document.pictureInPictureElement) document.exitPictureInPicture();
@@ -767,6 +887,10 @@ function buildPanel() {
     <h4>播放</h4>
     <div class="pi"><label>快轉／倒轉秒數</label></div>
     ${seg('skip', [['3','3 秒'],['5','5 秒'],['10','10 秒'],['30','30 秒']], cfg.skip)}
+    <div class="pi"><label>全螢幕方式</label></div>
+    ${seg('fullscreen', [['auto','自動'],['page','網頁'],['native','原生']], cfg.fullscreen || 'auto')}
+    <div class="hint">原生全螢幕畫面比較乾淨，但字幕會改由系統顯示，
+      上面那些字幕外觀設定在原生模式下不會生效。iPhone 只有這兩種可選。</div>
     <div class="pi"><label>速度</label></div>
     ${seg('rate', [['0.75','0.75x'],['1','1x'],['1.25','1.25x'],['1.5','1.5x'],['2','2x']], cfg.rate)}
     ${ladder.length ? `<div class="pi"><label>畫質${info.quality.auto_reason ? ' <small style="color:var(--dim)">'+esc(info.quality.auto_reason)+'</small>' : ''}</label></div>

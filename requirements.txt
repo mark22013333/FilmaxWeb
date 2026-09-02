@@ -4,3 +4,8 @@ httpx==0.28.1
 python-dotenv==1.0.1
 pydantic==2.10.4
 Pillow>=10.4.0
+
+# 使用者資料要存 MSSQL 才需要（.env 有設 MSSQL_HOST 時）。
+# 不裝也能跑，帳號會存在本機 SQLite。
+# Windows 另外要裝 Microsoft ODBC Driver 18 for SQL Server。
+pyodbc>=5.1.0

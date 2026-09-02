@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>FilmaxWeb 管理後台</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body class="admin">
+
+<header>
+  <!-- 漢堡鍵只在窄螢幕出現。iOS 刻意不做邊緣滑動開啟：
+       那會跟系統的返回手勢打架，使用者想返回卻打開了抽屜。 -->
+  <button id="menuBtn" class="icon-btn" aria-label="選單" aria-expanded="false"
+          aria-controls="side">☰</button>
+  <a class="brand" href="/"><i>F</i>FilmaxWeb</a>
+  <span class="tag">管理後台</span>
+  <div class="spacer"></div>
+  <span id="restartBar" class="warnpill" hidden>需重啟</span>
+  <a class="btn" href="/">回到媒體庫</a>
+</header>
+
+<div class="admin-wrap">
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="side" class="side">
+    <nav class="sidenav">
+      <button data-tab="overview" class="on">總覽</button>
+      <button data-tab="library">媒體庫</button>
+      <button data-tab="users">使用者<span id="pendingDot" class="dot" hidden></span></button>
+      <button data-tab="playback">播放與轉碼</button>
+      <button data-tab="system">系統</button>
+      <button data-tab="logs">紀錄</button>
+    </nav>
+  </aside>
+
+  <main id="main">
+    <section id="tab-overview" class="tab on"></section>
+    <section id="tab-library" class="tab"></section>
+    <section id="tab-users" class="tab"></section>
+    <section id="tab-playback" class="tab"></section>
+    <section id="tab-system" class="tab"></section>
+    <section id="tab-logs" class="tab"></section>
+  </main>
+</div>
+
+<div id="toast" class="toast"></div>
+<div id="modal" class="modal" hidden></div>
+
+<script src="/static/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,174 @@
+/* 管理後台。沿用 style.css 的變數與 .btn/.pill/.st/.file-row 等既有元件，
+   這裡只加後台自己的版面。 */
+
+/* hidden 屬性的預設值是 display:none，但那是 UA 樣式表 —— 任何一條有
+   class 的規則寫了 display 就會蓋掉它。`.modal{display:grid}` 加上
+   `<div hidden>` 的結果是：一整片看不見的東西鋪滿畫面，把所有點擊都吃掉，
+   而畫面上完全看不出有什麼不對。這一行讓 hidden 永遠說得算。 */
+[hidden]{display:none !important}
+
+.admin header .tag{
+  font-size:11px;font-weight:800;padding:3px 8px;border-radius:6px;
+  background:#243049;color:var(--blue);
+}
+.icon-btn{
+  display:none;width:40px;height:40px;border-radius:9px;font-size:18px;
+  background:var(--panel);border:1px solid var(--line);
+}
+.warnpill{
+  padding:4px 10px;border-radius:99px;background:#3a2a17;color:#ffb648;
+  font-size:11.5px;font-weight:800;
+}
+
+.admin-wrap{display:flex;align-items:flex-start;min-height:calc(100vh - 57px)}
+.side{
+  position:sticky;top:57px;flex:0 0 190px;align-self:flex-start;
+  max-height:calc(100vh - 57px);overflow-y:auto;
+  border-right:1px solid var(--line);padding:14px 10px;
+}
+.sidenav{display:flex;flex-direction:column;gap:3px}
+.sidenav button{
+  display:flex;align-items:center;gap:8px;
+  /* 觸控目標 ≥44px。桌機看起來也不會太胖。 */
+  min-height:44px;padding:0 14px;border-radius:9px;text-align:left;
+  color:var(--muted);font-weight:600;font-size:13.5px;transition:.15s;
+}
+.sidenav button:hover{background:var(--panel);color:var(--text)}
+.sidenav button.on{background:var(--panel-2);color:var(--accent)}
+.dot{width:7px;height:7px;border-radius:99px;background:var(--red);margin-left:auto}
+
+#main{flex:1;min-width:0;padding:18px 24px 60px}
+.tab{display:none}
+.tab.on{display:block}
+
+h2.sec{font-size:16px;font-weight:800;margin:0 0 4px}
+p.secsub{color:var(--muted);font-size:12.5px;margin:0 0 16px}
+h3.sub{font-size:13.5px;font-weight:800;margin:26px 0 10px;color:var(--accent)}
+
+.grid-cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
+.stat{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:14px 16px;
+}
+.stat b{display:block;font-size:22px;font-weight:800;line-height:1.25}
+.stat small{color:var(--muted);font-size:12px}
+.stat.warn{border-color:#5a4520}
+.stat.bad{border-color:#5a2626}
+
+.bar{height:7px;border-radius:99px;background:var(--panel-2);overflow:hidden;margin-top:9px}
+.bar i{display:block;height:100%;background:var(--green)}
+.bar.warn i{background:#ffb648}
+.bar.bad i{background:var(--red)}
+
+.box{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:14px 16px;margin-bottom:14px;
+}
+.banner{
+  border-radius:10px;padding:11px 14px;margin-bottom:14px;font-size:13px;
+  border:1px solid #5a4520;background:#241d10;color:#ffcf7d;
+}
+.banner.bad{border-color:#5a2626;background:#241618;color:#ffaeae}
+.banner b{color:inherit}
+.empty{color:var(--dim);font-size:13px;padding:18px;text-align:center}
+
+/* 寬內容自己捲，body 永遠不橫捲 */
+.scrollx{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table.t{width:100%;border-collapse:collapse;font-size:13px;min-width:560px}
+table.t th{
+  text-align:left;font-size:11.5px;color:var(--muted);font-weight:700;
+  padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+table.t td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+table.t tr:last-child td{border-bottom:none}
+
+/* 手機用的卡片，不是把欄位藏起來 —— 藏起來等於資料消失且沒有替代入口 */
+.rowcards{display:none}
+.rowcard{
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:11px 13px;margin-bottom:8px;
+}
+.rowcard .top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.rowcard .top b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rowcard dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:0;font-size:12.5px}
+.rowcard dt{color:var(--muted)}
+.rowcard dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.rowcard .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+
+/* ---------- 系統參數 ---------- */
+.param{
+  display:grid;grid-template-columns:1fr 280px;gap:10px 18px;align-items:start;
+  padding:13px 0;border-bottom:1px solid var(--line);
+}
+.param:last-child{border-bottom:none}
+.param .meta label{display:block;font-weight:700;font-size:13.5px;margin-bottom:3px}
+.param .meta code{font-size:11px;color:var(--dim)}
+.param .meta p{margin:5px 0 0;color:var(--muted);font-size:12.5px}
+.param .ctl{display:flex;flex-direction:column;gap:6px}
+.param input,.param select{
+  width:100%;padding:9px 11px;border-radius:9px;background:var(--bg-2);
+  border:1px solid var(--line);outline:none;min-height:40px;
+}
+.param input:focus,.param select:focus{border-color:var(--accent)}
+.param input:disabled,.param select:disabled{opacity:.55;cursor:not-allowed}
+.param .note{font-size:11.5px;color:var(--muted);display:flex;gap:6px;align-items:flex-start}
+.param .note.lock{color:#ffcf7d}
+.param .note.err{color:#ffaeae}
+.param .acts{display:flex;gap:6px;flex-wrap:wrap}
+.param .acts button{
+  padding:5px 10px;border-radius:7px;font-size:11.5px;font-weight:700;
+  background:var(--panel-2);border:1px solid var(--line);color:var(--muted);
+}
+.param .acts button:hover{color:var(--text)}
+.param.dirty .meta label::after{
+  content:"未儲存";margin-left:8px;font-size:10.5px;font-weight:800;
+  color:var(--accent);
+}
+.apply{font-size:10.5px;font-weight:800;padding:2px 7px;border-radius:5px;
+  background:#173a2c;color:var(--green)}
+.apply.reload{background:#243049;color:var(--blue)}
+.apply.restart{background:#3a2a17;color:#ffb648}
+
+/* ---------- 對話框 ---------- */
+.modal{position:fixed;inset:0;z-index:200;display:grid;place-items:center;
+  background:rgba(0,0,0,.6);padding:20px}
+.modal .sheet{
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:20px;max-width:460px;width:100%;box-shadow:var(--shadow);
+}
+.modal h3{margin:0 0 8px;font-size:15px}
+.modal p{margin:0 0 14px;font-size:13.5px;color:var(--muted);line-height:1.6}
+.modal .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.modal .danger{background:#3a1c1c;border-color:#5a2626;color:#ffaeae}
+.modal code{background:var(--bg-2);padding:2px 6px;border-radius:5px;
+  font-size:12px;overflow-wrap:anywhere}
+
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60}
+
+/* ---------- 手機 ---------- */
+@media (max-width:768px){
+  .icon-btn{display:grid;place-items:center}
+  .admin header{padding:10px 14px;gap:10px}
+  .admin header .tag{display:none}
+  .side{
+    position:fixed;top:0;left:0;bottom:0;z-index:70;width:225px;flex:none;
+    max-height:none;background:var(--bg-2);border-right:1px solid var(--line);
+    transform:translateX(-102%);transition:transform .22s ease;
+    padding-top:calc(14px + env(safe-area-inset-top));
+  }
+  .side.open{transform:none}
+  #main{padding:14px 14px 60px}
+  table.t{display:none}
+  .rowcards{display:block}
+  .param{grid-template-columns:1fr;gap:8px}
+  .param .ctl{max-width:none}
+  /* 寬表單在手機上藏起來，但要留一句話說它在哪裡 */
+  .desktop-only{display:none}
+  .desktop-note{
+    color:var(--dim);font-size:12.5px;padding:14px;text-align:center;
+    border:1px dashed var(--line);border-radius:10px;
+  }
+}
+@media (min-width:769px){
+  .desktop-note{display:none}
+}

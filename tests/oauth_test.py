@@ -12,9 +12,19 @@ import base64, json, os, shutil, sys, tempfile, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# 同一套測試跑兩種儲存後端：
+#   python tests/oauth_test.py            → SQLite
+#   python tests/oauth_test.py --mssql    → MSSQL 那條程式碼路徑
+# --mssql 用 tests/fake_pyodbc.py 頂替驅動（沙箱連不到真的 SQL Server）。
+# 它驗得到的是 SQL 欄位對齊、參數順序與時間轉換；驗不到定序與權限那類方言問題，
+# 那些要用 app/dbcheck.py 在真的資料庫上跑。
+USE_MSSQL = "--mssql" in sys.argv
 # 全新的資料目錄，不要碰到你正在用的 data/library.db。
 # FILMAX_DATA_DIR 必須在 import app 之前設好（config.py 在載入時就決定路徑了）。
 TMP = tempfile.mkdtemp(prefix="filmax-oauth-test-")
+if USE_MSSQL:
+    os.environ.update({"MSSQL_HOST": "fake-server", "MSSQL_DATABASE": "filmax",
+                       "MSSQL_USER": "filmax_app", "MSSQL_PASSWORD": "x"})
 os.environ.update({
     "FILMAX_DATA_DIR": TMP,
     "AUTH_ENABLED": "true",
@@ -29,10 +39,17 @@ os.environ.update({
 })
 sys.path.insert(0, str(ROOT))
 
+sys.path.insert(0, str(ROOT / "tests"))
 from starlette.testclient import TestClient
 from app import auth, db, oauth, users
 from app.config import settings
 from app.main import app
+
+if USE_MSSQL:
+    import fake_pyodbc
+    fake_pyodbc.install(os.path.join(TMP, "fake_mssql.db"))
+print(f"儲存後端：{users.store_name()}")
+assert users.store_name() == ("mssql" if USE_MSSQL else "sqlite")
 
 OK = FAIL = 0
 def check(name, cond, extra=""):
@@ -193,11 +210,11 @@ with TestClient(app, base_url="https://video.example.com") as c:
         auth._fails.clear()
 
     # 網域白名單
-    settings.google_allowed_domains = "example.com"
+    os.environ["GOOGLE_ALLOWED_DOMAINS"] = "example.com"   # 設定現在是即時解析的
     r = login(c, email="boss@example.com"); check("白名單內放行", r.status_code == 303)
     auth._fails.clear()
     r = login(c, email="outsider@other.com"); check("白名單外擋下", r.status_code == 400)
-    settings.google_allowed_domains = ""
+    os.environ.pop("GOOGLE_ALLOWED_DOMAINS", None)
     auth._fails.clear()
 
     # 開放轉址

@@ -18,7 +18,7 @@ import re
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .. import auth, db, geo, oauth, users
+from .. import audit, auth, db, geo, mssql, oauth, users
 from ..config import settings
 
 log = logging.getLogger("filmax.oauth")
@@ -89,10 +89,12 @@ def start(request: Request, next: str = ""):
 def callback(request: Request, code: str = "", state: str = "", error: str = ""):
     ip = auth.client_ip(request.scope)
     loc = geo.from_scope(request.scope)
+    src = geo.ip_source(request.scope)
 
     def fail(msg: str, status: int = 400, event: str = "failed", email: str = ""):
         auth.note_failure(ip)
-        db.log_login(event, None, ip, loc, email=email or None, detail=msg)
+        audit.record(event, ip=ip, loc=loc, email=email or None,
+                     detail=msg, ip_source=src)
         resp = _page("登入失敗", f"<p>{html.escape(msg)}</p>", status)
         resp.delete_cookie(oauth.STATE_COOKIE, path="/auth/google")
         return resp
@@ -119,14 +121,28 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "")
 
     email = claims["email"]
     try:
+        # 判斷是不是新帳號要跟 upsert 用同一組條件（sub 優先、再 email），
+        # 只看 email 的話，換過信箱的人會被誤記成「新註冊」。
+        existed = (users.by_sub(claims.get("sub") or "") or users.by_email(email)) is not None
         rec = users.upsert_from_google(claims, ip, loc)
+    except mssql.MssqlUnavailable as e:
+        # 資料庫連不上跟「你沒有權限」是完全不同的兩件事，訊息要分開，
+        # 不然使用者會一直重試一個永遠不會成功的登入。
+        log.error("使用者資料庫不可用：%s", e)
+        return fail("伺服器的使用者資料庫目前連不上，請聯絡管理員", 503, email=email)
     except Exception:
         log.exception("寫入帳號失敗")
         return fail("無法建立帳號，請聯絡管理員", 500, email=email)
 
+    if not existed:
+        # 註冊事件要在狀態檢查「之前」記 —— 新帳號預設是待審核，
+        # 記在後面的話，最需要被看到的那一群（剛申請、還沒過）反而沒有註冊紀錄。
+        audit.record("register", role=None, ip=ip, loc=loc, email=email,
+                     user_id=rec["id"], detail=f"status={rec['status']}", ip_source=src)
+
     if rec["status"] != "approved":
-        db.log_login("pending", None, ip, loc, email=email, user_id=rec["id"],
-                     detail=f"status={rec['status']}")
+        audit.record("pending", ip=ip, loc=loc, email=email, user_id=rec["id"],
+                     detail=f"status={rec['status']}", ip_source=src)
         log.info("帳號 %s 狀態為 %s，未放行（來源 %s / %s）",
                  email, rec["status"], ip, geo.describe(loc))
         if rec["status"] == "pending":
@@ -146,7 +162,8 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "")
     users.record_login(rec["id"], ip, loc)
     auth.clear_failures(ip)
     role = users.role_to_auth(rec["role"])
-    db.log_login("success", role, ip, loc, email=email, user_id=rec["id"], detail="google")
+    audit.record("success", role=role, ip=ip, loc=loc, email=email,
+                 user_id=rec["id"], detail="google", ip_source=src)
     log.info("Google 登入成功：%s（%s），來源 %s（%s）",
              email, role, ip, geo.describe(loc))
 

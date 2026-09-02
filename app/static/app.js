@@ -20,6 +20,10 @@ let me = { role: 'admin', is_admin: true };
 async function loadMe() {
   try { me = await api('/api/me'); } catch {}
   document.body.classList.toggle('viewer', !me.is_admin);
+  // 後台入口只給管理員看。真正的保護在 /admin 與每個 API 端點上，
+  // 這裡只是不要在唯讀使用者面前放一個按了會被拒絕的連結。
+  const adminLink = $('#btnAdmin');
+  if (adminLink) adminLink.hidden = !me.is_admin;
   paintAccount();
 }
 
@@ -34,6 +38,31 @@ function paintAccount() {
   b.hidden = !n;
   b.textContent = n;
   btn.title = me.email ? `${me.email}（${me.is_admin ? '管理員' : '唯讀'}）` : '帳號';
+}
+
+/* 換頁時捲到「格線的頂端」而不是文件頂端。
+   原本是 window.scrollTo({top:0})，會捲到標頭、搜尋列、資料夾標籤之上，
+   離第一列還有一大段，等於每次換頁都要再往下捲一次。 */
+function scrollToGrid(sel) {
+  const grid = $(sel);
+  if (!grid) return;
+  const header = document.querySelector('header');
+  // 標頭是 sticky 的，捲過去之後它會蓋住格線頂端，所以要扣掉它的高度。
+  // 動態量而不是寫死 —— 手機上標頭會換行，高度跟桌機不一樣。
+  const offset = (header ? header.getBoundingClientRect().height : 0) + 8;
+  const target = Math.max(0, grid.getBoundingClientRect().top + window.scrollY - offset);
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: target, behavior: reduce ? 'auto' : 'smooth' });
+}
+
+/* 「要不要捲」必須在換內容**之前**判斷。
+   換頁時格線會先被清成「載入中」，頁面高度瞬間塌掉，瀏覽器把捲動位置
+   夾到 0 —— 這時候再問「使用者是不是已經在上面了」，答案永遠是「是」，
+   於是永遠不捲。所以先記下來，渲染完再決定。 */
+async function pageTo(loader, sel) {
+  const wasScrolled = window.scrollY > 4;
+  await loader();
+  if (wasScrolled) scrollToGrid(sel);
 }
 
 let toastTimer;
@@ -94,7 +123,9 @@ function renderPager(d) {
     <span>${d.page} / ${pages}</span>
     <button class="btn" ${d.page >= pages ? 'disabled' : ''} onclick="go(${d.page + 1})">下一頁</button></div>`;
 }
-window.go = p => { state.page = p; loadLibrary(); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+// 要等新內容渲染完才捲。先捲的話，loadLibrary 會把格線換成「載入中」，
+// 頁面高度瞬間塌掉，瀏覽器把捲動位置夾到 0，接著算出來的目標也是錯的。
+window.go = p => { state.page = p; return pageTo(loadLibrary, '#grid'); };
 
 async function loadGenres() {
   const { genres } = await api('/api/genres');
@@ -150,7 +181,7 @@ async function openItem(id) {
     <div class="modal-body">
       <div style="display:flex;gap:8px;margin-bottom:14px">
         ${me.is_admin ? `<button class="btn" onclick="rescrape(${it.id})">重新刮削</button>` : ''}
-        <button class="btn" onclick="manualMatch(${it.id},'${it.kind}','${esc(it.title).replace(/'/g, "\\'")}')">手動指定 TMDB</button>
+        ${me.is_admin ? `<button class="btn" onclick="manualMatch(${it.id},'${it.kind}','${esc(it.title).replace(/'/g, "\\'")}')">手動指定 TMDB</button>` : ''}
       </div>
       ${files || '<div class="empty">沒有檔案</div>'}
     </div>`;
@@ -216,7 +247,8 @@ async function pollScan() {
   let s;
   try { s = await api('/api/scan/status'); } catch { return; }
   const phase = { listing: '掃描 FTP 目錄', indexing: '建立索引', scraping: 'TMDB 刮削',
-    probing: '分析影片格式', done: '掃描完成', error: '發生錯誤', cancelled: '已停止', idle: '待機' }[s.phase] || s.phase;
+    probing: '分析影片格式', photos: '讀取相片', done: '掃描完成', error: '發生錯誤',
+    cancelled: '已停止', idle: '待機' }[s.phase] || s.phase;
   $('#scanPhase').textContent = phase;
   $('#scanDot').style.background = s.running ? 'var(--green)' : (s.phase === 'error' ? 'var(--red)' : 'var(--dim)');
   $('#scanDot').style.animation = s.running ? '' : 'none';
@@ -225,7 +257,15 @@ async function pollScan() {
   if (s.phase === 'listing') { txt = `已看 ${s.dirs_seen} 個資料夾，找到 ${s.files_found} 個影片（新增 ${s.files_new}）`; pct = Math.min(90, s.dirs_seen * 2); }
   else if (s.phase === 'scraping') { pct = s.items_total ? 100 * s.scraped / s.items_total : 0; txt = `刮削 ${s.scraped}/${s.items_total}`; }
   else if (s.phase === 'probing') { pct = s.probe_total ? 100 * s.probed / s.probe_total : 0; txt = `分析 ${s.probed}/${s.probe_total}`; }
-  else { pct = 100; txt = s.error || `${s.files_found} 個影片檔 · ${s.items_total} 個條目`; }
+  // 相片階段原本沒有對照，會直接印出英文 phase，進度條也跳到 100%
+  else if (s.phase === 'photos') { pct = s.photo_total ? 100 * s.photos_read / s.photo_total : 0; txt = `讀取相片 ${s.photos_read}/${s.photo_total}`; }
+  else {
+    pct = 100;
+    const bits = [`${s.files_found} 個影片檔`];
+    if (s.items_total) bits.push(`${s.items_total} 個條目`);
+    if (s.photos_found) bits.push(`${s.photos_found} 張相片`);
+    txt = s.error || bits.join(' · ');
+  }
   $('#scanText').textContent = txt + (s.current ? ` — ${s.current}` : '');
   $('#scanBar').style.width = pct + '%';
   $('#scanLog').innerHTML = (s.log || []).slice(-40).reverse().map(l => esc(l)).join('<br>');
@@ -381,9 +421,22 @@ $('#btnStats').onclick = async () => {
     <div style="display:flex;gap:8px;margin-top:14px">
       <button class="btn" onclick="testFtp()">測試 FTP 連線</button>
       <button class="btn" onclick="api('/api/cache/clear',{method:'POST'}).then(()=>toast('已清除轉碼快取'))">清除轉碼快取</button>
+      <button class="btn" onclick="reparseLibrary()" title="重新解析所有檔名並重新分組。不會重新下載中繼資料。">重新分組</button>
       <button class="btn primary" onclick="closeModal();api('/api/scan?full=true',{method:'POST'});$('#scanPanel').classList.add('show');pollScan()">完整重新掃描</button>
     </div></div>`;
 };
+/* 重新分組：改了檔名解析規則之後，既有檔案不會自己重新分組 ——
+   平常的掃描看到「檔案大小沒變」就早退了。 */
+window.reparseLibrary = async () => {
+  if (!confirm('重新分組會重新解析所有檔名並重建條目。\n\n'
+    + '播放進度會保留（它是綁在檔案上的），但手動指定過的 TMDB 配對可能要重做。\n\n'
+    + '要繼續嗎？')) return;
+  closeModal();
+  await api('/api/scan?reparse=true', { method: 'POST' }).catch(e => toast('失敗：' + e.message));
+  $('#scanPanel').classList.add('show');
+  pollScan();
+};
+
 window.testFtp = async () => {
   const r = await api('/api/ftp/test');
   toast(r.ok ? `連線成功：${(r.welcome || '').slice(0, 60)}` : '連線失敗：' + r.error);
@@ -448,7 +501,8 @@ async function loadPhotos() {
     <span style="padding:0 12px;color:var(--dim)">${pstate.page} / ${pages}</span>
     <button class="btn" ${pstate.page >= pages ? 'disabled' : ''} data-pp="1">下一頁</button>` : '';
   $('#ppager').querySelectorAll('[data-pp]').forEach(b => b.onclick = () => {
-    pstate.page += +b.dataset.pp; loadPhotos(); window.scrollTo({ top: 0, behavior: 'smooth' });
+    pstate.page += +b.dataset.pp;
+    pageTo(loadPhotos, '#pgrid');
   });
 }
 

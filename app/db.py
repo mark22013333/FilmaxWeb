@@ -132,6 +132,40 @@ CREATE INDEX IF NOT EXISTS idx_photo_folder ON photo(folder);
 CREATE INDEX IF NOT EXISTS idx_photo_taken ON photo(taken_at DESC);
 CREATE INDEX IF NOT EXISTS idx_photo_probe ON photo(probe_state);
 
+-- 後台儲存的系統參數。只存「跟預設值不同」的項目 —— 存一堆等於預設值的列，
+-- 之後改預設值時那些列會變成隱形的覆蓋：使用者從來沒設過它，卻永遠拿不到新預設值。
+-- 秘密欄位存密文（見 app/params.py 的 encrypt）。
+CREATE TABLE IF NOT EXISTS config_param (
+    k          TEXT PRIMARY KEY,
+    v          TEXT NOT NULL,
+    updated_at REAL,
+    updated_by TEXT
+);
+
+-- 設定變更稽核。秘密只記「已變更」，連遮罩後的值都不記 —— 長度也是情報。
+CREATE TABLE IF NOT EXISTS config_audit (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    at        REAL NOT NULL,
+    k         TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    actor     TEXT,
+    action    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_config_audit_at ON config_audit(at DESC);
+
+-- 刪除紀錄。刻意不併進 login_audit：那張表的 action 值域被 MSSQL 的
+-- CHECK 約束綁住（只有帳號事件那八個），而且它是「誰動了帳號」的紀錄。
+-- 媒體庫的刪除是另一件事，混在一起兩邊都會變難查。
+CREATE TABLE IF NOT EXISTS purge_log (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at     INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    detail TEXT,
+    total  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_purge_at ON purge_log(at DESC);
+
 -- 登入紀錄。之後接上 MSSQL 帳號系統時會改存那邊，但本機這份仍然有用：
 -- 資料庫連不上的時候，至少還看得到誰在什麼時候從哪裡登入。
 CREATE TABLE IF NOT EXISTS login_audit (
@@ -186,12 +220,26 @@ def tx():
 # 既有資料庫要補的欄位。SQLite 沒有 IF NOT EXISTS 的 ADD COLUMN，
 # 所以自己比對一次；這比要求使用者砍掉重建資料庫友善得多。
 _ADDED_COLUMNS = {
+    # 時間一律改存 epoch 整數秒。原本的字串欄位保留不動 ——
+    # 它是唯一的事實來源，日後改判斷規則可以在不重讀檔案的前提下重跑轉換。
+    "photo": [
+        ("mtime_ts", "INTEGER"),
+        ("taken_ts", "INTEGER"),
+        # EXIF 原始的時區字串（`+09:00`），或 'local' 表示「沒有，用本機時區猜的」。
+        # 兩者長得不一樣是刻意的：猜出來的時間不該假裝成算出來的。
+        # NULL = 這張根本沒有拍攝時間。
+        ("taken_tz", "TEXT"),
+        # sort_ts = COALESCE(taken_ts, mtime_ts, added_at)，寫入時算好。
+        # COALESCE 是表達式，兩邊都用不到索引；具體化之後才排得動。
+        ("sort_ts", "INTEGER"),
+    ],
     "login_audit": [
         ("email", "TEXT"),          # Google 帳號登入才有
         ("user_id", "INTEGER"),
         ("detail", "TEXT"),
     ],
     "media_file": [
+        ("mtime_ts", "INTEGER"),      # FTP 的 mtime 字串解析後的 epoch
         ("pix_fmt", "TEXT"),
         ("color_transfer", "TEXT"),
         ("color_primaries", "TEXT"),
@@ -204,12 +252,79 @@ _ADDED_COLUMNS = {
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
+    added = set()
     for table, cols in _ADDED_COLUMNS.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, decl in cols:
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
                 log.info("資料庫補上欄位 %s.%s", table, name)
+                added.add(f"{table}.{name}")
+    if added & {"photo.sort_ts", "photo.mtime_ts", "media_file.mtime_ts"}:
+        _backfill_times(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photo_sort ON photo(sort_ts DESC)")
+    _time_guards(conn)
+
+
+# 時間值域的守門員。
+#
+# 為什麼是觸發程序而不是 CHECK 約束：這些欄位是靠 ALTER TABLE ADD COLUMN
+# 補上去的，而 SQLite 的 ALTER TABLE 加不了 CHECK。寫在 CREATE TABLE 裡的話，
+# 新建的資料庫有約束、升級上來的沒有 —— 而且看不出來。同一份程式碼在兩台
+# 機器上行為不同，是最難查的那種問題。觸發程序兩邊都套得上去，所以一致。
+#
+# 為什麼需要它：DATETIME2 天生擋得住亂值，INTEGER 擋不住。把毫秒當秒傳
+# （×1000）會安靜地存進去，然後那一筆永遠排在最前面，沒有任何錯誤訊息。
+_TIME_GUARD_COLS = {
+    "photo": ("mtime_ts", "taken_ts", "sort_ts"),
+    "media_file": ("mtime_ts",),
+}
+
+
+def _time_guards(conn: sqlite3.Connection) -> None:
+    from .timeparse import MIN_TS, MAX_TS
+    for table, cols in _TIME_GUARD_COLS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col in cols:
+            if col not in have:
+                continue
+            for op in ("INSERT", "UPDATE"):
+                name = f"guard_{table}_{col}_{op.lower()}"
+                cond = (f"NEW.{col} IS NOT NULL AND "
+                        f"(NEW.{col} < {MIN_TS} OR NEW.{col} > {MAX_TS})")
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+                conn.execute(
+                    f"CREATE TRIGGER {name} BEFORE {op} ON {table} "
+                    f"FOR EACH ROW WHEN {cond} "
+                    f"BEGIN SELECT RAISE(ABORT, '{table}.{col} 超出合理時間範圍'); END")
+
+
+def _backfill_times(conn: sqlite3.Connection) -> None:
+    """把既有的時間字串轉成 epoch。
+
+    不轉的話，升級之後既有相片的 sort_ts 全是 NULL，會一次沉到最底下 ——
+    使用者的感受是「我的相片不見了」。轉換在 Python 端做，因為那五種格式
+    SQLite 自己認不得（見 app/timeparse.py）。
+    """
+    from .timeparse import parse
+    n = 0
+    for table, cols in (("photo", ("mtime", "taken_at")), ("media_file", ("mtime",))):
+        rows = conn.execute(
+            f"SELECT id, {', '.join(cols)} FROM {table}").fetchall()
+        for r in rows:
+            mt = parse(r["mtime"])
+            if table == "photo":
+                tk = parse(r["taken_at"])
+                added = conn.execute("SELECT added_at FROM photo WHERE id=?",
+                                     (r["id"],)).fetchone()
+                sort = tk or mt or int(added["added_at"] or 0) or None
+                conn.execute("UPDATE photo SET mtime_ts=?, taken_ts=?, sort_ts=? WHERE id=?",
+                             (mt, tk, sort, r["id"]))
+            else:
+                conn.execute("UPDATE media_file SET mtime_ts=? WHERE id=?", (mt, r["id"]))
+            n += 1
+    if n:
+        log.info("回填 %s 筆時間欄位（字串 → epoch）", n)
 
 
 def init_db() -> None:
@@ -231,6 +346,117 @@ def q1(sql: str, params: Iterable = ()) -> Optional[sqlite3.Row]:
 def execute(sql: str, params: Iterable = ()) -> sqlite3.Cursor:
     with tx() as conn:
         return conn.execute(sql, tuple(params))
+
+
+# --------------------------------------------------------------------------
+# 批次寫入
+# --------------------------------------------------------------------------
+# 每一句 db.execute() 都自己開一個交易並 commit。WAL 底下那是一次 fsync，
+# 一次掃描 109 部片 + 679 張相片就是快 800 次。改成累積到一定筆數再一起寫，
+# 同樣的資料只要幾次 fsync。
+#
+# **哪些表可以批次是有講究的**：
+#
+#   media_file / photo   可以 —— 純 upsert，寫完不需要當場拿到 id。
+#   media_item / episode 不行 —— 要先有 item_id 才寫得了檔案列。
+#
+# 硬把 media_item 做成批次只會製造難修的競態：兩個執行緒同時建立同一個
+# guess_key，同一部影集就會變成兩張海報，一張 12 集一張 1 集。那 15 個條目
+# 序列化的成本本來就是零，不值得為它冒這個險。
+#
+# 批次順序：緩衝區照呼叫順序存，flush 時把**連續**同一句 SQL 併成一次
+# executemany。不重排順序 —— 重排就得證明「這批裡沒有兩筆動到同一列」，
+# 而那是掃描器的事，不該由這一層假設。
+_FILE_UPSERT = """
+INSERT INTO media_file(item_id, episode_id, ftp_path, filename, size, mtime,
+                       mtime_ts, ext, probe_state, seen_at, added_at)
+VALUES(?,?,?,?,?,?,?,?,'pending',?,?)
+ON CONFLICT(ftp_path) DO UPDATE SET
+    item_id=excluded.item_id, episode_id=excluded.episode_id,
+    size=excluded.size, mtime=excluded.mtime, mtime_ts=excluded.mtime_ts,
+    ext=excluded.ext, seen_at=excluded.seen_at, probe_state='pending'
+"""
+_FILE_TOUCH = "UPDATE media_file SET seen_at=? WHERE id=?"
+_PHOTO_UPSERT = """
+INSERT INTO photo(ftp_path, folder, filename, ext, size, mtime, mtime_ts, sort_ts,
+                  probe_state, seen_at, added_at)
+VALUES(?,?,?,?,?,?,?,?,'pending',?,?)
+ON CONFLICT(ftp_path) DO UPDATE SET
+    size=excluded.size, mtime=excluded.mtime, mtime_ts=excluded.mtime_ts,
+    -- 已經讀過 EXIF 的話 taken_ts 才是對的排序依據，不要被 mtime 蓋掉
+    sort_ts=COALESCE(photo.taken_ts, excluded.mtime_ts, photo.sort_ts, excluded.sort_ts),
+    probe_state='pending', probe_error=NULL, seen_at=excluded.seen_at
+"""
+_PHOTO_TOUCH = "UPDATE photo SET seen_at=? WHERE id=?"
+
+
+class Batch:
+    """累積寫入，滿了就一次送出。用 db.batch() 取得，不要自己 new。"""
+
+    def __init__(self, size: int = 500):
+        self.size = max(1, size)
+        self._buf: List[tuple] = []
+        self.written = 0
+        self.flushes = 0
+
+    # ---- 呼叫端用的 ----
+    def upsert_file(self, *, item_id, episode_id, path, name, size, mtime,
+                    mtime_ts, ext, at) -> None:
+        self._add(_FILE_UPSERT, (item_id, episode_id, path, name, size, mtime,
+                                 mtime_ts, ext, at, at))
+
+    def touch_file(self, file_id: int, at: float) -> None:
+        self._add(_FILE_TOUCH, (at, file_id))
+
+    def upsert_photo(self, *, path, folder, name, ext, size, mtime,
+                     mtime_ts, sort_ts, at) -> None:
+        self._add(_PHOTO_UPSERT, (path, folder, name, ext, size, mtime,
+                                  mtime_ts, sort_ts, at, at))
+
+    def touch_photo(self, photo_id: int, at: float) -> None:
+        self._add(_PHOTO_TOUCH, (at, photo_id))
+
+    # ---- 內部 ----
+    def _add(self, sql: str, params: tuple) -> None:
+        self._buf.append((sql, params))
+        if len(self._buf) >= self.size:
+            self.flush()
+
+    def flush(self) -> int:
+        if not self._buf:
+            return 0
+        buf, self._buf = self._buf, []
+        n = 0
+        with tx() as conn:
+            run_sql, run = buf[0][0], []
+            for sql, params in buf:
+                if sql is not run_sql:
+                    conn.executemany(run_sql, run)
+                    n += len(run)
+                    run_sql, run = sql, []
+                run.append(params)
+            conn.executemany(run_sql, run)
+            n += len(run)
+        self.written += n
+        self.flushes += 1
+        return n
+
+
+@contextmanager
+def batch(size: int = 500):
+    """批次寫入。正常離開時強制寫出，出例外時丟掉還沒寫出的部分。
+
+    出例外不寫的理由：已經 flush 出去的都在，沒 flush 的最多是最後幾百筆，
+    下次掃描本來就會重新索引到。反過來「出錯了還硬把緩衝寫出去」才難解釋 ——
+    使用者看到的會是一個沒人知道停在哪裡的半成品。
+    """
+    b = Batch(size)
+    try:
+        yield b
+    except Exception:
+        b._buf.clear()
+        raise
+    b.flush()
 
 
 def kv_get(key: str, default: Any = None) -> Any:
@@ -267,23 +493,15 @@ def now() -> float:
     return time.time()
 
 
+def now_i() -> int:
+    """整數秒。時間點欄位一律用這個 —— 浮點的相等比較不可靠。"""
+    return int(time.time())
+
+
 def log_login(event: str, role: Optional[str], ip: str, loc: Dict[str, Any],
               email: Optional[str] = None, user_id: Optional[int] = None,
               detail: Optional[str] = None) -> None:
-    """寫一筆登入事件。
-
-    寫失敗絕對不能影響登入本身 —— 稽核紀錄再重要，也不該讓人因為它壞掉而登不進來。
-    """
-    try:
-        execute(
-            """INSERT INTO login_audit
-                   (at, event, role, ip, country, region, city, timezone,
-                    latitude, longitude, user_agent, email, user_id, detail)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now(), event, role, ip, loc.get("country"), loc.get("region"),
-             loc.get("city"), loc.get("timezone"), loc.get("latitude"),
-             loc.get("longitude"), loc.get("user_agent"), email, user_id,
-             (detail or None) and str(detail)[:300]),
-        )
-    except Exception as e:
-        log.warning("登入紀錄寫入失敗: %s", e)
+    """保留舊介面，實作已經搬到 app/audit.py（那邊還要同時寫 MSSQL）。"""
+    from . import audit
+    audit.record(event, role=role, ip=ip, loc=loc, email=email,
+                 user_id=user_id, detail=detail)
