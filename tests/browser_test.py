@@ -13,6 +13,8 @@ TMP = tempfile.mkdtemp(prefix="filmax-br-")
 PORT = 29321
 os.environ.update({
     "FILMAX_DATA_DIR": os.path.join(TMP, "data"),
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
     "TMDB_API_KEY": "", "AUTH_ENABLED": "false", "MSSQL_HOST": "",
     "AUTO_SCAN_ON_START": "false", "HOST": "127.0.0.1", "PORT": str(PORT),
     "FTP_HOST": "127.0.0.1", "FTP_PORT": "1",
@@ -251,7 +253,8 @@ async def main():
                if m.type == "error" else None)
         await pg2.goto(BASE + "/admin", wait_until="networkidle")
         await pg2.wait_for_selector(".sidenav button", timeout=8000)
-        check("六個分區都在", await pg2.locator(".sidenav button").count() == 6,
+        check("七個分區都在（系統參數獨立成一頁）",
+              await pg2.locator(".sidenav button").count() == 7,
               await pg2.locator(".sidenav button").count())
         await pg2.wait_for_selector("#tab-overview .stat", timeout=8000)
         check("總覽有載到數字", await pg2.locator("#tab-overview .stat").count() >= 6,
@@ -259,7 +262,8 @@ async def main():
 
         # 每一個分區都要真的畫得出來，不能只是掛在那裡
         for tab, sel in (("library", "#tab-library .box"), ("users", "#tab-users"),
-                         ("playback", "#tab-playback .stat"), ("system", "#paramList .param"),
+                         ("playback", "#tab-playback .stat"), ("system", "#tab-system .stat"),
+                         ("params", "#paramList .param"),
                          ("logs", "#tab-logs table.t, #tab-logs .rowcards")):
             await pg2.click(f".sidenav button[data-tab='{tab}']")
             try:
@@ -270,11 +274,22 @@ async def main():
             check(f"{tab} 畫得出來", ok,
                   (await pg2.locator("#tab-" + tab).inner_text())[:80])
 
-        # 系統參數
-        await pg2.click(".sidenav button[data-tab='system']")
+        # 系統參數（M：獨立分頁 ＋ 二層 nav ＋ 批次儲存 ＋ 搜尋）
+        await pg2.click(".sidenav button[data-tab='params']")
         await pg2.wait_for_selector("#paramList .param", timeout=8000)
+
+        nav = await pg2.evaluate("""() => {
+            const n = document.querySelector('#paramNav');
+            return { hidden: n.hidden,
+                     cats: [...n.querySelectorAll('button')].map(b => b.dataset.cat) };
+        }""")
+        check("二層 nav 展開了", nav and not nav["hidden"], nav)
+        check("狀態分類在最前面（可以在這裡改／由 .env 決定）",
+              nav["cats"][:2] == ["__free", "__env"], nav["cats"][:2])
+        check("分類數 = 狀態 2 + 有項目的 section", len(nav["cats"]) >= 4, nav["cats"])
+
         n = await pg2.locator("#paramList .param").count()
-        check(f"參數列出來了（{n} 項）", n >= 20, n)
+        check(f"「可以在這裡改」列出來了（{n} 項）", n >= 1, n)
         keys = await pg2.evaluate(
             "() => [...document.querySelectorAll('#paramList .param')].map(e => e.dataset.key)")
         check("Tier 0 / Tier 4 完全沒出現在畫面上",
@@ -282,39 +297,90 @@ async def main():
                     "LIBRARY_ROOTS", "TRUST_PROXY"} & set(keys)),
               sorted({"HOST", "AUTH_SECRET", "FFMPEG_PATH"} & set(keys)))
 
-        # 被 .env 鎖住的那一項：輸入框要真的是停用狀態
-        locked = await pg2.evaluate("""() => {
-            const el = document.querySelector('.param[data-key="MIN_FILE_MB"]');
-            if (!el) return null;
-            const inp = el.querySelector('input,select');
-            return { disabled: inp.disabled, hasLock: !!el.querySelector('.note.lock'),
-                     hasSave: !!el.querySelector('[data-do="save"]') };
+        # 切到「由 .env 決定」：那些列不給輸入框，而且說得出原因
+        await pg2.click("#paramNav button[data-cat='__env']")
+        await pg2.wait_for_timeout(400)
+        envcat = await pg2.evaluate("""() => {
+            const rows = [...document.querySelectorAll('#paramList .param')];
+            return { rows: rows.length,
+                     ro: rows.filter(r => r.classList.contains('ro')).length,
+                     inputs: document.querySelectorAll('#paramList .param input,'
+                                                     + '#paramList .param select').length,
+                     rovals: document.querySelectorAll('#paramList .roval').length,
+                     hint: !!document.querySelector('.box.lockhint'),
+                     lockNotes: document.querySelectorAll('#paramList .note.lock').length };
         }""")
-        check("被環境變數決定的欄位是停用的", locked and locked["disabled"], locked)
-        check("而且畫面上說得出原因", locked and locked["hasLock"], locked)
-        check("停用的欄位不給儲存鈕（不能是送出後才在後端報錯）",
-              locked and not locked["hasSave"], locked)
+        if envcat["rows"]:
+            check("被 .env 決定的列全部標成唯讀",
+                  envcat["ro"] == envcat["rows"], envcat)
+            check("唯讀的列不給輸入框（不能是打了字才發現存不進去）",
+                  envcat["inputs"] == 0 and envcat["rovals"] == envcat["rows"], envcat)
+            check("而且畫面上說得出原因", envcat["hint"] and envcat["lockNotes"], envcat)
 
-        # 沒被鎖的那一項：改值 → 出現未儲存 → 存檔 → 真的生效
-        free_key = await pg2.evaluate("""() => {
-            const el = [...document.querySelectorAll('.param')].find(e =>
-                e.dataset.key === 'TRANSCODE_CRF');
-            return el ? el.dataset.key : null;
+        # 搜尋要跨分類
+        await pg2.click("#paramNav button[data-cat='__free']")
+        await pg2.wait_for_timeout(300)
+        await pg2.fill("#pq", "crf")
+        await pg2.wait_for_timeout(400)
+        found = await pg2.evaluate(
+            "() => [...document.querySelectorAll('#paramList .param')].map(e => e.dataset.key)")
+        check("搜尋找得到 TRANSCODE_CRF", "TRANSCODE_CRF" in found, found)
+        await pg2.fill("#pq", "")
+        await pg2.wait_for_timeout(300)
+
+        # 批次儲存：一項合法 + 一項不合法 → 整批拒絕，一個字都不寫
+        await pg2.evaluate("""() => {
+            const set = (k, v) => {
+                const w = document.querySelector(`.param[data-key="${k}"]`);
+                if (!w) return;
+                const inp = w.querySelector('input,select');
+                inp.value = v;
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+            };
+            set('TRANSCODE_CRF', '23');
+            set('NVENC_CQ', '999');
         }""")
-        check("找得到一個沒被鎖的參數來改", free_key == "TRANSCODE_CRF", free_key)
-        if free_key:
-            sel = ".param[data-key='TRANSCODE_CRF'] input"
-            await pg2.fill(sel, "23")
-            await pg2.dispatch_event(sel, "input")
-            check("改了之後有「未儲存」標記",
-                  await pg2.locator(".param[data-key='TRANSCODE_CRF'].dirty").count() == 1)
-            await pg2.click(".param[data-key='TRANSCODE_CRF'] [data-do='save']")
-            await pg2.wait_for_timeout(900)
-            got = await pg2.evaluate(
-                "async () => (await (await fetch('/api/params')).json())"
-                ".items.find(i => i.key === 'TRANSCODE_CRF').effective")
-            check(f"存完之後真的變成 23（來源 {got['source']}）",
-                  got["value"] == 23 and got["source"] == "db", got)
+        await pg2.wait_for_timeout(300)
+        check("改了之後有「未儲存」標記",
+              await pg2.locator(".param.dirty").count() == 2,
+              await pg2.locator(".param.dirty").count())
+        check("底部出現批次儲存列",
+              not await pg2.evaluate("() => document.querySelector('#savebar').hidden"))
+        await pg2.click("#bSaveAll")
+        await pg2.wait_for_timeout(900)
+        rej = await pg2.evaluate("""async () => {
+            const d = await (await fetch('/api/params')).json();
+            const v = k => d.items.find(i => i.key === k).effective;
+            return { crf: v('TRANSCODE_CRF'), cq: v('NVENC_CQ'),
+                     bad: [...document.querySelectorAll('.param.bad')].map(e => e.dataset.key),
+                     dirty: document.querySelectorAll('.param.dirty').length };
+        }""")
+        check("一項不合法 → 整批不寫（合法那一項也沒有進去）",
+              rej["crf"]["source"] != "db", rej["crf"])
+        check("錯誤標在出錯的那一列上", rej["bad"] == ["NVENC_CQ"], rej["bad"])
+        check("使用者打的東西沒有被錯誤吃掉", rej["dirty"] == 2, rej["dirty"])
+
+        # 修好 → 兩項一起寫進去
+        await pg2.evaluate("""() => {
+            const w = document.querySelector('.param[data-key="NVENC_CQ"]');
+            const inp = w.querySelector('input');
+            inp.value = '30';
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+        }""")
+        await pg2.click("#bSaveAll")
+        await pg2.wait_for_timeout(1200)
+        okv = await pg2.evaluate("""async () => {
+            const d = await (await fetch('/api/params')).json();
+            const v = k => d.items.find(i => i.key === k).effective;
+            return { crf: v('TRANSCODE_CRF'), cq: v('NVENC_CQ'),
+                     bar: document.querySelector('#savebar').hidden,
+                     dirty: document.querySelectorAll('.param.dirty').length };
+        }""")
+        check(f"批次存好之後兩項都生效（CRF={okv['crf']['value']}, CQ={okv['cq']['value']}）",
+              okv["crf"]["value"] == 23 and okv["crf"]["source"] == "db"
+              and okv["cq"]["value"] == 30 and okv["cq"]["source"] == "db", okv)
+        check("存完之後儲存列收起來、沒有殘留的未儲存標記",
+              okv["bar"] and okv["dirty"] == 0, okv)
 
         # 新增的那幾塊要真的畫得出來，而且錯誤態要是「說明」而不是空白
         await pg2.click(".sidenav button[data-tab='library']")
@@ -324,6 +390,22 @@ async def main():
         # 測試環境的 FTP 是連不上的，所以這裡要看到錯誤說明而不是一片空白
         check("FTP 瀏覽器連不上時給的是說明不是空白", len(ftp_txt.strip()) > 0, ftp_txt[:60])
         check("有上一層按鈕", await pg2.locator("#ftpUp").count() == 1)
+
+        # L：受限資料夾。UI 的關鍵不變量是「不讓人手打路徑」——
+        # 手打就會拼錯，而拼錯的規則等於沒有保護、畫面上還顯示已設定。
+        aclui = await pg2.evaluate("""() => ({
+            pick: !!document.querySelector('#aclPick'),
+            isSelect: document.querySelector('#aclPick')?.tagName === 'SELECT',
+            freeText: [...document.querySelectorAll('#tab-library input')]
+                        .some(i => i.id === 'aclPrefix'),
+            filter: !!document.querySelector('#aclFilter'),
+            note: (document.querySelector('#tab-library').textContent || '')
+                    .includes('密碼登入沒有帳號身分'),
+        })""")
+        check("受限資料夾有從清單挑選的下拉", aclui["pick"] and aclui["isSelect"], aclui)
+        check("而且沒有可以手打路徑的輸入框", not aclui["freeText"], aclui)
+        check("資料夾多的時候可以篩選", aclui["filter"], aclui)
+        check("畫面上講明「密碼登入沒有身分、無法授權」", aclui["note"], aclui)
 
         await pg2.click(".sidenav button[data-tab='playback']")
         await pg2.wait_for_selector("#encSel", timeout=8000)

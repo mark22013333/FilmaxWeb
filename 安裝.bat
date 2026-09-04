@@ -76,6 +76,28 @@ if errorlevel 1 (
 ) else (
   echo       完成
 )
+
+REM Test-only packages. ASCII on purpose - see the note in the quality-probe
+REM .bat files about cmd.exe parsing a .bat with the console code page.
+REM pyftpdlib and playwright are needed by tests\scan_e2e_test.py and
+REM tests\browser_test.py. They were never recorded anywhere, so on a clean
+REM machine those two scripts just Traceback and it looks like the code broke.
+echo.
+echo       test packages (pyftpdlib / playwright)...
+if exist "requirements-dev.txt" (
+  ".venv\Scripts\python.exe" -m pip install -q -r requirements-dev.txt
+  if errorlevel 1 (
+    echo       [X] test packages failed
+    set FAILED=!FAILED! pip-dev
+  ) else (
+    ".venv\Scripts\python.exe" -m playwright install chromium >nul 2>&1
+    if errorlevel 1 (
+      echo       [!] playwright browser download failed - browser_test will skip
+    ) else (
+      echo       done
+    )
+  )
+)
 :after_pip
 
 REM ---------------------------------------------------------------- Flyway
@@ -125,7 +147,9 @@ if not "!FAILED!"=="" (
   echo   全部就緒。
   echo.
   echo   接下來：
-  echo     1. 確認 .env 裡的 FFMPEG_PATH / FFPROBE_PATH 留空
+  echo     1. 確認 .env 的 FFMPEG_PATH / FFPROBE_PATH 填的是完整路徑
+  echo        ^(不要留空、不要靠 PATH —— 這台機器上有 ImageMagick 附帶的
+  echo         舊版 ffmpeg，靠 PATH 會拿到它。見 J 章第 3 步^)
   echo     2. 雙擊「啟動.bat」
   echo     3. 在網頁按一次「掃描媒體庫」，重新分析之前失敗的檔案
 )

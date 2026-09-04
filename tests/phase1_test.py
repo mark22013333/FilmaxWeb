@@ -11,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TMP = tempfile.mkdtemp(prefix="filmax-p1-")
 os.environ.update({"FILMAX_DATA_DIR": TMP, "TMDB_API_KEY": "",
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
                    "AUTH_ENABLED": "false", "GOOGLE_CLIENT_ID": "",
                    "GOOGLE_CLIENT_SECRET": "", "MSSQL_HOST": ""})
 sys.path.insert(0, str(ROOT))

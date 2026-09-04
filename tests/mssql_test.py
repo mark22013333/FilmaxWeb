@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parent.parent
 TMP = tempfile.mkdtemp(prefix="filmax-mssql-test-")
 os.environ.update({
     "FILMAX_DATA_DIR": TMP,
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
     "MSSQL_HOST": "fake-server", "MSSQL_DATABASE": "filmax",
     "MSSQL_USER": "filmax_app", "MSSQL_PASSWORD": "sup3r-s3cret-pw",
     "AUTH_ENABLED": "true", "AUTH_SECRET": "t", "TMDB_API_KEY": "",

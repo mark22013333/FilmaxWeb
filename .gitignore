@@ -33,3 +33,6 @@ test-result.txt
 quality-probe-result.txt
 quality-probe-crf-result.txt
 segment-boundary-result.txt
+
+# Cygwin/Git Bash 的當機轉存檔
+*.stackdump

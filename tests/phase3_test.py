@@ -9,6 +9,8 @@ ROOT = Path(__file__).resolve().parent.parent
 TMP = tempfile.mkdtemp(prefix="filmax-p3-")
 os.environ.update({
     "FILMAX_DATA_DIR": os.path.join(TMP, "data"),
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
     "TMDB_API_KEY": "", "AUTH_ENABLED": "true", "AUTH_PASSWORD": "adminpw12345",
     "VIEWER_PASSWORD": "viewerpw12345", "MSSQL_HOST": "",
     "AUTO_SCAN_ON_START": "false", "FTP_HOST": "127.0.0.1", "FTP_PORT": "1",
@@ -371,11 +373,25 @@ leaks = [w for w in ("adminpw12345", "viewerpw12345", "AUTH_PASSWORD=", "MSSQL_P
          if w in admin_js]
 check("admin.js 裡沒有寫死任何敏感資訊（它不需登入就下載得到）", not leaks, leaks)
 
-check("有六個分區",
-      len(_re.findall(r'data-tab="(\w+)"', admin_html)) == 6,
+# M：系統參數從「系統」分頁裡搬出來，獨立成第七個分區。
+# 分類導覽做成二層 nav 而不是第二個左欄 —— 後台左邊已經有一排。
+check("有七個分區（系統參數獨立成一頁）",
+      len(_re.findall(r'data-tab="(\w+)"', admin_html)) == 7,
       _re.findall(r'data-tab="(\w+)"', admin_html))
-for tab in ("overview", "library", "users", "playback", "system", "logs"):
+for tab in ("overview", "library", "users", "playback", "system", "params", "logs"):
     check(f"{tab} 有對應的實作", f"TABS.{tab} =" in admin_js)
+check("參數的分類是二層 nav，不是第二個左欄",
+      'id="paramNav"' in admin_html and ".subnav{" in admin_css)
+check("狀態當第一軸（可以在這裡改／由 .env 決定）",
+      "CAT_FREE" in admin_js and "CAT_ENV" in admin_js)
+check("有搜尋框，而且跨分類", 'id="pq"' in admin_js and "paramQ ? pd.items" in admin_js)
+check("批次儲存：底部一條儲存列，不是每列一顆按鈕",
+      'id="savebar"' in admin_js and ".savebar{" in admin_css
+      and 'data-do="save"' not in admin_js)
+check("批次儲存走專用端點（不是前端迴圈打單筆）",
+      "'/params', { method: 'PUT'" in admin_js)
+check("被 .env 蓋住的列不給輸入框，改印生效值",
+      'class="roval"' in admin_js and ".param .roval{" in admin_css)
 
 check("斷點是 768px", "max-width:768px" in admin_css)
 check("手機把表格換成卡片，不是用 CSS 藏欄位",
@@ -391,11 +407,16 @@ check("確認文案會重述對象名稱", "nameOf(id)" in admin_js)
 check("被鎖的欄位會停用並說明原因",
       "disabled" in admin_js and "由環境變數" in admin_js)
 check("被鎖且 shadowed 的有「清除這裡存的值」按鈕", 'data-do="clear"' in admin_js)
+api_py = (ROOT / "app" / "routers" / "api.py").read_text(encoding="utf-8")
+ps_py = (ROOT / "app" / "paramstore.py").read_text(encoding="utf-8")
+check("有批次儲存端點 PUT /params", '@router.put("/params")' in api_py)
+check("批次是先全部驗證再全部寫（不是迴圈寫到一半失敗）",
+      "def set_many(" in ps_py and "只驗證，不寫" in ps_py)
 check("有「重設為預設值」與「重設為上次儲存值」",
       'data-do="default"' in admin_js and 'data-do="revert"' in admin_js)
 check("有逐欄位的「未儲存」標記", ".param.dirty" in admin_css and "classList.add('dirty')" in admin_js)
 check("會鎖死自己的設定要二次確認，而且給 CLI 復原指令",
-      "item.lockout" in admin_js and "app.paramstore unset" in admin_js)
+      "lockout" in admin_js and "app.paramstore unset" in admin_js)
 check("每張表都有空狀態", admin_js.count("empty\">") >= 4 or admin_js.count('class="empty"') >= 4)
 # 規格的分區表列了每一區「最少要有」什麼。少一項不會壞掉，只是那個功能
 # 從此不存在 —— 而沒有人會發現，所以逐項釘住。

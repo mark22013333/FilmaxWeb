@@ -1,4 +1,12 @@
-fastapi==0.115.6
+# acl_test／rescrape_test 用的 TestClient(app, client=("127.0.0.1", 1)) 要
+# starlette >= 0.44（實測 0.43 沒有、0.44 有）。
+#
+# starlette 一定要自己釘。只升 fastapi 沒有用 —— fastapi 0.115.14 的條件是
+# starlette>=0.40,<0.47，而 pip 只在「已裝的版本不符合條件」時才會動它，
+# 所以舊 venv 裡的 0.41.3 完全合法、會原封不動留著（實機驗證過：升到
+# fastapi 0.115.14 之後 starlette 還是 0.41.3，那兩支照樣掛）。
+fastapi==0.115.14
+starlette==0.45.0
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 python-dotenv==1.0.1

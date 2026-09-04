@@ -21,6 +21,8 @@ PORT = 2187
 os.makedirs(FTPROOT)
 os.environ.update({
     "FILMAX_DATA_DIR": os.path.join(TMP, "data"),
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
     "FTP_HOST": "127.0.0.1", "FTP_PORT": str(PORT),
     "FTP_USER": "u", "FTP_PASSWORD": "p", "FTP_TLS": "false",
     "LIBRARY_ROOTS": "/|auto", "TMDB_API_KEY": "",

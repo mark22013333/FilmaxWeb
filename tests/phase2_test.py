@@ -9,6 +9,8 @@ ROOT = Path(__file__).resolve().parent.parent
 TMP = tempfile.mkdtemp(prefix="filmax-p2-")
 os.environ.update({
     "FILMAX_DATA_DIR": os.path.join(TMP, "data"),
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
     "TMDB_API_KEY": "", "AUTH_ENABLED": "false", "MSSQL_HOST": "",
     "AUTO_SCAN_ON_START": "false", "FTP_HOST": "127.0.0.1", "FTP_PORT": "1",
 })
@@ -29,23 +31,35 @@ db.init_db()
 # ============================================================ G-3 子行程終止
 head("[G-3] 停止掃描要能真的殺掉 ffprobe")
 
+# 子行程每 0.1 秒寫一次心跳檔。**用心跳而不是 pgrep**：
+# 這一套測試也會在 Windows 上跑，那裡沒有 pgrep —— 原本那一句在 Windows 上
+# 是「內層 python 找不到 pgrep → 例外 → stdout 空的 → 判定沒有殘留」，
+# 也就是**因為錯誤的理由而通過**，真的漏掉一隻子行程時它一樣會綠。
+# 心跳檔測的是同一件事，而且不依賴任何平台工具。
+HB = os.path.join(TMP, "heartbeat.txt")
+CHILD = ("import sys, time\n"
+         "while True:\n"
+         "    open(sys.argv[1], 'w').write(str(time.time()))\n"
+         "    time.sleep(0.1)\n")
+
 ev = threading.Event()
 threading.Timer(0.8, ev.set).start()
 t0 = time.monotonic()
 err = None
 try:
-    media._run([sys.executable, "-c", "import time; time.sleep(60)"], timeout=60, cancel=ev)
+    media._run([sys.executable, "-c", CHILD, HB], timeout=60, cancel=ev)
 except Exception as e:
     err = e
 dt = time.monotonic() - t0
 check("取消時丟 Cancelled 而不是等滿逾時", isinstance(err, media.Cancelled), type(err).__name__)
 check(f"0.8 秒設旗標，{dt:.1f} 秒內回來（原本要等 60 秒）", dt < 3, dt)
 
-alive = subprocess.run([sys.executable, "-c",
-    "import subprocess,sys;"
-    "print(subprocess.run(['pgrep','-f','time.sleep(60)'],capture_output=True,text=True).stdout)"],
-    capture_output=True, text=True).stdout.strip()
-check("子行程真的死了，不是只設了旗標", not alive.strip(), alive)
+check("子行程有真的跑起來（不然下面那一項會因為錯的理由通過）",
+      os.path.exists(HB), HB)
+before = os.path.getmtime(HB) if os.path.exists(HB) else 0
+time.sleep(1.0)
+after = os.path.getmtime(HB) if os.path.exists(HB) else 0
+check("子行程真的死了，不是只設了旗標（心跳停了）", after == before, (before, after))
 
 t0 = time.monotonic()
 code, out, _ = media._run([sys.executable, "-c", "print('hi')"], timeout=10)

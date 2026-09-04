@@ -1,0 +1,13 @@
+# 只有跑 tests\ 底下那幾支才需要的東西。正式執行不必裝。
+#
+# 為什麼要單獨一個檔案：這兩個套件一直是「測試需要但沒有人記下來」的狀態，
+# 結果在乾淨的環境裡 browser_test 與 scan_e2e_test 直接 Traceback，
+# 看起來像程式壞了。安裝.bat 現在會一起裝。
+-r requirements.txt
+
+# scan_e2e_test.py 用它架一台假的 FTP 伺服器
+pyftpdlib>=1.5.10
+
+# browser_test.py 用它開真的瀏覽器。裝完還要跑一次：
+#   .venv\Scripts\python.exe -m playwright install chromium
+playwright>=1.49.0
