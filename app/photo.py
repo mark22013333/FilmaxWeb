@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
+import re
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 from PIL import Image, ExifTags
@@ -21,6 +24,11 @@ log = logging.getLogger("filmax.photo")
 # Pillow 對超大圖有防護（避免解壓縮炸彈），這裡稍微放寬但仍保留上限。
 # 完全關掉的話，一張惡意構造的圖片就能把記憶體吃光。
 Image.MAX_IMAGE_PIXELS = 300_000_000
+
+# 縮圖與 preview 的長邊。preview 是「點圖放大」用的衍生圖：原圖每次都得從
+# FTP 重新拉（沒有快取，中位數 2MB、最大 30.9MB），衍生圖產生一次就是本機檔案。
+THUMB_BOX = 480
+PREVIEW_BOX = 1920
 
 _TAG = {v: k for k, v in ExifTags.TAGS.items()}
 
@@ -179,9 +187,30 @@ def thumb_name(data: bytes, box: int = 480) -> str:
     return f"p{box}_{h}.jpg"
 
 
+_NAME_RE = re.compile(r"^p(\d+)_([0-9a-f]{24})\.jpg$")
+
+
+def derived_name(name: str, box: int) -> Optional[str]:
+    """把一個既有的衍生圖檔名換算成另一個尺寸的檔名。
+
+    檔名是 `p{box}_{sha256(內容)[:24]}.jpg`，雜湊只跟內容有關 —— 所以
+    「同一張圖的 1920 版叫什麼」不必先把原圖抓下來重算，也不必在資料庫
+    多開一個欄位記 preview 檔名：把 box 換掉就是。
+
+    認不出格式就回 None（例如改用內容雜湊之前掃的 `ph_7.jpg`），
+    呼叫端自己抓原圖去算。
+    """
+    m = _NAME_RE.match(str(name or ""))
+    if not m:
+        return None
+    if int(m.group(1)) == box:
+        return str(name)
+    return f"p{box}_{m.group(2)}.jpg"
+
+
 def make_thumb(data: bytes, out_name: Optional[str] = None,
-               box: int = 480) -> Optional[str]:
-    """產生縮圖。會依 EXIF 方向轉正，不然直的照片會躺著。
+               box: int = THUMB_BOX, quality: int = 82) -> Optional[str]:
+    """產生縮圖或 preview。會依 EXIF 方向轉正，不然直的照片會躺著。
 
     out_name 留空就用內容雜湊命名（建議）。
     """
@@ -208,7 +237,16 @@ def make_thumb(data: bytes, out_name: Optional[str] = None,
                 im = im.convert("RGB")
             im.thumbnail((box, box), Image.LANCZOS)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            im.save(dest, "JPEG", quality=82, optimize=True)
+            # 先寫暫存檔再 rename。瀏覽器開燈箱時會同時預載前後張，
+            # 兩個請求真的會同時要產生同一個檔名 —— 直接寫目標檔的話
+            # 有機會讀到只寫了一半的 JPEG，而那個壞檔還會被快取住。
+            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{threading.get_ident()}")
+            try:
+                im.save(tmp, "JPEG", quality=quality, optimize=True)
+                os.replace(tmp, dest)
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
         return out_name
     except Exception as e:
         log.warning("縮圖失敗 %s: %s", out_name, e)
