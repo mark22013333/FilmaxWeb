@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
-from . import db
+from . import db, localfs
 from .config import IMAGE_DIR, SUB_DIR, settings
 
 log = logging.getLogger("filmax.media")
@@ -158,6 +158,7 @@ def reset_encoder_cache() -> None:
     global _hw_cache
     _hw_cache = None
     _chosen_args.clear()
+    _chosen_tier.clear()
     _hw_probe.clear()
     _enc_opt_cache.clear()
 
@@ -212,6 +213,29 @@ def tool_status() -> Dict[str, Any]:
 
 def source_url(file_id: int) -> str:
     return f"{settings.self_base_url()}/api/stream/{file_id}?raw=1"
+
+
+def input_args(file_id: int) -> List[str]:
+    """`-i` 及其前面該帶的參數。**認得的路徑直接讀檔**（第 −1 層）。
+
+    片庫其實就在同一台機器上（`FTP_HOST=127.0.0.1`，FTP 根目錄就是 `D:\\1.FTP`），
+    所以走 `source_url()` 的話每一段都是
+    「HTTP → FastAPI → FtpReadStream → FTP 伺服器（loopback） → 磁碟」四層 ——
+    讀的是同一顆磁碟上的同一個檔案，而且每 6 秒一段就重來一次
+    （新連線、`REST` 到偏移量、重新開始讀）。
+
+    對上階（remux）尤其重要：它一段要搬 2～3 MB 的原始位元組，
+    四層搬運的成本會直接吃掉「remux 幾乎不花資源」這個前提。
+
+    對應不到就照舊走 HTTP —— 那是「來源可以在別台機器」的抽象，
+    而且本機直讀沒設定時就是它在頂著。
+    """
+    row = db.q1("SELECT ftp_path FROM media_file WHERE id=?", (file_id,))
+    if row:
+        local = localfs.resolve_local(row["ftp_path"] or "")
+        if local is not None:
+            return ["-i", str(local)]
+    return [*source_headers(), "-rw_timeout", "30000000", "-i", source_url(file_id)]
 
 
 def source_headers() -> List[str]:
@@ -292,14 +316,24 @@ def _run(cmd: List[str], timeout: int = 120, cancel=None) -> Tuple[int, bytes, b
         raise subprocess.TimeoutExpired(cmd, timeout)
 
 
+def run_tool(cmd: List[str], timeout: int = 120, cancel=None) -> Tuple[int, bytes, bytes]:
+    """給同一個 package 裡其他模組用的公開入口（keyframes.py 在用）。
+
+    直接包 _run 而不是讓別人去碰私有函式：可中止與「出口一律遮憑證」
+    這兩件事都在 _run 裡面，繞過它就是繞過那兩層保護。
+    """
+    return _run(cmd, timeout=timeout, cancel=cancel)
+
+
 def _ffprobe_json(file_id: int, timeout: int = 90, cancel=None) -> Dict[str, Any]:
+    # 探測也走本機直讀（第 −1 層）。`input_args()` 會回 ["-i", 路徑]，
+    # 而 ffprobe 吃得下 `-i`（它只是不常這樣寫）—— 統一用同一個入口，
+    # 才不會出現「轉碼讀本機、探測讀 HTTP」這種一半的狀態。
     cmd = [
         resolve_tool("ffprobe"), "-v", "error",
-        *source_headers(),
-        "-rw_timeout", "30000000",
         "-print_format", "json",
         "-show_format", "-show_streams",
-        source_url(file_id),
+        *input_args(file_id),
     ]
     code, out, err = _run(cmd, timeout=timeout, cancel=cancel)
     if code != 0:
@@ -324,8 +358,7 @@ _CHANNELS = {"mono": 1, "stereo": 2, "2.1": 3, "quad": 4, "5.0": 5,
 
 
 def _ffmpeg_probe(file_id: int, timeout: int = 120, cancel=None) -> Dict[str, Any]:
-    cmd = [resolve_tool("ffmpeg"), "-hide_banner", "-rw_timeout", "30000000",
-           *source_headers(), "-i", source_url(file_id)]
+    cmd = [resolve_tool("ffmpeg"), "-hide_banner", *input_args(file_id)]
     # 沒指定輸出檔，ffmpeg 一定以非 0 結束，資訊在 stderr —— 這是預期行為
     code, _, err = _run(cmd, timeout=timeout, cancel=cancel)
     text = (err or b"").decode("utf-8", "ignore")
@@ -590,7 +623,13 @@ def encoder_option_values(encoder: str, option: str) -> List[str]:
                 continue
             # 選項底下縮排的列舉值："  fast   3   E..V......."
             if current and line.startswith((" " * 5, "\t")):
-                vm = re.match(r"^([A-Za-z0-9_.\-]+)\s+[-]?\d+\s+[EDAVS.]{6,}", stripped)
+                # ffmpeg 4.x 的常數列沒有數值那一欄，5.x 之後才有。
+                # 數值寫成必填的話，4.x 上這裡永遠抓到空清單，於是 pick_option()
+                # 一律回 None —— preset 與 rc 都選不到，NVENC 的 tier 退到「僅 cq」，
+                # 而那組沒有 -rc vbr 也沒有 -b:v 0，等於 CRF 對硬體編碼失效。
+                #   ffmpeg 4.2   →      slow                    E..V..... hq 2 passes
+                #   ffmpeg 5.x+  →      p4          15          E..V....... medium
+                vm = re.match(r"^([A-Za-z0-9_.\-]+)\s+(?:[-]?\d+\s+)?[EDAVS.]{6,}", stripped)
                 if vm:
                     cached[current].append(vm.group(1))
                     continue
@@ -614,23 +653,70 @@ def pick_option(encoder: str, option: str, preferences: List[str]) -> Optional[s
 _hw_probe: Dict[str, Dict[str, Any]] = {}
 
 
-def _quality_arg_tiers(encoder: str) -> List[Tuple[str, List[str]]]:
+def _rate_args(encoder: str, target_kbps: int) -> List[str]:
+    """這一段要怎麼控制位元率：有目標碼率就綁碼率，沒有就綁品質。
+
+    **有目標碼率時 NVENC 要走碼率導向，不要走 cq。**兩個理由：
+
+    1. v4 量到 cq 模式下有「更多碼率、更低分」的異常 —— cq 28 時「參數調滿」
+       花 3,305 kbps 拿到 VMAF 92.8，而「現況參數」花 2,579 kbps 拿到 94.0。
+       最可能是 `-spatial-aq`（還沒查清）。**綁碼率的那兩條階梯不受這個影響**
+       —— v4／v5 的兩條獨立階梯在同碼率上量到同一個分數（差 0.1～0.4）。
+    2. 兩階 HLS 的下階要在 master playlist 宣告 `BANDWIDTH`，
+       而 `BANDWIDTH` 是承諾的上界。**cq 導向給不出上界**（同一個 cq 在
+       不同片源上吐 1,093 到 10,195 kbps 都有），碼率導向才給得出來。
+
+    x264 則是「capped CRF」：`-crf` 決定畫質、`-maxrate` 只當天花板 ——
+    v4／v5 的量測就是用這個組合跑的，所以照它。實測 CRF 21 在片源 A 只吐
+    3,174 kbps，上限 12000 完全咬不到；真正決定畫質的是 CRF，上限是保險。
+    """
+    if target_kbps > 0:
+        cap = [f"-maxrate", f"{target_kbps}k", "-bufsize", f"{target_kbps * 2}k"]
+        if encoder == "h264_nvenc":
+            # 碼率導向：-b:v 就是目標，不再給 -cq
+            return ["-b:v", f"{target_kbps}k"] + cap
+        if encoder == "libx264":
+            # capped CRF：畫質由 CRF 決定，碼率只是天花板
+            return ["-crf", str(settings.crf)] + cap
+        return cap
+    if encoder == "h264_nvenc":
+        # **NVENC 的 -cq 不是 x264 的 -crf。**實測同一部 1080p 片源、同樣寫 21：
+        # x264 veryfast 用 3,238 kbps 拿到 SSIM 0.9742，NVENC 用 10,195 kbps
+        # （原檔是 10,891）才拿到 0.9767 —— 幾乎等於沒有壓縮。
+        # 所以硬體編碼有自己的一把尺，用 NVENC_CQ，不要跟 TRANSCODE_CRF 共用。
+        #
+        # `-b:v 0` 一定要帶。少了它，ffmpeg 的預設位元率就變成實際目標，
+        # cq 給多少都沒有用 —— 這是「畫質設定沒有作用」那一類的失效。
+        return ["-cq", str(settings.nvenc_cq), "-b:v", "0"]
+    if encoder == "libx264":
+        return ["-crf", str(settings.crf)]
+    return []
+
+
+def _quality_arg_tiers(encoder: str,
+                       target_kbps: int = 0) -> List[Tuple[str, List[str]]]:
     """同一個編碼器的參數組合，由好到保守。
 
     硬體編碼器在不同 ffmpeg 版本、不同驅動下能吃的參數差很多。與其猜，
     不如按順序實際試 —— 第一個過的就是這台機器實際能用的最好設定。
+
+    `target_kbps` 只換掉「位元率怎麼控制」那幾個參數（見 `_rate_args`），
+    **階層的名字與數量不變** —— `_test_encoder` 記住的是層級的名字，
+    不是那一串數字，所以探測時（沒有目標碼率）記下的「完整」，
+    在實際轉碼時（有目標碼率）仍然對應到同一層。
     """
     crf = str(settings.crf)
     if encoder == "h264_nvenc":
-        preset = pick_option(encoder, "preset", ["p4", "medium", "fast", "default"])
+        rate = _rate_args(encoder, target_kbps)
+        preset = pick_option(encoder, "preset", ["p5", "p4", "slow", "hq", "medium"])
         rc = pick_option(encoder, "rc", ["vbr", "vbr_hq", "constqp"])
         pre = ["-preset", preset] if preset else []
         tiers: List[Tuple[str, List[str]]] = []
         if rc:
-            tiers.append(("完整", pre + ["-rc", rc, "-cq", crf, "-b:v", "0", "-bf", "0"]))
-            tiers.append(("無 bf", pre + ["-rc", rc, "-cq", crf, "-b:v", "0"]))
-            tiers.append(("無 b:v", pre + ["-rc", rc, "-cq", crf]))
-        tiers.append(("僅 cq", pre + ["-cq", crf]))
+            tiers.append(("完整", pre + ["-rc", rc] + rate + ["-bf", "0"]))
+            tiers.append(("無 bf", pre + ["-rc", rc] + rate))
+        tiers.append(("無 rc", pre + rate))
+        tiers.append(("僅品質", rate))
         tiers.append(("僅 preset", pre))
         tiers.append(("預設值", []))
         return tiers
@@ -653,18 +739,40 @@ def _quality_arg_tiers(encoder: str) -> List[Tuple[str, List[str]]]:
     if encoder == "h264_videotoolbox":
         return [("完整", ["-q:v", str(max(1, min(100, 100 - settings.crf * 2)))]),
                 ("預設值", [])]
-    return [("完整", ["-preset", settings.x264_preset, "-crf", crf])]
+    return [("完整", ["-preset", settings.x264_preset]
+                    + _rate_args("libx264", target_kbps))]
 
 
 # 實測通過的那一組參數，之後就固定用它
 _chosen_args: Dict[str, List[str]] = {}
+# 通過的是「哪一層」，不是「哪幾個數字」。記標籤才不會把畫質數字凍住 ——
+# 見 _encoder_quality_args 的說明。
+_chosen_tier: Dict[str, str] = {}
 
 
-def _encoder_quality_args(encoder: str) -> List[str]:
-    """回傳這台機器實測可用的畫質參數。沒測過就用最好的那一組。"""
-    if encoder in _chosen_args:
-        return list(_chosen_args[encoder])
-    return list(_quality_arg_tiers(encoder)[0][1])
+def _encoder_quality_args(encoder: str, target_kbps: int = 0) -> List[str]:
+    """回傳這台機器實測可用的畫質參數。沒測過就用最好的那一組。
+
+    **不能直接回傳實測當下那份 list。**那份 list 裡的 `-cq 21`／`-crf 21`
+    是探測那一刻的 settings 值；之後在後台把 NVENC_CQ 改成 28，
+    UI 會說「已生效」，而硬體編碼仍然在用 21 —— 正是 B+ 節點名的
+    「最容易悄悄漂移」那一項。所以記住的是**通過的層級**（標籤），
+    每次呼叫都用當下的設定重新組一次。
+
+    `target_kbps` 走同一條路：層級記憶不變，只是那一層的位元率參數
+    換成碼率導向（見 `_rate_args`）。探測是在沒有目標碼率的情況下做的，
+    這樣才不會為了每一個不同的碼率各探測一次 —— 而 `-b:v` 與 `-cq`
+    的差別不影響「這張卡吃不吃 `-rc`／`-bf`」，那才是探測在問的事。
+    """
+    tiers = _quality_arg_tiers(encoder, target_kbps)
+    label = _chosen_tier.get(encoder)
+    if label:
+        for name, args in tiers:
+            if name == label:
+                return list(args)
+        # 找不到同名的層（例如換了 ffmpeg 之後可用選項變了）→ 用實測那份保底
+        return list(_chosen_args.get(encoder, tiers[0][1]))
+    return list(tiers[0][1])
 
 
 ENCODER_OF = {"nvenc": "h264_nvenc", "qsv": "h264_qsv",
@@ -725,6 +833,7 @@ def _test_encoder(encoder: str) -> bool:
         rec["tier"] = label
         rec["args"] = " ".join(args) or "(無)"
         _chosen_args[encoder] = args
+        _chosen_tier[encoder] = label
         return True
 
     tiers = _quality_arg_tiers(encoder)
@@ -850,6 +959,43 @@ def hdr_mode_for(src_w: Optional[int], src_h: Optional[int],
     return "fast" if pixels >= 3840 * 1600 else "quality"
 
 
+def quality_class(width: Optional[int], height: Optional[int]) -> str:
+    """把解析度講成一般人認得的級別。**依寬度判，不是依高度。**
+
+    片庫裡真正 1920×1080 的只有 32 部，而 1920 寬、高度 800／802／804／960 的
+    有 88 部 —— 那些是 2.35:1～2.4:1 的寬螢幕片，黑邊在壓製時就裁掉了，
+    所以畫面本來就比 1080 矮。**照高度標的話，一部 1920×804 的藍光會被寫成
+    「804p」**，看起來像被降級了，其實它就是原檔。Plex／Jellyfin 也是照寬度判。
+
+    回傳的是級別字串（"1080p"），不是解析度 —— 兩個都要給使用者看，
+    級別讓人知道「這是哪一檔的畫質」，解析度讓人知道「實際上是什麼」。
+    """
+    w = int(width or 0)
+    h = int(height or 0)
+    if w >= 3840 or h >= 2000:
+        return "4K"
+    if w >= 2560 or h >= 1400:
+        return "1440p"
+    if w >= 1900 or h >= 1000:
+        return "1080p"
+    if w >= 1280 or h >= 700:
+        return "720p"
+    if w >= 854 or h >= 460:
+        return "480p"
+    return f"{h}p" if h else "—"
+
+
+def scaled_size(src_w: Optional[int], src_h: Optional[int],
+                target_h: int) -> Tuple[int, int]:
+    """縮到 target_h 之後的實際解析度（跟 build_video_filters 用同一條規則）。"""
+    sw = int(src_w or 1920)
+    sh = int(src_h or 1080)
+    out_h = min(target_h, sh) if target_h > 0 else sh
+    out_h -= out_h % 2
+    out_w = int(sw * out_h / sh / 2) * 2 if sh else sw
+    return out_w, out_h
+
+
 def build_video_filters(src_w: Optional[int], src_h: Optional[int], target_h: Optional[int],
                         is_hdr: bool, tonemap: Optional[str] = None) -> Tuple[List[str], int]:
     """組出影像濾鏡鏈，並回傳實際的輸出高度。
@@ -923,8 +1069,8 @@ def bench_transcode(file_id: int, start: float = 60.0, seconds: float = 6.0,
         cmd = [ff, "-v", "error", "-nostdin", "-y"]
         if dec != "none":
             cmd += ["-hwaccel", dec]
-        cmd += ["-ss", f"{start:.3f}", "-rw_timeout", "30000000",
-                *source_headers(), "-i", source_url(file_id), "-t", f"{seconds:.3f}",
+        # 實測要跟生產走同一條讀取路徑，否則量到的倍速不是實際的倍速
+        cmd += ["-ss", f"{start:.3f}", *input_args(file_id), "-t", f"{seconds:.3f}",
                 "-map", "0:v:0", "-an", "-sn", "-dn"]
         if vf:
             cmd += ["-vf", ",".join(vf)]
@@ -1053,8 +1199,7 @@ def make_thumbnail(file_id: int, at_seconds: float, out_name: str, width: int = 
     cmd = [
         resolve_tool("ffmpeg"), "-v", "error", "-y",
         "-ss", f"{max(at_seconds, 0):.2f}",
-        "-rw_timeout", "30000000",
-        *source_headers(), "-i", source_url(file_id),
+        *input_args(file_id),
         "-frames:v", "1",
         "-vf", f"scale={width}:-2",
         "-q:v", "4",
@@ -1081,11 +1226,27 @@ def subtitle_cache_path(file_id: int, stream_index: int,
     return SUB_DIR / f"{file_id}_s{stream_index}_{tag}.vtt"
 
 
+def subtitle_cached(file_id: int, stream_index: int,
+                    mtime: Any = None, size: Any = None) -> bool:
+    """這一軌是不是已經抽好躺在快取裡了。
+
+    給 /api/play 回報用。前端拿它決定「要不要在背景預抽」——
+    沒有這個欄位的話，每次開播都會對已經抽好的檔案再跑一次 ffmpeg：
+    伺服器最後雖然還是走 FileResponse，但前端已經先發出一個沒必要的請求，
+    而且沒辦法在設定面板上顯示哪一軌已經就緒。
+
+    只 stat 一個路徑，成本可以忽略。
+    """
+    try:
+        return subtitle_cache_path(file_id, stream_index, mtime, size).exists()
+    except Exception:
+        return False
+
+
 def _sub_cmd(file_id: int, stream_index: int) -> List[str]:
     return [
         resolve_tool("ffmpeg"), "-v", "error",
-        "-rw_timeout", "30000000",
-        *source_headers(), "-i", source_url(file_id),
+        *input_args(file_id),
         "-map", f"0:{stream_index}",
         "-c:s", "webvtt", "-f", "webvtt",
         # 逐筆送出，不要在 stdio buffer 裡壓著。少了這個就算改成串流回應，
@@ -1259,6 +1420,77 @@ def convert_subtitle_bytes(data: bytes, src_ext: str) -> Optional[bytes]:
     return None
 
 
+def audio_can_copy(file_id: int, audio_index: Optional[int]) -> bool:
+    """這個音軌能不能直接 copy 到上階去。
+
+    上階的視訊是 `-c:v copy`，音訊則要看情況：mkv 裡常見的是 AC3／DTS／TrueHD，
+    瀏覽器不吃，一定要轉 AAC。已經是 AAC 的話就 copy —— **但聲道數必須符合
+    `AUDIO_CHANNELS`**，否則「降混成立體聲」這個設定會在上階整個失效
+    （5.1 的 AAC 包在 mpegts 裡，各家瀏覽器與 hls.js 的支援度並不一致，
+    那正是 AUDIO_CHANNELS 存在的理由）。
+    """
+    row = db.q1("SELECT audio_tracks, audio_codec FROM media_file WHERE id=?", (file_id,))
+    if not row:
+        return False
+    want_ch = max(0, int(settings.audio_channels))
+    tracks = json.loads(row["audio_tracks"] or "[]") if row["audio_tracks"] else []
+    track = None
+    if audio_index is not None:
+        track = next((t for t in tracks if t.get("index") == audio_index), None)
+    elif tracks:
+        track = next((t for t in tracks if t.get("default")), tracks[0])
+    codec = ((track or {}).get("codec") or row["audio_codec"] or "").lower()
+    if codec not in ("aac",):
+        return False
+    if want_ch <= 0:
+        return True                     # 0 = 不動原始聲道
+    ch = (track or {}).get("channels")
+    return bool(ch) and int(ch) == want_ch
+
+
+def build_remux_cmd(file_id: int, start: float, duration: float,
+                    audio_index: Optional[int]) -> List[str]:
+    """上階的單一分段：視訊照抄，音訊按需轉 AAC（J 章第 0 層）。
+
+    **為什麼不走 build_transcode_cmd 的分支而是自己一支。**兩者共用的部分
+    （來源、`-ss`／`-t`、`-map`、mpegts 輸出）不到一半，而不共用的部分是
+    「絕對不能出現」的那些：`-vf`、編碼器參數、`-profile:v`／`-level`、
+    `-force_key_frames`、`-sc_threshold`。混在一個函式裡用 if 擋，
+    將來加一個轉碼參數就有機會漏進 copy 的路徑 —— 而那不會報錯，
+    只會讓「零損失」這句話悄悄變成假的。
+
+    **`-ss` 一定要在 `-i` 前面（輸入端 seek）。**copy 模式只能從 keyframe 起頭，
+    而我們的 `start` 就是邊界表裡的 keyframe 時間戳，所以兩者剛好吻合。
+    放到輸出端 seek 的話 ffmpeg 會從 0 開始解，然後丟掉前面 —— 慢，而且
+    每一段都要從頭掃一次。
+
+    **`-avoid_negative_ts make_zero` 是給非單調 DTS 的片源的。**mkv 有一整類
+    片源的 DTS 不單調（量測工具在那部 4K DV 上就吃過三行警告），
+    在 copy 模式下 mpegts muxer 會直接吐錯。make_zero 讓 muxer 把時間軸
+    平移到零而不是拒收，再由 `-output_ts_offset` 放回這一段該有的位置。
+    """
+    pre = [resolve_tool("ffmpeg"), "-v", "error", "-nostdin", "-y",
+           "-ss", f"{start:.3f}",
+           *input_args(file_id),
+           "-t", f"{duration:.3f}",
+           "-map", "0:v:0",
+           "-map", f"0:{audio_index}" if audio_index is not None else "0:a:0?",
+           "-sn", "-dn",
+           "-c:v", "copy"]
+    if audio_can_copy(file_id, audio_index):
+        pre += ["-c:a", "copy"]
+    else:
+        pre += ["-c:a", "aac", "-b:a", f"{max(64, settings.audio_bitrate_kbps)}k",
+                "-ar", "48000"]
+        if settings.audio_channels > 0:
+            pre += ["-ac", str(settings.audio_channels)]
+    pre += ["-avoid_negative_ts", "make_zero",
+            "-muxdelay", "0", "-muxpreload", "0",
+            "-output_ts_offset", f"{start:.3f}",
+            "-f", "mpegts", "pipe:1"]
+    return pre
+
+
 def build_transcode_cmd(file_id: int, start: float, duration: float,
                         height: Optional[int], audio_index: Optional[int],
                         force_software: bool = False,
@@ -1277,8 +1509,7 @@ def build_transcode_cmd(file_id: int, start: float, duration: float,
 
     pre += [
         "-ss", f"{start:.3f}",
-        "-rw_timeout", "30000000",
-        *source_headers(), "-i", source_url(file_id),
+        *input_args(file_id),
         "-t", f"{duration:.3f}",
         "-map", "0:v:0",
         "-map", f"0:{audio_index}" if audio_index is not None else "0:a:0?",
@@ -1290,15 +1521,17 @@ def build_transcode_cmd(file_id: int, start: float, duration: float,
     src_h = row["height"] if row else None
     is_hdr = bool(row["is_hdr"]) if row else False
 
-    vf, out_h = build_video_filters(src_w, src_h, height if height else s.max_height, is_hdr)
+    # height=0 是「不縮放」，不是「沒指定」—— 用 `or` 會把它退回 max_height。
+    vf, out_h = build_video_filters(src_w, src_h,
+                                    s.max_height if height is None else height, is_hdr)
     if vf:
         pre += ["-vf", ",".join(vf)]
 
     encoder = ENCODER_OF.get(hw, "libx264")
-    pre += ["-c:v", encoder] + _encoder_quality_args(encoder)
-    if bitrate_kbps > 0:
-        # 遠端觀看時把峰值鎖住，避免高動態畫面瞬間爆掉上傳頻寬
-        pre += ["-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps * 2}k"]
+    # 位元率控制整個交給 _encoder_quality_args ——「上限」與「目標」是同一件事的
+    # 兩面，分兩個地方加會出現 `-maxrate` 出現兩次（後者靜默勝出）這種難查的狀況。
+    # 遠端觀看時這裡就是把峰值鎖住的地方，避免高動態畫面瞬間爆掉上傳頻寬。
+    pre += ["-c:v", encoder] + _encoder_quality_args(encoder, bitrate_kbps)
 
     pre += [
         "-profile:v", "high", "-level", h264_level_for(out_h),
