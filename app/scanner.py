@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
-from . import db, ftpclient, media, nameparser, photo, purge, timeparse
+from . import db, ftpclient, keyframes, media, nameparser, photo, purge, timeparse
 from .config import settings
 from .scraper import normalize_details, tmdb
 
@@ -33,6 +33,7 @@ class ScanStatus:
     artwork_skipped: int = 0
     photos_read: int = 0
     photo_total: int = 0
+    docs_found: int = 0
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     error: str = ""
@@ -57,12 +58,15 @@ def cancel() -> None:
     _cancel.set()
 
 
-def start(full: bool = False, reparse: bool = False) -> bool:
+def start(full: bool = False, reparse: bool = False, remanual: bool = False) -> bool:
     """開始掃描。
 
-    full    重新刮削所有條目、重新分析所有檔案
-    reparse 強制重新解析每個檔名並重新分組。改了解析規則之後要用這個 ——
-            平常的掃描看到「檔案大小沒變」就早退，不會重新分組。
+    full     重新刮削所有條目、重新分析所有檔案
+    reparse  強制重新解析每個檔名並重新分組。改了解析規則之後要用這個 ——
+             平常的掃描看到「檔案大小沒變」就早退，不會重新分組。
+    remanual 連手動修正過的條目也重新刮削。**預設 false，而且要跟 full 一起用。**
+             見 `_scrape_items` 的註解 —— 這個開關存在的唯一理由是「真的要換」，
+             不該是「完整重掃」的副作用。
     """
     global _thread
     with _lock:
@@ -73,19 +77,20 @@ def start(full: bool = False, reparse: bool = False) -> bool:
         status.running = True
         status.phase = "listing"
         status.started_at = time.time()
-        _thread = threading.Thread(target=_run, args=(full, reparse), name="scan", daemon=True)
+        _thread = threading.Thread(target=_run, args=(full, reparse, remanual),
+                                   name="scan", daemon=True)
         _thread.start()
         return True
 
 
-def _run(full: bool, reparse: bool = False) -> None:
+def _run(full: bool, reparse: bool = False, remanual: bool = False) -> None:
     try:
         _scan_files(reparse)
         if _cancel.is_set():
             status.phase = "cancelled"
             return
         status.phase = "scraping"
-        _scrape_items(force=full)
+        _scrape_items(force=full, include_manual=remanual)
         if _cancel.is_set():
             status.phase = "cancelled"
             return
@@ -99,6 +104,15 @@ def _run(full: bool, reparse: bool = False) -> None:
         _read_photos()
         status.phase = "done"
         status.note("掃描完成")
+        # 邊界表放在掃描**之後**的獨立背景佇列，不當成掃描的一個階段。
+        # 實測 6.2 秒／GB —— 全庫約 42 分鐘，塞進上面那串會讓「掃描」
+        # 從幾分鐘變成 45 分鐘，性質完全不同。它自己可取消、可續跑
+        # （狀態欄留在 media_file.kf_state，所以中斷了下一次接著跑）。
+        try:
+            if keyframes.start_background(cancel=_cancel):
+                status.note(f"分段邊界表在背景計算中（待辦 {keyframes.pending_count()} 個）")
+        except Exception as e:
+            log.warning("keyframe 佇列啟動失敗：%s", e)
     except Exception as e:  # pragma: no cover
         log.exception("掃描失敗")
         status.phase = "error"
@@ -125,6 +139,7 @@ def _scan_files(reparse: bool = False) -> None:
     _load_registry()
     seen_paths: List[str] = []
     seen_photos: List[str] = []
+    seen_docs: List[str] = []
     subtitle_map: Dict[str, List[ftpclient.FtpEntry]] = {}
 
     # 「一集一資料夾」與「檔名尾端是不是集數」都要看群組才判斷得出來。
@@ -162,6 +177,13 @@ def _scan_files(reparse: bool = False) -> None:
                     seen_photos.append(f.path)
                     _index_photo(f, batch=writes)
 
+                for f in files:
+                    if not _wanted_doc(f):
+                        continue
+                    status.docs_found += 1
+                    seen_docs.append(f.path)
+                    _index_doc(f)
+
     # 從 FTP 上消失的檔案。
     #
     # 先查出 id 再交給 purge，而不是直接 DELETE：那些資料列上掛著磁碟檔
@@ -175,6 +197,21 @@ def _scan_files(reparse: bool = False) -> None:
         gone_photos = _vanished("photo", "_seenp", seen_photos)
     if gone_files or gone_photos:
         purge.purge(file_ids=gone_files, photo_ids=gone_photos, reason="scan_vanished")
+
+    # 消失的文件直接刪列，不走 purge()。
+    # purge() 存在的理由是「資料列上掛著磁碟檔」（海報、縮圖）—— 而最小版的
+    # 走 purge() 而不是自己寫 DELETE。
+    #
+    # 最小版的文件沒有任何磁碟衍生物，所以「一句 DELETE 就夠」看起來成立 ——
+    # 但 phase1 的測試就是在釘「掃描器自己不寫 DELETE」這條不變量，而它是對的：
+    # 等封面縮圖進來，這裡的 DELETE 會安靜地留下一堆孤兒縮圖，
+    # 而那時候沒有人會回來看這一段。現在就接上 purge()，之後只要在 purge()
+    # 裡多收一個 thumb 檔名即可。
+    if seen_docs and not _cancel.is_set():
+        gone_docs = _vanished("document", "_seend", seen_docs)
+        if gone_docs:
+            purge.purge(doc_ids=gone_docs, reason="scan_vanished_doc")
+            status.note(f"移除 {len(gone_docs)} 份已不存在的文件")
 
     # 孤兒條目清理：影片與相片是兩件獨立的事。
     # 這一段原本縮排在「if seen_photos」裡面 —— 純影片的片庫永遠不會清孤兒，
@@ -193,6 +230,8 @@ def _scan_files(reparse: bool = False) -> None:
         msg += f"；{status.photos_found} 張相片"
     if status.artwork_skipped:
         msg += f"（排除 {status.artwork_skipped} 張影片封面）"
+    if status.docs_found:
+        msg += f"；{status.docs_found} 份文件"
     status.note(msg)
 
 
@@ -226,6 +265,47 @@ def _wanted_photo(f) -> bool:
     if only and ext not in only:
         return False
     return f.size >= settings.min_photo_kb * 1024
+
+
+# 文件的大小門檻。影片用 MIN_FILE_MB（50MB）會把所有 PDF 濾掉，
+# 相片的 MIN_PHOTO_KB（40KB）又偏大 —— 一份純文字的規格書可能只有 20KB。
+# 這個值只是用來擋掉壞檔與 0 位元組的殘骸，不需要做成設定。
+MIN_DOC_BYTES = 4 * 1024
+
+
+def _wanted_doc(f) -> bool:
+    """這個檔案要不要收進文件庫。"""
+    ext = (f.ext or "").lower()
+    if ext not in ftpclient.DOC_EXTS:
+        return False
+    if ext in settings.exclude_exts:
+        return False
+    only = settings.only_exts
+    if only and ext not in only:
+        return False
+    return f.size >= MIN_DOC_BYTES
+
+
+def _index_doc(entry: ftpclient.FtpEntry) -> None:
+    """把 PDF 登記進文件庫。
+
+    這裡不走 db.batch()：批次是為了「一次掃描 800 次 fsync」那個問題而存在的，
+    而文件的數量是幾十筆等級，直接 upsert 反而少一層要維護的介面。
+    """
+    folder = posixpath.dirname(entry.path) or "/"
+    mts = timeparse.parse(entry.mtime)
+    now = db.now_i()
+    db.execute("""INSERT INTO document(ftp_path, folder, filename, ext, size, mtime,
+                                       mtime_ts, sort_ts, probe_state, seen_at, added_at)
+                  VALUES(?,?,?,?,?,?,?,?, 'ok', ?, ?)
+                  ON CONFLICT(ftp_path) DO UPDATE SET
+                      folder=excluded.folder, filename=excluded.filename,
+                      size=excluded.size, mtime=excluded.mtime,
+                      mtime_ts=excluded.mtime_ts,
+                      sort_ts=COALESCE(excluded.mtime_ts, document.sort_ts),
+                      seen_at=excluded.seen_at""",
+               (entry.path, folder, entry.name, (entry.ext or "").lower(),
+                entry.size, entry.mtime, mts, mts or now, now, now))
 
 
 def _wanted(f) -> bool:
@@ -297,7 +377,7 @@ def _index_photo(entry: ftpclient.FtpEntry, *, batch) -> None:
     """把圖片登記進相片庫。真正讀 EXIF 與產縮圖是後面那一輪做的。"""
     existing = db.q1("SELECT id, size FROM photo WHERE ftp_path=?", (entry.path,))
     if existing and (existing["size"] or 0) == entry.size:
-        batch.touch_photo(existing["id"], db.now())
+        batch.touch_photo(existing["id"], db.now_i())
         return
     folder = posixpath.dirname(entry.path) or "/"
     # FTP 的 mtime 有五種格式（MLSD 的 ISO、LIST 的兩種、DOS、空字串），
@@ -369,7 +449,7 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     # 檔案大小沒變就早退 —— 但改了解析器之後這個捷徑會讓既有檔案永遠
     # 不重新分組。reparse=True 時強制重新解析。
     if existing and (existing["size"] or 0) == entry.size and not reparse:
-        batch.touch_file(existing["id"], db.now())
+        batch.touch_file(existing["id"], db.now_i())
         return
 
     parents = nameparser.dirs_of(entry.path, root.path)
@@ -398,7 +478,7 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     batch.upsert_file(item_id=item_id, episode_id=episode_id, path=entry.path,
                       name=entry.name, size=entry.size, mtime=entry.mtime,
                       mtime_ts=timeparse.parse(entry.mtime), ext=entry.ext,
-                      at=db.now())
+                      at=db.now_i())
     if not existing:
         status.files_new += 1
 
@@ -444,10 +524,56 @@ def _upsert_item(kind: str, key: str, parsed) -> int:
                                       scrape_state, added_at, updated_at)
                VALUES(?,?,?,?,?,?,'pending',?,?)""",
             (kind, title, parsed.alt_title or "", title.lower(), parsed.year, key,
-             db.now(), db.now()),
+             db.now_i(), db.now_i()),
         )
         _item_reg[key] = int(cur.lastrowid)
         return _item_reg[key]
+
+
+def reassign_episodes(item_id: int) -> int:
+    """把條目底下的檔案重新指派集數。給「類型改成影集」用。
+
+    電影條目的檔案沒有 episode_id，改成影集之後如果不補，那個條目就會是
+    「是影集、但一集都沒有」—— 前端的季／集清單會是空的。
+
+    先用 `nameparser` 從檔名解析；解析不出集數的，就按檔名排序給
+    S01E01、S01E02…。**這個 fallback 是刻意的**：一個被誤判成電影的多檔條目，
+    檔名通常本來就沒有集數標記（那正是它被誤判的原因），與其留空，
+    不如給一個看得懂、而且順序正確的編號。
+
+    回傳指派了幾個檔案。
+    """
+    files = db.q("SELECT id, ftp_path, filename FROM media_file WHERE item_id=? "
+                 "ORDER BY filename COLLATE NOCASE", (item_id,))
+    n = 0
+    with _reg_lock:
+        _ep_reg.clear()
+        for r in db.q("SELECT id, item_id, season, episode FROM episode"):
+            _ep_reg[(r["item_id"], r["season"], r["episode"])] = r["id"]
+    auto = 0
+    for r in files:
+        parsed = nameparser.parse(r["filename"], [])
+        season, ep = parsed.season, parsed.episode
+        if not ep:
+            auto += 1
+            season, ep = season or 1, auto
+        ep_id = _upsert_episode(item_id, season or 1, ep)
+        db.execute("UPDATE media_file SET episode_id=? WHERE id=?", (ep_id, r["id"]))
+        n += 1
+    return n
+
+
+def clear_episodes(item_id: int) -> int:
+    """把條目底下的集數清掉。給「類型改成電影」用。
+
+    走 purge()（A-4 的單一刪除進入點）而不是自己 DELETE ——
+    集數有 still（劇照）檔在磁碟上，自己刪會留孤兒。
+    """
+    ep_ids = [r["id"] for r in db.q("SELECT id FROM episode WHERE item_id=?", (item_id,))]
+    if not ep_ids:
+        return 0
+    purge.purge(episode_ids=ep_ids, reason="kind_changed_to_movie")
+    return len(ep_ids)
 
 
 def _upsert_episode(item_id: int, season: int, episode: int) -> int:
@@ -468,12 +594,34 @@ def _upsert_episode(item_id: int, season: int, episode: int) -> int:
 # --------------------------------------------------------------------------
 # 2) TMDB 刮削
 # --------------------------------------------------------------------------
-def _scrape_items(force: bool = False) -> None:
+def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
+    """刮削。
+
+    **`scrape_state='manual'` 的條目預設永遠不刮，連 force 也不刮。**
+
+    原本 force 的 where 是空字串 —— 於是「完整重掃」會把使用者一個一個手動指定
+    好的條目，拿去重新自動比對再蓋掉。而自動比對之所以會挑錯，通常是檔名的問題，
+    那個原因不會因為重掃而改變，所以它會挑錯第二次，一模一樣。
+    整件事沒有任何提示，使用者只會發現「我修好的片又變回錯的了」。
+
+    實測（Yu 的資料庫）：一般掃描會刮 9 筆，force 會刮 23 筆 ——
+    手動修正過的 2 筆也在裡面。
+
+    真的要重刮手動修正過的條目時，走 include_manual=True（後台一個預設關閉的
+    勾選）。那必須是一個明確的動作，不是「完整重掃」的副作用。
+    """
     if not tmdb.enabled:
         status.note("未設定 TMDB_API_KEY，跳過刮削（仍可用檔名瀏覽與播放）")
         return
-    where = "" if force else "WHERE scrape_state IN ('pending','failed')"
+    if force:
+        where = "" if include_manual else "WHERE scrape_state != 'manual'"
+    else:
+        where = "WHERE scrape_state IN ('pending','failed')"
     rows = db.q(f"SELECT * FROM media_item {where} ORDER BY id")
+    if force and not include_manual:
+        kept = db.q1("SELECT COUNT(*) c FROM media_item WHERE scrape_state='manual'")["c"]
+        if kept:
+            status.note(f"保留 {kept} 筆手動修正過的條目（沒有重新刮削）")
     status.items_total = len(rows)
     for row in rows:
         if _cancel.is_set():
@@ -484,7 +632,7 @@ def _scrape_items(force: bool = False) -> None:
         except Exception as e:
             log.warning("刮削失敗 %s: %s", row["title"], e)
             db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
-                       (db.now(), row["id"]))
+                       (db.now_i(), row["id"]))
         status.scraped += 1
 
 
@@ -493,13 +641,13 @@ def _scrape_one(item: dict) -> None:
     hit = tmdb.search(kind, item["title"], item.get("year"), item.get("original_title") or "")
     if not hit:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
-                   (db.now(), item["id"]))
+                   (db.now_i(), item["id"]))
         status.note(f"找不到: {item['title']}")
         return
     detail = tmdb.details(kind, hit["id"])
     if not detail:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
-                   (db.now(), item["id"]))
+                   (db.now_i(), item["id"]))
         return
     n = normalize_details(kind, detail)
     poster = tmdb.download_image(n["poster_path"], "w500")
@@ -511,7 +659,7 @@ def _scrape_one(item: dict) -> None:
         (n["title"] or item["title"], n["original_title"], (n["title"] or "").lower(),
          n["year"] or item.get("year"), n["tmdb_id"], n["overview"], poster, backdrop,
          n["rating"], n["runtime"], json.dumps(n["genres"], ensure_ascii=False),
-         json.dumps(n["cast"], ensure_ascii=False), db.now(), item["id"]),
+         json.dumps(n["cast"], ensure_ascii=False), db.now_i(), item["id"]),
     )
     status.note(f"刮到: {n['title']} ({n['year'] or '-'})")
 

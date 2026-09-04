@@ -27,6 +27,9 @@ VIDEO_EXTS = {
 }
 SUBTITLE_EXTS = {"srt", "ass", "ssa", "vtt", "sub"}
 IMAGE_EXTS = {"jpg", "jpeg", "png", "webp"}
+# 文件庫。目前只有 PDF —— cbz/epub 是另一種排版模型與另一種閱讀器，
+# 混進來只會讓兩邊都做不好（見規格書 I 節的「刻意不做」）。
+DOC_EXTS = {"pdf"}
 
 # 這些資料夾直接跳過
 SKIP_DIRS = {
