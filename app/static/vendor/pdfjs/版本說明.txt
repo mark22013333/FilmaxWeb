@@ -1,0 +1,15 @@
+pdfjs-dist 6.3.289（Apache-2.0）—— 用的是 **legacy 版本的 build**，不是預設那份。
+
+原因：預設 build 用到 Map.prototype.getOrInsertComputed（很新的提案 API）。
+實測連 Chromium 141 都還沒有它，一 render 就丟
+  TypeError: this[#Yr].getOrInsertComputed is not a function
+Safari 與稍舊的 Chrome 也一樣。legacy build 是 pdf.js 官方為舊環境轉譯＋補
+polyfill 的那一份，功能相同、體積差不到 50KB。
+
+要升級的話：
+  npm i pdfjs-dist@<版本>
+  cp node_modules/pdfjs-dist/legacy/build/pdf.min.mjs        app/static/vendor/pdfjs/
+  cp node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs app/static/vendor/pdfjs/
+  cp -r node_modules/pdfjs-dist/standard_fonts               app/static/vendor/pdfjs/
+（cmaps 沒有一起帶 —— 169 個檔案，只有「用 CJK 字型但沒有內嵌」的 PDF 需要。
+  真的遇到文字破圖再補。）

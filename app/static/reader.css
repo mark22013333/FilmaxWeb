@@ -1,0 +1,59 @@
+/* PDF 閱讀器。沿用 style.css 的變數與 .btn，只加閱讀器自己的版面。 */
+body.reader{
+  margin:0;height:100dvh;display:flex;flex-direction:column;overflow:hidden;
+  background:var(--bg);color:var(--text);
+}
+
+.rd-bar{
+  display:flex;align-items:center;gap:10px;flex:none;
+  padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);
+  flex-wrap:wrap;
+}
+.rd-bar .spacer{flex:1}
+.rd-title{
+  font-size:13.5px;font-weight:500;color:var(--muted);
+  max-width:38vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.rd-pages,.rd-zoom{display:flex;align-items:center;gap:4px;flex:none}
+.rd-pages input{
+  width:52px;text-align:center;font-variant-numeric:tabular-nums;
+  background:var(--bg-2);color:var(--text);border:1px solid var(--line);
+  border-radius:5px;padding:5px 4px;font-size:13px;
+}
+.rd-total{font-size:12.5px;color:var(--dim);font-variant-numeric:tabular-nums}
+.rd-total b{color:var(--muted);font-weight:600}
+.rd-zoom .btn.on{background:var(--accent);color:#111;border-color:var(--accent)}
+
+/* 捲動容器。overscroll-behavior 擋掉 iOS 的下拉重整 —— 讀到第一頁還想往上滑
+   是很自然的動作，而那一下重整會把你踢回第 1 頁。 */
+.rd-doc{
+  /* 這是 <main>，而 style.css 的 main{max-width:1800px;margin:0 auto} 在
+     flex column 容器裡會出事：cross axis 上的 auto margin 會取消 stretch，
+     寬度變成「跟著內容縮」—— 而內容寬又是照容器寬算的，於是卡在最小值
+     （實測整份文件只有 352px 寬）。這三行是解那個循環。 */
+  width:100%;max-width:none;margin:0;
+  flex:1;overflow-y:auto;overscroll-behavior:contain;
+  padding:16px;display:flex;flex-direction:column;align-items:center;gap:16px;
+  -webkit-overflow-scrolling:touch;
+}
+
+.rd-page{
+  position:relative;flex:none;background:#fff;
+  box-shadow:0 2px 10px rgba(0,0,0,.45);
+  /* 還沒畫好的頁面是白底，不是破圖或閃黑 */
+}
+.rd-canvas{display:block;width:100%;height:100%}
+.rd-num{
+  position:absolute;top:6px;right:-34px;width:28px;text-align:right;
+  font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;
+  pointer-events:none;
+}
+
+@media(max-width:820px){
+  .rd-title{max-width:100%;order:9;flex-basis:100%}
+  .rd-doc{padding:10px 6px;gap:10px}
+  .rd-num{display:none}          /* 手機上沒有頁碼的空間，看上面的輸入框 */
+}
+@media(prefers-reduced-motion:reduce){
+  .rd-doc{scroll-behavior:auto}
+}

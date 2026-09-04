@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<!-- 刻意不寫 user-scalable=no：手機上雙指縮放是讀 PDF 最自然的操作，
+     自己實作一套只會比瀏覽器原生的差 -->
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>閱讀 — FilmaxWeb</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/reader.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📄</text></svg>">
+</head>
+<body class="reader">
+
+<header class="rd-bar">
+  <a class="btn" href="/" title="回媒體庫">‹ 返回</a>
+  <div class="rd-title" id="rdTitle">載入中…</div>
+  <div class="spacer"></div>
+  <div class="rd-pages">
+    <button class="btn" id="rdPrev" title="上一頁 (←)">‹</button>
+    <input id="rdPage" type="text" inputmode="numeric" value="1" aria-label="頁碼">
+    <span class="rd-total">/ <b id="rdTotal">–</b></span>
+    <button class="btn" id="rdNext" title="下一頁 (→)">›</button>
+  </div>
+  <div class="rd-zoom">
+    <button class="btn" id="rdOut" title="縮小 (-)">−</button>
+    <button class="btn" id="rdFitW" title="符合寬度">寬</button>
+    <button class="btn" id="rdFitP" title="符合整頁">頁</button>
+    <button class="btn" id="rdIn" title="放大 (+)">＋</button>
+  </div>
+  <a class="btn" id="rdRaw" href="#" target="_blank" rel="noopener" title="用瀏覽器內建檢視器開啟">原檔</a>
+</header>
+
+<main class="rd-doc" id="rdDoc">
+  <div class="loading" id="rdStatus">載入中…</div>
+</main>
+
+<script type="module" src="/static/reader.js"></script>
+</body>
+</html>
