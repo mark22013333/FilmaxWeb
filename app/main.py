@@ -14,19 +14,53 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import (audit, auth, db, ftpclient, geo, media, mssql, params,
+from . import (audit, auth, db, ftpclient, geo, hls, media, mssql, params,
                paramstore, purge, scanner, users)
 from .config import settings
 from .routers import api, auth_google, stream
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)-16s %(message)s",
-    datefmt="%H:%M:%S",
-)
+# 日期一定要在時間旁邊。服務會連著開好幾天，而問題往往是隔天才回報的 ——
+# 只有 `21:06:39` 的話，沒有人分得出那是今天還是三天前的那一次啟動。
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)-16s %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATEFMT)
 log = logging.getLogger("filmax")
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def no_admin_lines(listed) -> list:
+    """「還沒有管理員帳號」該說什麼。
+
+    **「沒設名單」與「設了但還沒登入」是兩件事。**`GOOGLE_ADMIN_EMAILS` 只是
+    一份名單，它不會建立帳號 —— 帳號是在那個人**第一次用該 Gmail 登入**時才
+    建立並提升為管理員（見 `users.upsert_from_google`）。
+
+    原本兩種情況共用同一句「請在 .env 設 GOOGLE_ADMIN_EMAILS」，
+    於是已經設好的人會以為自己設錯了，回頭去改一個本來就對的設定 ——
+    **一個把人導向錯誤方向的提示，比沒有提示更糟。**
+    """
+    out = ["目前還沒有任何管理員帳號，新註冊的人會全部卡在「待審核」而沒有人能核准。"]
+    listed = list(listed or [])
+    if listed:
+        out.append(f"GOOGLE_ADMIN_EMAILS 已經設了 {len(listed)} 個帳號："
+                   + "、".join(_mask_email(e) for e in listed))
+        out.append("設定本身沒問題，只是還沒有人用名單內的帳號登入過 ——")
+        out.append("用其中一個 Gmail 登入一次，那個帳號就會自動成為管理員。")
+    else:
+        out.append("請在 .env 設 GOOGLE_ADMIN_EMAILS=你的Gmail 後重新啟動，再用該帳號登入一次。")
+    return out
+
+
+def _mask_email(addr: str) -> str:
+    """日誌裡的信箱只留頭尾。日誌會被貼進聊天室、issue、螢幕截圖裡。"""
+    addr = (addr or "").strip()
+    if "@" not in addr:
+        return addr
+    name, _, domain = addr.partition("@")
+    keep = name[:2] if len(name) > 3 else name[:1]
+    return f"{keep}{'*' * max(1, len(name) - len(keep))}@{domain}"
 
 
 @asynccontextmanager
@@ -64,6 +98,13 @@ async def lifespan(app: FastAPI):
 
     db.init_db()
     log.info("媒體庫資料庫就緒（%s）", settings.media_store)
+
+    # profile key 換過形狀（加了階別維度）→ 舊分段的資料夾名對不上了，清一次。
+    # 放在這裡而不是 db._migrate()：刪快取不是資料層的事，而且要看得到訊息。
+    try:
+        hls.migrate_cache()
+    except Exception as e:
+        log.warning("HLS 快取版本檢查失敗（不影響啟動）：%s", e)
 
     # 被環境變數蓋掉的後台設定。**絕不自動刪** —— 使用者可能只是暫時用
     # 環境變數覆蓋（測試、容器編排），刪掉他們在後台設過的東西是不可逆的。
@@ -142,9 +183,15 @@ async def lifespan(app: FastAPI):
         else:
             log.info("Google 登入回呼網址：%s（要跟 Google Cloud Console 登記的完全一致）", uri)
         if not users.has_owner():
+            # **「沒設名單」與「設了但還沒登入」是兩件事。**
+            # GOOGLE_ADMIN_EMAILS 只是一份名單，它不會建立帳號 ——
+            # 帳號是在那個人**第一次用該 Gmail 登入**時才建立並提升為管理員
+            # （見 users.upsert_from_google）。原本兩種情況共用同一句
+            # 「請在 .env 設 GOOGLE_ADMIN_EMAILS」，於是已經設好的人會以為
+            # 自己設錯了，然後回頭改一個本來就對的設定。
             log.warning("=" * 78)
-            log.warning("目前還沒有任何管理員帳號，新註冊的人會全部卡在「待審核」而沒有人能核准。")
-            log.warning("請在 .env 設 GOOGLE_ADMIN_EMAILS=你的Gmail 後重新啟動，再用該帳號登入一次。")
+            for line in no_admin_lines(settings.admin_emails):
+                log.warning("%s", line)
             log.warning("=" * 78)
     else:
         log.warning("=" * 78)
@@ -252,6 +299,12 @@ def index():
 @app.get("/player", include_in_schema=False)
 def player():
     return FileResponse(STATIC_DIR / "player.html")
+
+
+@app.get("/reader", include_in_schema=False)
+def reader():
+    """PDF 閱讀器。實際要讀哪一份由網址的 ?doc= 決定，權限在 API 那一層擋。"""
+    return FileResponse(STATIC_DIR / "reader.html")
 
 
 @app.get("/admin", include_in_schema=False)
