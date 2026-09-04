@@ -60,7 +60,7 @@ def _sqlite(event, role, ip, loc, email, user_id, detail) -> None:
                    (at, event, role, ip, country, region, city, timezone,
                     latitude, longitude, user_agent, email, user_id, detail)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (db.now(), event, role, ip, loc.get("country"), loc.get("region"),
+            (db.now_i(), event, role, ip, loc.get("country"), loc.get("region"),
              loc.get("city"), loc.get("timezone"), loc.get("latitude"),
              loc.get("longitude"), loc.get("user_agent"), email, user_id,
              str(detail)[:300] if detail else None))

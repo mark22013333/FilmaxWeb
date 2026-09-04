@@ -27,3 +27,9 @@ Thumbs.db
 
 # 執行期產物
 *.log
+
+# 測試與量測工具的執行輸出（由 跑測試.bat / 測試畫質*.bat 產生，可隨時重跑）
+test-result.txt
+quality-probe-result.txt
+quality-probe-crf-result.txt
+segment-boundary-result.txt

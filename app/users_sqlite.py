@@ -103,7 +103,7 @@ def state(uid: int) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------- 寫
 def create(email: str, sub: str, name: str, picture: Optional[str], role: str,
            status: str, ip: str, loc: Dict[str, Any], approved_by: Optional[str]) -> int:
-    now = db.now()
+    now = db.now_i()
     cur = db.execute(
         """INSERT INTO app_user
                (email, google_sub, display_name, picture_url, role, status, created_at,
@@ -132,7 +132,7 @@ def promote(uid: int, role: str, status: str, approved_by: str) -> None:
         """UPDATE app_user SET role=?, status=?, approved_at=?, approved_by=?,
                                sess_ver=COALESCE(sess_ver,0)+1
             WHERE id=?""",
-        (role, status, db.now(), approved_by, uid))
+        (role, status, db.now_i(), approved_by, uid))
 
 
 def record_login(uid: int, ip: str, loc: Dict[str, Any]) -> None:
@@ -142,7 +142,7 @@ def record_login(uid: int, ip: str, loc: Dict[str, Any]) -> None:
                   last_login_city=?, last_login_ua=?,
                   login_count=COALESCE(login_count,0)+1
             WHERE id=?""",
-        (db.now(), ip, loc.get("country"), loc.get("city"), loc.get("user_agent"), uid))
+        (db.now_i(), ip, loc.get("country"), loc.get("city"), loc.get("user_agent"), uid))
 
 
 def set_status(uid: int, status: str, by: Optional[str]) -> None:
@@ -151,7 +151,7 @@ def set_status(uid: int, status: str, by: Optional[str]) -> None:
         """UPDATE app_user SET status=?, approved_at=?, approved_by=?,
                                sess_ver=COALESCE(sess_ver,0)+1
             WHERE id=?""",
-        (status, db.now() if approved else None, by if approved else None, uid))
+        (status, db.now_i() if approved else None, by if approved else None, uid))
 
 
 def set_role(uid: int, db_role: str) -> None:

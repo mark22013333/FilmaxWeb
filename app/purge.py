@@ -49,6 +49,11 @@ NEEDS_GRACE = ("item_nofile", "episode_nofile", "image_unused")
 GRACE_SECONDS = 3600
 
 
+# 計數欄位集中在這裡。原本同一個 tuple 在 purge() 裡出現三次，
+# 加一種媒體型別就要改三個地方，而漏掉的那個會回一個少一欄的 dict。
+_COUNT_KEYS = ("item", "episode", "file", "photo", "document", "play_state", "image")
+
+
 def _ids(v) -> List[int]:
     if not v:
         return []
@@ -94,7 +99,7 @@ def _unlink(names: Iterable[str]) -> int:
 
 # ---------------------------------------------------------------- purge
 def purge(*, item_ids=None, file_ids=None, photo_ids=None, episode_ids=None,
-          reason: str, dry_run: bool = False) -> Dict[str, int]:
+          doc_ids=None, reason: str, dry_run: bool = False) -> Dict[str, int]:
     """刪除媒體庫資料的唯一進入點。連帶關係與磁碟檔都在這裡展開。
 
     reason 是必填的，而且會進紀錄。沒有理由的刪除到頭來沒有人查得出來
@@ -106,8 +111,9 @@ def purge(*, item_ids=None, file_ids=None, photo_ids=None, episode_ids=None,
 
     items, files = _ids(item_ids), _ids(file_ids)
     photos, episodes = _ids(photo_ids), _ids(episode_ids)
-    if not (items or files or photos or episodes):
-        return {k: 0 for k in ("item", "episode", "file", "photo", "play_state", "image")}
+    docs = _ids(doc_ids)
+    if not (items or files or photos or episodes or docs):
+        return {k: 0 for k in _COUNT_KEYS}
 
     with db.tx() as conn:
         # 1) 條目 → 底下的集數與檔案一起收進來
@@ -134,17 +140,20 @@ def purge(*, item_ids=None, file_ids=None, photo_ids=None, episode_ids=None,
             names += [r["thumb"] for r in conn.execute(
                 f"SELECT thumb FROM photo WHERE {_in('id', photos)}", photos)]
 
-        counts = {k: 0 for k in ("item", "episode", "file", "photo", "play_state", "image")}
+        counts = {k: 0 for k in _COUNT_KEYS}
         if dry_run:
             # 到這裡為止一個字都還沒寫，所以直接回去就是了，不需要回滾
             counts.update(item=len(items), episode=len(episodes),
-                          file=len(files), photo=len(photos))
+                          file=len(files), photo=len(photos), document=len(docs))
             return counts
 
         # 3) 由下往上刪，不靠 CASCADE
         if files:
             counts["play_state"] = conn.execute(
                 f"DELETE FROM play_state WHERE {_in('file_id', files)}", files).rowcount
+            # 邊界表是另一張表，沒有 CASCADE —— 這一行不刪就是孤兒
+            conn.execute(
+                f"DELETE FROM media_keyframe WHERE {_in('file_id', files)}", files)
             counts["file"] = conn.execute(
                 f"DELETE FROM media_file WHERE {_in('id', files)}", files).rowcount
         if episodes:
@@ -159,6 +168,12 @@ def purge(*, item_ids=None, file_ids=None, photo_ids=None, episode_ids=None,
         if photos:
             counts["photo"] = conn.execute(
                 f"DELETE FROM photo WHERE {_in('id', photos)}", photos).rowcount
+        if docs:
+            # 目前文件沒有磁碟衍生物（最小版沒有封面），所以只刪資料列。
+            # **做封面的時候要在上面第 2 步一起收 thumb 檔名** ——
+            # 那一行不補，刪掉的文件會在 IMAGE_DIR 留下孤兒縮圖。
+            counts["document"] = conn.execute(
+                f"DELETE FROM document WHERE {_in('id', docs)}", docs).rowcount
 
     # 4) 磁碟檔在交易外面刪。交易回滾得了資料列，回滾不了 unlink()——
     #    先刪檔再回滾就是資料還在、圖不見了。

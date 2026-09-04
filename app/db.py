@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS media_file (
 CREATE INDEX IF NOT EXISTS idx_file_item ON media_file(item_id);
 CREATE INDEX IF NOT EXISTS idx_file_probe ON media_file(probe_state);
 
+-- 分段邊界表（J 章第 0 層的上階要用）。
+--
+-- 存的是**原始的 keyframe 時間與位元組偏移**，不是算好的分段邊界。
+-- 理由：邊界規則還沒定案（「湊滿 >= 分段長度的最少 keyframe 數」讓段長變成
+-- keyframe 間距的整數倍，實測 6 秒設定變 7.34 秒；另一種是取「離目標最近」的）。
+-- 存原始資料的話換規則不必重掃 —— 而重掃是 6.2 秒/GB、全庫 42 分鐘。
+-- 代價是每檔約 19 KB 而不是 4 KB，133 檔約 2.5 MB，換掉 42 分鐘很划算。
+CREATE TABLE IF NOT EXISTS media_keyframe (
+    file_id   INTEGER PRIMARY KEY,
+    times     TEXT NOT NULL,          -- JSON: [秒數, ...]
+    positions TEXT NOT NULL,          -- JSON: [位元組偏移, ...]，跟 times 同長
+    count     INTEGER NOT NULL,
+    gap_min   REAL,
+    gap_med   REAL,
+    gap_max   REAL,
+    updated_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS play_state (
     file_id     INTEGER PRIMARY KEY REFERENCES media_file(id) ON DELETE CASCADE,
     position    REAL DEFAULT 0,
@@ -131,6 +149,43 @@ CREATE TABLE IF NOT EXISTS photo (
 CREATE INDEX IF NOT EXISTS idx_photo_folder ON photo(folder);
 CREATE INDEX IF NOT EXISTS idx_photo_taken ON photo(taken_at DESC);
 CREATE INDEX IF NOT EXISTS idx_photo_probe ON photo(probe_state);
+
+-- 文件庫（PDF）。刻意獨立一張表，不塞進 media_file ——
+-- 那張表的每一列都假設自己有 duration、影片語意的 probe_state、play_mode
+-- 與 HLS 設定檔，PDF 一個都沒有。相片當初獨立開表是對的，照著做。
+--
+-- 時間欄位照 A-3 的規則：Python 端一律 epoch 整數，並在建表時就加上值域
+-- CHECK（ALTER TABLE 補的欄位加不了 CHECK，新表沒有這個限制）。
+CREATE TABLE IF NOT EXISTS document (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ftp_path    TEXT UNIQUE NOT NULL,
+    folder      TEXT NOT NULL,
+    filename    TEXT NOT NULL,
+    ext         TEXT,
+    size        INTEGER,
+    mtime       TEXT,                     -- FTP 給的原始字串，一字不改
+    mtime_ts    INTEGER CHECK (mtime_ts IS NULL OR mtime_ts BETWEEN 0 AND 4102444800),
+    sort_ts     INTEGER CHECK (sort_ts  IS NULL OR sort_ts  BETWEEN 0 AND 4102444800),
+    pages       INTEGER,                  -- 目前不填，等封面／頁數那一期
+    probe_state TEXT DEFAULT 'ok',        -- 最小版沒有探測階段，索引完就是 ok
+    probe_error TEXT,
+    seen_at     REAL,
+    added_at    REAL
+);
+CREATE TABLE IF NOT EXISTS folder_rule (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    prefix     TEXT UNIQUE NOT NULL,      -- 受限的資料夾（前綴，子資料夾自動繼承）
+    note       TEXT,
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS folder_grant (
+    rule_id INTEGER NOT NULL REFERENCES folder_rule(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL,             -- app_user.id（只有 Google 帳號有 id）
+    PRIMARY KEY (rule_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_grant_user ON folder_grant(user_id);
+CREATE INDEX IF NOT EXISTS idx_doc_folder ON document(folder);
+CREATE INDEX IF NOT EXISTS idx_doc_sort ON document(sort_ts DESC);
 
 -- 後台儲存的系統參數。只存「跟預設值不同」的項目 —— 存一堆等於預設值的列，
 -- 之後改預設值時那些列會變成隱形的覆蓋：使用者從來沒設過它，卻永遠拿不到新預設值。
@@ -247,6 +302,22 @@ _ADDED_COLUMNS = {
         ("bit_depth", "INTEGER"),
         ("is_hdr", "INTEGER DEFAULT 0"),
         ("fps", "REAL"),
+        # 邊界表的狀態。**只放狀態不放資料** —— 資料本體在 media_keyframe，
+        # 因為它每檔約 19 KB，混進這張熱表會讓每個 SELECT * 都把它拖出來。
+        # 狀態留在這裡的理由相反：佇列要能用一句 WHERE 撈出待辦，不必 JOIN。
+        ("kf_state", "TEXT DEFAULT 'pending'"),   # pending / ok / failed / skipped
+        ("kf_error", "TEXT"),
+        # 上階（remux）的 CODECS 屬性要照片源的真實 profile／level 填 ——
+        # 寫死 avc1.64001f（High 3.1）會讓不符的片源在 Safari 上被整階拒收。
+        # 由 keyframe 掃描順手寫進來：那支掃描本來就在對同一個檔案跑 ffprobe，
+        # 而且它跟邊界表是同一組前置條件（kf_state='ok' 才有上階）。
+        ("video_profile", "TEXT"),      # ffprobe 的字串，如 High / Main / High 10
+        ("video_level", "INTEGER"),     # ffprobe 的整數，如 40 = level 4.0
+        # 上階（remux）的執行期狀態。NULL = 還沒出過問題、'failed' = 這個檔案的
+        # 上階已經下線。**一段失敗就整個 file_id 下線**，不是只退那一段 ——
+        # 一份播放清單裡混著 copy 與重編的分段是更糟的失效（J 章第 0 層）。
+        ("remux_state", "TEXT"),
+        ("remux_error", "TEXT"),
     ],
 }
 
@@ -327,11 +398,66 @@ def _backfill_times(conn: sqlite3.Connection) -> None:
         log.info("回填 %s 筆時間欄位（字串 → epoch）", n)
 
 
+# 時間點欄位（A-3：一律 epoch 整數秒）。`duration`／`position` **不在這裡** ——
+# 那是時間長度，取整會讓續播每次往前跳最多一秒。
+_TIME_POINT_COLS = {
+    "media_file": ("seen_at", "added_at"),
+    "photo": ("seen_at", "added_at"),
+    "media_item": ("added_at", "updated_at"),
+    "episode": ("added_at", "updated_at"),
+    "document": ("seen_at", "added_at"),
+    "play_state": ("updated_at",),
+}
+
+
+def _round_time_points(conn: sqlite3.Connection) -> None:
+    """把時間點欄位裡的浮點值取整。一次性，做完在 kv 記一筆。
+
+    A-3 說時間點一律整數秒，但寫入端一直有兩個入口（`now()` 與 `now_i()`），
+    所以實機上 `media_file.seen_at` 147 列全是浮點、`photo.seen_at` 1490 列也是。
+    浮點的相等比較不可靠，而這些欄位正是「上次掃描看到」這種要拿來比對的值。
+
+    **取整不會改變任何行為**（差距 < 1 秒），但它讓「同一個概念只有一種表示」
+    這件事在資料上也成立 —— 寫入端已經統一成 `now_i()` 了。
+    """
+    if kv_get_conn(conn, "time_points_rounded"):
+        return
+    total = 0
+    for table, cols in _TIME_POINT_COLS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col in cols:
+            if col not in have:
+                continue
+            cur = conn.execute(
+                f"UPDATE {table} SET {col}=CAST({col} AS INTEGER) "
+                f"WHERE {col} IS NOT NULL AND {col} != CAST({col} AS INTEGER)")
+            total += cur.rowcount or 0
+    conn.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)",
+                 ("time_points_rounded", json.dumps(1)))
+    if total:
+        log.info("時間點欄位取整完成，%s 個值（A-3：時間點一律整數秒）", total)
+
+
+def kv_get_conn(conn: sqlite3.Connection, key: str) -> Any:
+    """kv 讀取，但用呼叫端給的連線 —— 遷移中不能再去拿一次連線。"""
+    try:
+        r = conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if not r:
+        return None
+    try:
+        return json.loads(r[0])
+    except (TypeError, ValueError):
+        return None
+
+
 def init_db() -> None:
     conn = get_conn()
     with _write_lock:
         conn.executescript(SCHEMA)
         _migrate(conn)
+        _round_time_points(conn)
         conn.commit()
 
 
@@ -374,7 +500,12 @@ VALUES(?,?,?,?,?,?,?,?,'pending',?,?)
 ON CONFLICT(ftp_path) DO UPDATE SET
     item_id=excluded.item_id, episode_id=excluded.episode_id,
     size=excluded.size, mtime=excluded.mtime, mtime_ts=excluded.mtime_ts,
-    ext=excluded.ext, seen_at=excluded.seen_at, probe_state='pending'
+    ext=excluded.ext, seen_at=excluded.seen_at, probe_state='pending',
+    -- 檔案變了就要重算邊界表。**吃跟 probe_state 同一個訊號**，不要另外
+    -- 發明一套判斷 —— 兩套判斷遲早會不一致，而不一致的那一邊會安靜地留著舊資料。
+    kf_state='pending', kf_error=NULL,
+    -- 上階的下線紀錄也一起清掉：檔案換了，之前那個失敗的理由不再適用。
+    remux_state=NULL, remux_error=NULL
 """
 _FILE_TOUCH = "UPDATE media_file SET seen_at=? WHERE id=?"
 _PHOTO_UPSERT = """
