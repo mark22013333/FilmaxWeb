@@ -30,6 +30,10 @@
       <button data-tab="users">使用者<span id="pendingDot" class="dot" hidden></span></button>
       <button data-tab="playback">播放與轉碼</button>
       <button data-tab="system">系統</button>
+      <button data-tab="params">系統參數</button>
+      <!-- 參數的分類（二層 nav）。內容由 admin.js 依 /api/params 產生，
+           因為分類是從參數登記表來的，不該在 HTML 裡再抄一份。 -->
+      <div class="subnav" id="paramNav" hidden></div>
       <button data-tab="logs">紀錄</button>
     </nav>
   </aside>
@@ -40,6 +44,7 @@
     <section id="tab-users" class="tab"></section>
     <section id="tab-playback" class="tab"></section>
     <section id="tab-system" class="tab"></section>
+    <section id="tab-params" class="tab"></section>
     <section id="tab-logs" class="tab"></section>
   </main>
 </div>

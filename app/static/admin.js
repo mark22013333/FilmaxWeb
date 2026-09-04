@@ -17,8 +17,15 @@ async function api(path, opts) {
   });
   if (!r.ok) {
     let msg = r.status === 403 ? '需要管理員權限' : `HTTP ${r.status}`;
-    try { msg = (await r.json()).detail || msg; } catch (e) { /* 不是 JSON 就用預設訊息 */ }
-    throw new Error(msg);
+    let detail = null;
+    try { detail = (await r.json()).detail; if (detail) msg = detail; }
+    catch (e) { /* 不是 JSON 就用預設訊息 */ }
+    // detail 可能是物件（批次儲存會回 {key: 訊息}）。直接丟進 Error 的話
+    // 訊息會變成 "[object Object]"，呼叫端也拿不到每一項的錯誤 —— 所以另外掛上去。
+    const err = new Error(typeof msg === 'string' ? msg : '有幾項不能儲存');
+    err.detail = detail;
+    err.status = r.status;
+    throw err;
   }
   return r.status === 204 ? null : r.json();
 }
@@ -50,7 +57,11 @@ const dur = s => {
 /* ---------------------------------------------------------------- 對話框 */
 /* 危險操作的二次確認。文案一定要重述對象名稱 ——
    「確定要刪除嗎？」在連按兩下的時候等於沒問，使用者根本沒看清楚刪的是哪一個。 */
-function confirmBox({ title, body, ok = '確定', danger = false }) {
+/* collect：在對話框被清掉**之前**讀裡面的欄位。
+ * done() 會先 m.innerHTML = '' 再 resolve，所以 await 回來之後再
+ * querySelector 對話框裡的勾選一定是 null —— 那個 bug 的症狀是
+ * 「勾了也沒有生效」，而且完全沒有錯誤訊息。 */
+function confirmBox({ title, body, ok = '確定', danger = false, collect = null }) {
   return new Promise(resolve => {
     const m = $('#modal');
     m.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">
@@ -58,7 +69,12 @@ function confirmBox({ title, body, ok = '確定', danger = false }) {
       <div class="row"><button class="btn" data-no>取消</button>
       <button class="btn ${danger ? 'danger' : 'primary'}" data-yes>${esc(ok)}</button></div></div>`;
     m.hidden = false;
-    const done = v => { m.hidden = true; m.innerHTML = ''; document.removeEventListener('keydown', key); resolve(v); };
+    const done = v => {
+      if (v && collect) collect(m);
+      m.hidden = true; m.innerHTML = '';
+      document.removeEventListener('keydown', key);
+      resolve(v);
+    };
     const key = e => { if (e.key === 'Escape') done(false); };
     m.querySelector('[data-no]').onclick = () => done(false);
     m.querySelector('[data-yes]').onclick = () => done(true);
@@ -75,6 +91,10 @@ let current = 'overview';
 function show(name) {
   current = name;
   $$('.sidenav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  // 二層 nav 只在參數頁展開。放在這裡而不是各分頁自己管，
+  // 是因為離開參數頁時也要收起來，而那件事分頁自己不會知道。
+  const pnav = $('#paramNav');
+  if (pnav) pnav.hidden = name !== 'params' || !pd;
   $$('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + name));
   closeDrawer();
   if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
@@ -163,9 +183,170 @@ TABS.overview = async el => {
       : '<div class="empty">還沒有任何登入紀錄。</div>'}`;
 };
 
+/* ---------------------------------------------------------------- 受限資料夾（L） */
+/* 只給特定帳號看的資料夾。三件事刻意這樣做：
+ *
+ * 1. **從掃到的資料夾清單勾選，不讓人手打路徑。**手打就會拼錯，而拼錯的規則
+ *    等於沒有保護 —— 畫面上還是會顯示「已設定」，沒有人會發現。
+ * 2. **密碼登入沒有帳號身分**，所以無法被授權。這句話要印在畫面上，
+ *    不然設定的人會以為「我設了但他還是看不到」是壞掉。
+ * 3. 授權用 checkbox 一次送出整份名單（PUT grants），不是逐一 add/remove ——
+ *    逐一送會有「加了三個、第四個失敗」的半套狀態。
+ */
+function aclBlock(ac) {
+  // **管理員不放進勾選清單。**他們看得到受限資料夾是因為「角色」，
+  // 不是因為這裡有一筆授權（acl.can_read 的第一句就是 is_admin）。
+  //
+  // 那為什麼不乾脆在升管理員時順手勾起來？因為降級的時候會出事：
+  // 授權留著 → 他降回一般帳號之後仍然看得到，而畫面上一切正常
+  // （這就是 L 章開頭寫的「安靜的外洩」）；若改成降級時自動刪，
+  // 又會刪掉他升級**之前**本來就有的授權，而那救不回來。
+  // 所以資料維持一種真相（角色歸角色、授權歸授權），改的是畫面：
+  // 把管理員另外列出來，不要讓四個沒勾的框看起來像「四個人都看不到」。
+  const admins = ac.users.filter(u => u.is_admin);
+  const viewers = ac.users.filter(u => !u.is_admin);
+  const adminNames = admins.map(u => esc(u.name)).join('、');
+  const adminTail = admins.length
+    ? ` <span style="color:var(--dim)">＋ 全部管理員（${admins.length} 人）</span>` : '';
+
+  const rules = ac.rules.map(r => `
+    <div class="rowcard acl-rule" data-rule="${r.id}">
+      <div class="top"><b><code>${esc(r.prefix)}</code></b>
+        <button class="btn" data-aclrm="${r.id}">移除限制</button></div>
+      <dl><dt>備註</dt><dd>${esc(r.note || '—')}</dd>
+        <dt>看得到的人</dt><dd>${r.user_names.length
+          ? r.user_names.map(n => esc(n)).join('、') + adminTail
+          : '<span style="color:#ffaeae">目前沒有人</span>' + adminTail}</dd></dl>
+      <div class="acl-users">
+        ${viewers.length ? viewers.map(u => `
+          <label><input type="checkbox" data-aclu="${u.id}"
+            ${r.user_ids.includes(u.id) ? 'checked' : ''}>
+            <span>${esc(u.name)}</span></label>`).join('')
+          : '<span style="color:var(--dim)">沒有可以授權的一般帳號。</span>'}
+      </div>
+      ${admins.length ? `<div style="font-size:11.5px;color:var(--dim);margin-top:6px">
+        管理員一律看得到，不需要（也不能）在這裡勾選：${adminNames}
+        ${(() => {
+          // 先被授權、後來升管理員的人：那筆授權還在，而且降級後仍然有效。
+          // 不講出來的話它就是一個看不見的狀態。
+          const kept = admins.filter(u => r.user_ids.includes(u.id));
+          return kept.length
+            ? `<br>其中 ${kept.map(u => esc(u.name)).join('、')} 另外保有授權，降為一般帳號後仍看得到。`
+            : '';
+        })()}</div>` : ''}
+      <div class="acts"><button class="btn primary" data-aclsave="${r.id}">儲存授權</button></div>
+    </div>`).join('');
+
+  // 已經受限、或已經在某個受限資料夾底下的，不必再列 —— 子資料夾本來就繼承
+  const free = ac.folders.filter(f => !f.restricted && !f.covered_by);
+  const opt = f => {
+    const pad = '　'.repeat(Math.max(0, f.depth - 1));
+    const bits = [f.videos && `影片 ${f.videos}`, f.photos && `相片 ${f.photos}`,
+                  f.documents && `文件 ${f.documents}`].filter(Boolean).join('／');
+    return `<option value="${esc(f.folder)}">${pad}${esc(f.folder)}　${bits}</option>`;
+  };
+  return `
+    <div class="box">
+      <div style="font-size:12.5px;color:var(--muted);line-height:1.7">
+        <b>沒被列在這裡的資料夾，所有登入者都看得到。</b>
+        列進來的只有被授權的帳號與管理員看得到，子資料夾自動跟著受限。<br>
+        <b>勾選的意思是「即使不是管理員也看得到」</b> ——
+        所以管理員不在勾選清單裡，而一個人從管理員降成一般帳號之後，
+        沒被勾到的受限資料夾他就看不到了。要讓他降級後仍然看得到，
+        趁現在先勾起來。<br>
+        ${esc(ac.password_login_note)}
+      </div>
+      ${rules || '<div class="empty" style="margin-top:10px">目前沒有受限資料夾。</div>'}
+      <div style="margin-top:14px">
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">
+          從掃到的資料夾裡挑一個加入限制（數量已經把子資料夾累加進來）：</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input id="aclFilter" placeholder="篩選資料夾…" style="flex:1;min-width:160px">
+          <input id="aclNote" placeholder="備註（選填）" style="flex:1;min-width:140px">
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <select id="aclPick" style="flex:1;min-width:240px">
+            <option value="">— 選一個資料夾（${free.length} 個）—</option>
+            ${free.map(opt).join('')}
+          </select>
+          <button class="btn" id="aclAdd">加入限制</button>
+        </div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:6px">
+          只列到第 4 層。更深的資料夾請選它的上層 —— 子資料夾自動跟著受限，
+          而限制一個葉目錄幾乎永遠不是你想做的事。
+        </div>
+      </div>
+    </div>`;
+}
+
+function wireAcl(el, ac) {
+  // 篩選：只是把選項藏起來，不讓人打路徑。手打的路徑會拼錯，
+  // 而拼錯的規則等於沒有保護。
+  const flt = el.querySelector('#aclFilter');
+  if (flt) flt.oninput = () => {
+    const q = flt.value.trim().toLowerCase();
+    const sel = el.querySelector('#aclPick');
+    [...sel.options].forEach((o, i) => {
+      if (i === 0) return;
+      o.hidden = !!q && !o.value.toLowerCase().includes(q);
+    });
+    if (sel.selectedOptions[0]?.hidden) sel.value = '';
+  };
+
+  const add = el.querySelector('#aclAdd');
+  if (add) add.onclick = async () => {
+    const prefix = el.querySelector('#aclPick').value;
+    if (!prefix) return toast('先選一個資料夾', true);
+    if (!await confirmBox({
+      title: '把這個資料夾設為受限', ok: '設為受限',
+      body: `<code>${esc(prefix)}</code> 與它底下的子資料夾，
+             之後只有<b>被授權的帳號</b>與管理員看得到。<br><br>
+             設定完成的當下<b>還沒有人被授權</b> —— 記得接著勾選要開放給誰。`
+    })) return;
+    try {
+      await api('/folders/acl', { method: 'POST',
+        body: JSON.stringify({ prefix, note: el.querySelector('#aclNote').value }) });
+      toast('已設為受限');
+      render('library');
+    } catch (e) { toast(e.message, true); }
+  };
+
+  el.querySelectorAll('[data-aclrm]').forEach(b => b.onclick = async () => {
+    const wrap = b.closest('.acl-rule');
+    const prefix = wrap.querySelector('code').textContent;
+    if (!await confirmBox({ title: '移除限制', ok: '移除',
+      body: `<code>${esc(prefix)}</code> 之後<b>所有登入者都看得到</b>。` })) return;
+    try { await api('/folders/acl/' + b.dataset.aclrm, { method: 'DELETE' });
+      toast('已移除限制'); render('library'); }
+    catch (e) { toast(e.message, true); }
+  });
+
+  el.querySelectorAll('[data-aclsave]').forEach(b => b.onclick = async () => {
+    const wrap = b.closest('.acl-rule');
+    const ruleId = +b.dataset.aclsave;
+    const ids = [...wrap.querySelectorAll('[data-aclu]:checked')].map(x => +x.dataset.aclu);
+    // **管理員原本就有的授權要原封帶回去。**這個端點是「整份取代」，
+    // 而管理員不在勾選清單裡（見 aclBlock 的說明）—— 不帶的話，
+    // 一個「先被授權、後來升管理員」的人會在別人按一次儲存時
+    // 被安靜地收回授權，然後在他降級的那天才發現。
+    const adminIds = new Set((ac.users || []).filter(u => u.is_admin).map(u => u.id));
+    const rule = (ac.rules || []).find(r => r.id === ruleId);
+    const keep = (rule ? rule.user_ids : []).filter(i => adminIds.has(i));
+    const all = [...new Set([...ids, ...keep])];
+    try {
+      await api(`/folders/acl/${ruleId}/grants`,
+        { method: 'PUT', body: JSON.stringify({ user_ids: all }) });
+      toast(ids.length ? `已授權 ${ids.length} 個帳號` : '已收回全部授權');
+      render('library');
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
 /* ================================================================ 媒體庫 */
 TABS.library = async el => {
-  const [st, pr] = await Promise.all([api('/scan/status'), api('/admin/problems')]);
+  const [st, pr, ac, mn] = await Promise.all(
+    [api('/scan/status'), api('/admin/problems'), api('/folders/acl'),
+     api('/admin/manual').catch(() => ({ items: [] }))]);
   el.innerHTML = `
     <h2 class="sec">媒體庫</h2>
     <p class="secsub">掃描控制、刮不到與分析失敗的清單、FTP 目錄。</p>
@@ -180,6 +361,33 @@ TABS.library = async el => {
       </div>
       <div id="scanBox" style="margin-top:12px"></div>
     </div>
+
+    <h3 class="sub">手動修正過的條目（${mn.items.length}）</h3>
+    <div class="box" style="font-size:12.5px;color:var(--muted)">
+      這些條目的 TMDB 資料是你自己指定的。<b>自動刮削（含「完整重掃」）不會蓋掉它們</b> ——
+      要連它們一起重刮，在「完整重掃」的確認框裡勾那一格。
+    </div>
+    ${mn.items.length ? `<div class="scrollx"><table class="t">
+      <thead><tr><th>標題</th><th>類型</th><th>年份</th><th>TMDB</th><th>檔案</th><th>修改時間</th></tr></thead>
+      <tbody>${mn.items.map(r => `<tr>
+        <td><b>${esc(r.title)}</b></td>
+        <td>${r.kind === 'tv' ? '影集' : '電影'}</td>
+        <td>${r.year || '—'}</td>
+        <td>${r.tmdb_id ? `<code>${r.tmdb_id}</code>` : '—'}</td>
+        <td>${r.files}</td>
+        <td>${when(r.updated_at)}</td></tr>`).join('')}
+      </tbody></table></div>
+      <div class="rowcards">${mn.items.map(r => `<div class="rowcard">
+        <div class="top"><b>${esc(r.title)}</b>
+          <span class="st">${r.kind === 'tv' ? '影集' : '電影'}</span></div>
+        <dl><dt>年份</dt><dd>${r.year || '—'}</dd>
+        <dt>TMDB</dt><dd>${r.tmdb_id || '—'}</dd>
+        <dt>檔案</dt><dd>${r.files}</dd>
+        <dt>修改時間</dt><dd>${when(r.updated_at)}</dd></dl></div>`).join('')}</div>`
+      : '<div class="empty">還沒有手動修正過的條目。</div>'}
+
+    <h3 class="sub">受限資料夾（${ac.rules.length}）</h3>
+    ${aclBlock(ac)}
 
     <h3 class="sub">FTP 目錄</h3>
     <div class="box">
@@ -215,7 +423,32 @@ TABS.library = async el => {
         <dt>錯誤</dt><dd style="color:#ffaeae">${esc(r.probe_error || '')}</dd></dl>
         <div class="acts"><button class="btn" data-probe="${r.id}">重試分析</button></div>
         </div>`).join('')}</div>`
-      : '<div class="empty">沒有失敗的檔案。</div>'}`;
+      : '<div class="empty">沒有失敗的檔案。</div>'}
+
+    ${(pr.remuxOffline || []).length ? `
+    <h3 class="sub">原畫質直送下線（${pr.remuxOffline.length}）</h3>
+    <div class="box" style="font-size:12.5px;color:var(--muted)">
+      這些檔案的 remux（原畫質直送）出過錯，已經改發單階轉碼 ——
+      <b>播放沒有中斷，畫質變成轉碼的畫質</b>。重新掃描這個檔案會清掉這個狀態。
+    </div>
+    <div class="scrollx"><table class="t">
+      <thead><tr><th>檔名</th><th>所屬</th><th>錯誤</th></tr></thead><tbody>
+      ${pr.remuxOffline.map(r => `<tr><td>${esc(r.filename)}</td><td>${esc(r.title || '—')}</td>
+        <td style="color:#ffaeae">${esc(r.remux_error || '')}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}
+
+    ${(pr.keyframeFailed || []).length ? `
+    <h3 class="sub">邊界表掃描失敗（${pr.keyframeFailed.length}）</h3>
+    <div class="box" style="font-size:12.5px;color:var(--muted)">
+      沒有邊界表就沒有原畫質直送那一階，但不影響轉碼播放。
+    </div>
+    <div class="scrollx"><table class="t">
+      <thead><tr><th>檔名</th><th>所屬</th><th>錯誤</th></tr></thead><tbody>
+      ${pr.keyframeFailed.map(r => `<tr><td>${esc(r.filename)}</td><td>${esc(r.title || '—')}</td>
+        <td style="color:#ffaeae">${esc(r.kf_error || '')}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}`;
+
+  wireAcl(el, ac);
 
   const paint = s => {
     $('#scanBox').innerHTML = s.running
@@ -234,10 +467,26 @@ TABS.library = async el => {
   };
   $('#bScan').onclick = () => run('', '掃描');
   $('#bFull').onclick = async () => {
-    if (await confirmBox({
+    const n = mn.items.length;
+    // 這一段文案是修過 bug 之後的實話。原本寫「既有的手動 TMDB 配對可能被覆蓋」——
+    // 那時候是真的會被覆蓋（force 的 where 是空字串），而「可能」這個字
+    // 讓它聽起來像個小風險。現在預設不會覆蓋，要覆蓋得自己勾。
+    const picked = {};
+    const ok = await confirmBox({
       title: '完整重掃', ok: '開始重掃',
-      body: '會重新刮削<b>所有</b>條目、重新分析<b>所有</b>檔案。既有的手動 TMDB 配對可能被覆蓋。'
-    })) run('?full=true', '完整重掃');
+      collect: m => { picked.remanual = !!m.querySelector('#cbRemanual')?.checked; },
+      body: `會重新刮削所有條目、重新分析所有檔案。<br><br>
+        ${n ? `<b>手動修正過的 ${n} 筆不會被動到。</b>真的要連它們一起重新自動比對，
+               勾下面這一格 —— 你挑的那個 TMDB 配對<b>沒有留在任何地方</b>，
+               蓋掉就是蓋掉了。<br>
+               <label style="display:flex;gap:8px;align-items:center;margin-top:10px">
+                 <input type="checkbox" id="cbRemanual" style="width:16px;height:16px">
+                 <span>連手動修正過的 ${n} 筆也重新刮削</span></label>`
+             : '目前沒有手動修正過的條目。'}`
+    });
+    if (!ok) return;
+    const re = !!picked.remanual;
+    run('?full=true' + (re ? '&remanual=true' : ''), re ? '完整重掃（含手動修正）' : '完整重掃');
   };
   $('#bReparse').onclick = () => run('?reparse=true', '重新分組');
   $('#bStop').onclick = async () => {
@@ -307,6 +556,15 @@ TABS.library = async el => {
 let userFilter = '';
 TABS.users = async el => {
   const d = await api('/users' + (userFilter ? '?status=' + userFilter : ''));
+  // 反過來的視角：這個帳號看得到哪些受限資料夾。
+  // 規則那一側在「媒體庫」分頁，但「這個人到底能看什麼」是從人這邊問的問題。
+  let aclByUser = {};
+  try {
+    const ac = await api('/folders/acl');
+    ac.rules.forEach(r => r.user_ids.forEach(
+      uid => (aclByUser[uid] = aclByUser[uid] || []).push(r.prefix)));
+  } catch (e) { /* 沒權限或還沒有規則都不影響這一頁 */ }
+  const aclOf = u => (aclByUser[u.id] || []);
   if (!d.google_login) {
     el.innerHTML = `<h2 class="sec">使用者</h2>
       <div class="box">目前是<b>密碼登入</b>模式，沒有個別帳號。<br>
@@ -344,7 +602,8 @@ TABS.users = async el => {
         <td><span class="st ${esc(u.status)}">${esc(u.status)}</span></td>
         <td>${when(u.last_login_at)}<br><small style="color:var(--dim)">${esc(u.last_login_ip || '')}
           ${esc(u.last_login_country || '')}</small></td>
-        <td>${esc(u.note || '')}</td>
+        <td>${esc(u.note || '')}<br>${aclOf(u).length
+          ? `<small style="color:var(--accent)">受限資料夾 ${aclOf(u).length} 個</small>` : ''}</td>
         <td><div style="display:flex;gap:5px;flex-wrap:wrap">${acts(u)}</div></td></tr>`).join('')}
       </tbody></table></div>
       <div class="rowcards">${d.items.map(u => `<div class="rowcard">
@@ -353,7 +612,10 @@ TABS.users = async el => {
         <dl><dt>帳號</dt><dd>${esc(u.email)}</dd>
         <dt>角色</dt><dd>${u.role === 'owner' ? '管理員' : '唯讀'}</dd>
         <dt>最後登入</dt><dd>${when(u.last_login_at)}　${esc(u.last_login_ip || '')}</dd>
-        <dt>備註</dt><dd>${esc(u.note || '—')}</dd></dl>
+        <dt>備註</dt><dd>${esc(u.note || '—')}</dd>
+        <dt>受限資料夾</dt><dd>${aclOf(u).length
+          ? aclOf(u).map(p => `<code>${esc(p)}</code>`).join('<br>')
+          : '—'}</dd></dl>
         <div class="acts">${acts(u)}</div></div>`).join('')}</div>`
       : '<div class="empty">這個篩選底下沒有帳號。</div>'}`;
 
@@ -616,28 +878,11 @@ TABS.logs = async el => {
 };
 
 /* ================================================================ 系統 */
-const APPLY_TEXT = { hot: '即時生效', reload: '存檔後套用', restart: '需重啟' };
-let paramDraft = {};        // key → 使用者改到一半、還沒存的值
-
 TABS.system = async el => {
-  const [d, diag] = await Promise.all([api('/params'), api('/diagnostics')]);
-  const bySec = {};
-  d.items.forEach(i => (bySec[i.section] = bySec[i.section] || []).push(i));
-
+  const diag = await api('/diagnostics');
   el.innerHTML = `
     <h2 class="sec">系統</h2>
-    <p class="secsub">資料庫狀態、外部相依、以及所有可以在這裡調整的參數。</p>
-
-    ${d.unknownEnvKeys.length ? `<div class="banner">
-      <b>.env 裡有程式不認得的設定</b>（等於完全沒有作用）：<br>
-      ${d.unknownEnvKeys.map(u => `<code>${esc(u.key)}</code>` +
-        (u.guess ? ` → 是不是想打 <code>${esc(u.guess)}</code>？` : '')).join('<br>')}</div>` : ''}
-    ${d.drift.length ? `<div class="banner">
-      <b>有 ${d.drift.length} 項在這裡存過的設定被環境變數蓋掉了</b>，所以不會生效。
-      下面那幾項會標出來，可以選擇清掉這裡存的值。</div>` : ''}
-    ${d.needsRestart.length ? `<div class="banner">
-      <b>這些設定已經存好，但要重開服務才生效</b>：
-      ${d.needsRestart.map(k => `<code>${esc(k)}</code>`).join(' ')}</div>` : ''}
+    <p class="secsub">資料庫狀態與外部相依。參數調整搬到左邊的〈系統參數〉。</p>
 
     <h3 class="sub">狀態</h3>
     <div class="grid-cards">
@@ -652,17 +897,7 @@ TABS.system = async el => {
       <button class="btn" id="bFtpTest">測試 FTP 連線</button>
       <button class="btn" id="bRecheck">重新檢查所有相依</button>
       <div id="sysOut" style="margin-top:10px"></div>
-    </div>
-
-    <h3 class="sub">系統參數</h3>
-    <div class="box" style="font-size:12.5px;color:var(--muted)">
-      解析順序是 <b>.env / 環境變數　&gt;　這裡存的值　&gt;　程式預設值</b>，
-      沒有例外。被 <code>.env</code> 決定的項目在這裡會被鎖住並標示出來 ——
-      這樣「存了卻沒生效」就不會是個看不見的問題。<br>
-      連線資訊、綁定位址、密碼這類改錯了會讓你進不來的設定，
-      刻意<b>只能</b>在 <code>.env</code> 改，這裡完全不會出現。
-    </div>
-    <div id="paramList"></div>`;
+    </div>`;
 
   $('#bFtpTest').onclick = async () => {
     const out = $('#sysOut');
@@ -679,51 +914,268 @@ TABS.system = async el => {
     try { await api('/diagnostics/recheck', { method: 'POST' }); toast('已重新檢查'); render('system'); }
     catch (e) { toast(e.message, true); }
   };
+};
 
+/* ================================================================ 系統參數
+ *
+ * 這一頁的形狀是量出來的，不是設計出來的。實測 Yu 的機器：**UI 上 48 項，
+ * 其中 43 項被 .env 蓋住、只有 5 項真的能在這裡改。**（Tier 0／Tier 4 的參數
+ * `in_ui` 是 false，根本不會出現在這裡 —— 所以沒有「永遠唯讀」的列。）
+ *
+ * 所以第一軸不是分類，是**「這一項現在改不改得動」**：
+ *   可以在這裡改 / 由 .env 決定
+ * 分類當第二軸，給「我要找 FFMPEG_HWACCEL 在哪」用。搜尋跨全部。
+ *
+ * 另外：每一列都是一顆「儲存」的話，48 列就是上百顆按鈕，而且改三項要按三次、
+ * 錯一項不知道另外兩項存了沒。改成整批送 PUT /api/params ——
+ * 後端先全部驗證再全部寫，錯了一個字都不寫。
+ */
+const APPLY_TEXT = { hot: '即時生效', reload: '存檔後套用', restart: '需重啟' };
+const CAT_FREE = '__free', CAT_ENV = '__env';
+const CAT_NAME = { [CAT_FREE]: '可以在這裡改', [CAT_ENV]: '由 .env 決定' };
+
+let pd = null;              // 最後一次 /params 的結果
+let paramDraft = {};        // key → 使用者改到一半、還沒存的值
+let paramErr = {};          // key → 後端回的驗證錯誤
+let paramCat = CAT_FREE;
+let paramQ = '';
+
+const catLabel = c => CAT_NAME[c] || c;
+
+function paramMatch(i, q) {
+  if (!q) return true;
+  const hay = `${i.key} ${i.label} ${i.help || ''} ${i.section}`.toLowerCase();
+  // 每個詞都要中，順序不管 —— 「nvenc 品質」和「品質 nvenc」要一樣找得到
+  return q.toLowerCase().split(/\s+/).filter(Boolean).every(w => hay.includes(w));
+}
+
+function catItems(cat) {
+  if (cat === CAT_FREE) return pd.items.filter(i => !i.locked);
+  if (cat === CAT_ENV) return pd.items.filter(i => i.locked);
+  return pd.items.filter(i => i.section === cat);
+}
+
+function renderParamNav() {
+  const nav = $('#paramNav');
+  if (!nav) return;
+  if (!pd) { nav.hidden = true; return; }
+  const btn = (cat, name, n, cls = '') => `
+    <button data-cat="${esc(cat)}" class="${cls}${paramCat === cat && !paramQ ? ' on' : ''}">
+      <span>${esc(name)}</span><span class="n">${n}</span></button>`;
+  nav.innerHTML =
+    btn(CAT_FREE, CAT_NAME[CAT_FREE], pd.items.filter(i => !i.locked).length, 'strong ') +
+    btn(CAT_ENV, CAT_NAME[CAT_ENV], pd.items.filter(i => i.locked).length, 'muted ') +
+    '<div class="sep"></div>' +
+    pd.sections.map(s => btn(s, s, pd.items.filter(i => i.section === s).length)).join('');
+  nav.hidden = current !== 'params';
+  nav.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => {
+    paramCat = b.dataset.cat;
+    paramQ = '';
+    if ($('#pq')) $('#pq').value = '';
+    renderParamNav();
+    paintParams();
+  });
+}
+
+function paramBanners() {
+  const out = [];
+  if (pd.unknownEnvKeys.length) out.push(`<div class="banner bad">
+    <b>.env 裡有程式不認得的設定</b>（等於完全沒有作用）：<br>
+    ${pd.unknownEnvKeys.map(u => `<code>${esc(u.key)}</code>` +
+      (u.guess ? ` → 是不是想打 <code>${esc(u.guess)}</code>？` : '')).join('<br>')}</div>`);
+  const sh = pd.items.filter(i => i.shadowed);
+  if (sh.length) out.push(`<div class="banner">
+    <b>有 ${sh.length} 項在這裡存過的值被 .env 蓋掉了</b>，所以不會生效。
+    要讓它生效就把 <code>.env</code> 裡那一行刪掉；不需要了就在該項按「清除這裡存的值」。<br>
+    ${sh.map(i => `<code>${esc(i.key)}</code>`).join(' ')}</div>`);
+  if (pd.needsRestart.length) out.push(`<div class="banner">
+    <b>這些設定已經存好，但要重開服務才生效</b>：
+    ${pd.needsRestart.map(k => `<code>${esc(k)}</code>`).join(' ')}</div>`);
+  return out.join('');
+}
+
+TABS.params = async el => {
+  pd = await api('/params');
+  // 標頭的「需重啟」跟著更新。存完之後如果不更新，畫面會停在存之前的狀態，
+  // 而使用者剛剛才被告知「有幾項要重開服務」—— 兩個訊息互相矛盾。
+  $('#restartBar').hidden = !pd.needsRestart.length;
+  if (paramCat !== CAT_FREE && paramCat !== CAT_ENV && !pd.sections.includes(paramCat))
+    paramCat = CAT_FREE;
+  const free = pd.items.filter(i => !i.locked).length;
+
+  el.innerHTML = `
+    <h2 class="sec">系統參數</h2>
+    <p class="secsub">解析順序是 <b>.env / 環境變數　&gt;　這裡存的值　&gt;　程式預設值</b>，
+      沒有例外。目前 <b>${pd.items.length}</b> 項裡有 <b>${pd.items.length - free}</b>
+      項由 <code>.env</code> 決定、在這裡改不動。<br>
+      連線資訊、綁定位址、密碼這類改錯會讓你進不來的設定，刻意<b>只能</b>在
+      <code>.env</code> 改，這一頁完全不會出現。</p>
+    ${paramBanners()}
+    <div class="ptools">
+      <input id="pq" type="search" autocomplete="off"
+             placeholder="搜尋設定名稱或說明…（例如 nvenc、字幕、逾時）">
+      <span class="pcount" id="pcount"></span>
+    </div>
+    <div id="paramList"></div>
+    <div class="savebar" id="savebar" hidden>
+      <span class="info" id="saveInfo"></span>
+      <div class="acts">
+        <button class="btn" id="bDiscard">全部還原</button>
+        <button class="btn primary" id="bSaveAll">儲存</button>
+      </div>
+    </div>`;
+
+  $('#pq').value = paramQ;
+  $('#pq').oninput = e => { paramQ = e.target.value.trim(); renderParamNav(); paintParams(); };
+  $('#bDiscard').onclick = () => { paramDraft = {}; paramErr = {}; paintParams(); };
+  $('#bSaveAll').onclick = saveAllParams;
+  renderParamNav();
+  paintParams();
+};
+
+function paintParams() {
   const list = $('#paramList');
-  list.innerHTML = d.sections.map(sec => `
-    <h3 class="sub">${esc(sec)}</h3>
-    <div class="box">${bySec[sec].map(paramRow).join('')}</div>`).join('');
+  if (!list || !pd) return;
+  const base = paramQ ? pd.items : catItems(paramCat);
+  const items = base.filter(i => paramMatch(i, paramQ));
+  $('#pcount').textContent = paramQ
+    ? `搜尋結果 ${items.length} 項`
+    : `${catLabel(paramCat)}　${items.length} 項`;
 
-  list.addEventListener('input', e => {
+  if (!items.length) {
+    list.innerHTML = `<div class="empty"><h3>沒有符合的設定</h3>
+      <p>${paramQ ? '換個關鍵字，或看左邊的分類。' : '這個分類目前沒有項目。'}</p></div>`;
+    return syncSaveBar();
+  }
+
+  // 跨分類看的時候（搜尋、或那兩個狀態分類）才需要小標；看單一分類時是多餘的
+  const grouped = !!paramQ || paramCat === CAT_FREE || paramCat === CAT_ENV;
+  let html = '';
+  if (grouped) {
+    const bySec = {};
+    items.forEach(i => (bySec[i.section] = bySec[i.section] || []).push(i));
+    html = pd.sections.filter(s => bySec[s]).map(s =>
+      `<h3 class="sub">${esc(s)}</h3><div class="box">${bySec[s].map(paramRow).join('')}</div>`
+    ).join('');
+  } else {
+    html = `<div class="box">${items.map(paramRow).join('')}</div>`;
+  }
+  // 鎖住的列會出現在畫面上時，把「要怎麼改」講一次，而不是每列印一次
+  if (items.some(i => i.locked)) {
+    html = `<div class="box lockhint">
+      <b>🔒 的項目由 <code>.env</code> 決定，在這裡改不動。</b>
+      要改就改 <code>.env</code> 再重啟；想改成在後台管理，把 <code>.env</code>
+      裡那一行刪掉再重啟 —— 解析順序是
+      <code>.env</code> &gt; 這裡存的值 &gt; 程式預設值，沒有例外。</div>` + html;
+  }
+  list.innerHTML = html;
+
+  list.oninput = e => {
     const wrap = e.target.closest('.param');
-    if (!wrap) return;
+    if (!wrap || wrap.classList.contains('ro')) return;
     const key = wrap.dataset.key;
     paramDraft[key] = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+    delete paramErr[key];
     wrap.classList.add('dirty');
-  });
-
-  list.addEventListener('click', async e => {
+    wrap.classList.remove('bad');
+    syncSaveBar();
+  };
+  list.onclick = async e => {
     const b = e.target.closest('button[data-do]');
     if (!b) return;
     const wrap = b.closest('.param');
     const key = wrap.dataset.key;
-    const item = d.items.find(i => i.key === key);
+    const item = pd.items.find(i => i.key === key);
     const inp = wrap.querySelector('input,select');
-
-    if (b.dataset.do === 'save') return saveParam(key, item, inp, wrap);
     if (b.dataset.do === 'default') {
       setInput(inp, item.candidates.default, item);
       paramDraft[key] = item.candidates.default;
       wrap.classList.add('dirty');
+      syncSaveBar();
     }
     if (b.dataset.do === 'revert') {
       const v = item.candidates.db !== null && item.candidates.db !== undefined
         ? item.candidates.db : item.candidates.default;
       setInput(inp, v, item);
       delete paramDraft[key];
-      wrap.classList.remove('dirty');
+      delete paramErr[key];
+      wrap.classList.remove('dirty', 'bad');
+      syncSaveBar();
     }
     if (b.dataset.do === 'clear') {
       if (!await confirmBox({ title: '清除這裡存的值', ok: '清除',
         body: `<code>${esc(key)}</code> 在這裡存的值會被刪掉，之後就完全由
                <code>.env</code>（或程式預設值）決定。` })) return;
-      try { await api('/params/' + key, { method: 'DELETE' }); delete paramDraft[key];
-        toast('已清除'); render('system'); }
-      catch (err) { toast(err.message, true); }
+      try {
+        await api('/params/' + key, { method: 'DELETE' });
+        delete paramDraft[key];
+        toast('已清除');
+        render('params');
+      } catch (err) { toast(err.message, true); }
     }
-  });
-};
+  };
+  syncSaveBar();
+}
+
+function syncSaveBar() {
+  const bar = $('#savebar');
+  if (!bar) return;
+  const keys = Object.keys(paramDraft);
+  bar.hidden = !keys.length;
+  if (!keys.length) return;
+  const modes = keys.map(k => pd.items.find(i => i.key === k)?.applyMode);
+  const restart = modes.filter(m => m === 'restart').length;
+  $('#saveInfo').innerHTML = `<b>${keys.length}</b> 項未儲存` +
+    (restart ? `　<span class="apply restart">其中 ${restart} 項需重啟</span>` : '');
+  $('#bSaveAll').textContent = `儲存 ${keys.length} 項變更`;
+}
+
+async function saveAllParams() {
+  const keys = Object.keys(paramDraft);
+  if (!keys.length) return;
+
+  // lockout 的參數目前全都是 Tier 0、根本不在這一頁，所以這一段實務上不會觸發。
+  // 留著是因為某一天有人把某個 lockout 參數降成 Tier 2 時，
+  // 這裡是唯一會提醒他「這會把自己鎖在外面」的地方。
+  const lock = keys.filter(k => pd.items.find(i => i.key === k)?.lockout);
+  if (lock.length && !await confirmBox({
+    title: '這幾項可能讓你進不了後台', ok: '我知道，還是要存', danger: true,
+    body: `${lock.map(k => `<code>${esc(k)}</code>`).join('、')} 改錯的話，
+           你可能沒辦法再登入或連到這個後台。<br><br>
+           真的進不來的時候，在伺服器上執行：<br>
+           <code>python -m app.paramstore unset &lt;KEY&gt;</code><br><br>
+           或直接編輯 <code>.env</code> —— 它的優先度比這裡高。`
+  })) return;
+
+  const btn = $('#bSaveAll');
+  btn.disabled = true;
+  try {
+    const r = await api('/params', { method: 'PUT', body: JSON.stringify({ values: paramDraft }) });
+    const modes = new Set((r.items || []).map(i => i.applyMode));
+    const stillLocked = (r.items || []).filter(i => i.locked).map(i => i.key);
+    paramDraft = {};
+    paramErr = {};
+    if (stillLocked.length) {
+      toast(`存起來了，但 ${stillLocked.length} 項由環境變數決定，所以不會生效`, true);
+    } else {
+      toast(modes.has('restart') ? '已存好，有幾項要重開服務才生效'
+        : modes.has('reload') ? '已儲存並套用' : '已儲存並生效');
+    }
+    render('params');
+  } catch (e) {
+    // 後端是整批驗證：錯了就一項都沒寫。所以這裡要把錯誤標回每一列，
+    // 而且**不能清掉 paramDraft** —— 使用者打的東西不能被一個錯誤吃掉。
+    if (e.detail && typeof e.detail === 'object') {
+      paramErr = e.detail;
+      toast(`有 ${Object.keys(e.detail).length} 項不合法，一項都沒有儲存`, true);
+      paintParams();
+    } else {
+      toast(e.message, true);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 function setInput(inp, v, item) {
   if (!inp) return;
@@ -731,94 +1183,74 @@ function setInput(inp, v, item) {
   else inp.value = v === null || v === undefined ? '' : v;
 }
 
-async function saveParam(key, item, inp, wrap) {
-  let v = paramDraft[key];
-  if (v === undefined) v = item.type === 'bool' ? inp.checked : inp.value;
-
-  // 改到會把自己鎖在外面的東西之前，要先講清楚，而且要給救援指令。
-  if (item.lockout) {
-    if (!await confirmBox({
-      title: '這一項可能讓你進不了後台', ok: '我知道，還是要改', danger: true,
-      body: `<code>${esc(key)}</code> 改錯的話，你可能沒辦法再登入或連到這個後台。<br><br>
-             真的進不來的時候，在伺服器上執行：<br>
-             <code>python -m app.paramstore unset ${esc(key)}</code><br><br>
-             或直接編輯 <code>.env</code> —— 它的優先度比這裡高。`
-    })) return;
-  }
-  try {
-    const r = await api('/params/' + key, { method: 'PUT', body: JSON.stringify({ value: v }) });
-    delete paramDraft[key];
-    wrap.classList.remove('dirty');
-    if (r.locked) {
-      toast('存起來了，但這一項由環境變數決定，所以不會生效', true);
-    } else {
-      toast({ hot: '已生效', reload: '已套用', restart: '已存好，重開服務才會生效' }[r.applyMode]);
-    }
-    render('system');
-  } catch (e) {
-    toast(e.message, true);
-  }
-}
-
 function paramRow(i) {
   const locked = i.locked;
-  const dis = locked ? 'disabled' : '';
-  const val = i.secret ? '' : (i.effective.value ?? '');
+  const draft = paramDraft[i.key];
+  const dirty = draft !== undefined;
+  const err = paramErr[i.key];
+  const cur = dirty ? draft : (i.secret ? '' : (i.effective.value ?? ''));
+
   let ctl;
-  if (i.type === 'bool') {
-    ctl = `<label style="display:flex;gap:9px;align-items:center;min-height:40px">
-      <input type="checkbox" style="width:18px;height:18px" ${i.effective.value ? 'checked' : ''} ${dis}>
-      <span style="color:var(--muted);font-size:12.5px">開啟</span></label>`;
+  if (locked) {
+    // 被 .env 蓋住的項目不給輸入框。給一個停用的框只是讓人試著打字然後發現打不進去 ——
+    // 直接把生效值印出來，再說清楚要改就去改 .env。
+    ctl = `<div class="roval">${i.secret ? '（已設定）' : esc(String(i.effective.value ?? '—'))}</div>`;
+  } else if (i.type === 'bool') {
+    ctl = `<label class="chk"><input type="checkbox" ${cur ? 'checked' : ''}>
+      <span>開啟</span></label>`;
   } else if (i.choices) {
-    ctl = `<select ${dis}>${i.choices.map(c =>
-      `<option ${String(c) === String(val) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
+    ctl = `<select>${i.choices.map(c =>
+      `<option ${String(c) === String(cur) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
   } else if (i.secret) {
     // 唯寫欄位。API 任何情況都不回明文，所以這裡永遠是空的 ——
     // 留空 = 不改，輸入新值 = 覆蓋。
-    ctl = `<input type="password" autocomplete="new-password" ${dis}
+    ctl = `<input type="password" autocomplete="new-password"
+      value="${esc(dirty ? draft : '')}"
       placeholder="${i.isSet ? '已設定，留空表示不修改' : '尚未設定'}">`;
   } else {
     ctl = `<input type="${i.type === 'int' || i.type === 'float' ? 'number' : 'text'}"
       ${i.type === 'float' ? 'step="0.1"' : ''}
       ${i.min !== null && i.min !== undefined ? `min="${i.min}"` : ''}
       ${i.max !== null && i.max !== undefined ? `max="${i.max}"` : ''}
-      value="${esc(val)}" ${dis}>`;
+      value="${esc(cur)}">`;
   }
 
   const notes = [];
   if (locked) {
-    notes.push(`<div class="note lock">🔒 這一項由環境變數
-      <code>${esc(i.key)}</code> 設定，不能在這裡修改。</div>`);
+    // 一行就好。「要怎麼改」那段說明放在分類頂端講一次 ——
+    // 同一句話在 29 列上各印一次，只是把真正的資訊（值是多少）擠掉。
+    notes.push(`<div class="note lock">🔒 由 <code>.env</code> 決定</div>`);
   }
   if (i.shadowed) {
     notes.push(`<div class="note lock">⚠ 這裡曾經存過
-      <b>${esc(String(i.candidates.db))}</b>，但被環境變數蓋掉了，所以沒有作用。</div>`);
+      <b>${esc(String(i.candidates.db))}</b>，但被 <code>.env</code> 蓋掉了，所以沒有作用。</div>`);
   }
-  if (i.error) notes.push(`<div class="note err">✕ ${esc(i.error)}</div>`);
-  if (i.secret && i.isSet) {
+  if (err) notes.push(`<div class="note err">✕ ${esc(err)}</div>`);
+  else if (i.error) notes.push(`<div class="note err">✕ ${esc(i.error)}</div>`);
+  if (i.secret && i.isSet && !locked) {
     notes.push(`<div class="note">已設定　${i.updatedAt ? '最後更新 ' + when(i.updatedAt) : ''}</div>`);
   }
 
   const acts = [];
-  if (!locked) acts.push('<button class="btn primary" data-do="save">儲存</button>');
   if (!locked && !i.secret) {
-    acts.push('<button data-do="default">重設為預設值</button>');
-    acts.push('<button data-do="revert">重設為上次儲存值</button>');
+    acts.push('<button data-do="default">預設值</button>');
+    if (dirty) acts.push('<button data-do="revert">還原</button>');
   }
   if (i.shadowed) acts.push('<button data-do="clear">清除這裡存的值</button>');
 
-  return `<div class="param" data-key="${esc(i.key)}">
+  return `<div class="param${locked ? ' ro' : ''}${dirty ? ' dirty' : ''}${err ? ' bad' : ''}"
+               data-key="${esc(i.key)}">
     <div class="meta">
       <label>${esc(i.label)}
         <span class="apply ${i.applyMode}">${APPLY_TEXT[i.applyMode]}</span>
         ${i.sensitive ? '<span class="apply reload">敏感</span>' : ''}</label>
       <code>${esc(i.key)}</code>
       ${i.help ? `<p>${esc(i.help)}</p>` : ''}
-      <p style="color:var(--dim)">目前來源：${
-        { env: '環境變數', db: '這裡設定的', default: '程式預設值' }[i.effective.source]}</p>
+      <p class="src">目前來源：${
+        { env: '.env / 環境變數', db: '這裡設定的', default: '程式預設值' }[i.effective.source]}</p>
     </div>
     <div class="ctl">${ctl}${notes.join('')}
-      <div class="acts">${acts.join('')}</div></div>
+      ${acts.length ? `<div class="acts">${acts.join('')}</div>` : ''}</div>
   </div>`;
 }
 

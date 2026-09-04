@@ -37,6 +37,49 @@
 .sidenav button.on{background:var(--panel-2);color:var(--accent)}
 .dot{width:7px;height:7px;border-radius:99px;background:var(--red);margin-left:auto}
 
+/* 二層 nav（系統參數的分類）。刻意不做成第二個左欄 ——
+   後台左邊已經有一排 sidenav，並排兩排在桌機上很怪，手機上還要收掉一排。
+   縮排 + 一條左線就足夠表達層級，而且抽屜裡不用任何新元件。 */
+.subnav{
+  display:flex;flex-direction:column;gap:2px;
+  margin:2px 0 6px 12px;padding-left:8px;border-left:1px solid var(--line);
+}
+.subnav button{
+  display:flex;align-items:center;gap:8px;
+  min-height:34px;padding:0 10px;border-radius:7px;text-align:left;
+  color:var(--dim);font-weight:600;font-size:12.5px;transition:.15s;
+}
+.subnav button:hover{background:var(--panel);color:var(--text)}
+.subnav button.on{background:var(--panel-2);color:var(--accent)}
+.subnav button.strong{color:var(--muted)}
+.subnav button .n{
+  margin-left:auto;font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums;
+}
+.subnav .sep{height:1px;background:var(--line);margin:5px 4px}
+
+/* 搜尋 + 計數 */
+.ptools{display:flex;align-items:center;gap:12px;margin:14px 0 4px;flex-wrap:wrap}
+.ptools input{
+  flex:1;min-width:200px;padding:9px 12px;border-radius:9px;min-height:40px;
+  background:var(--bg-2);border:1px solid var(--line);color:var(--text);outline:none;
+}
+.ptools input:focus{border-color:var(--accent)}
+.pcount{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;flex:none}
+
+/* 批次儲存列。sticky 而不是 fixed：fixed 會蓋到手機抽屜，
+   而且離開參數頁時還要記得藏起來。sticky 跟著內容走，離開就不存在。 */
+.savebar{
+  position:sticky;bottom:0;z-index:40;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  margin:16px -24px 0;padding:12px 24px;
+  padding-bottom:calc(12px + env(safe-area-inset-bottom));
+  background:rgba(17,20,28,.94);backdrop-filter:blur(10px);
+  border-top:1px solid var(--accent);
+}
+.savebar .info{font-size:13px;color:var(--muted)}
+.savebar .info b{color:var(--accent);font-size:15px}
+.savebar .acts{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+
 #main{flex:1;min-width:0;padding:18px 24px 60px}
 .tab{display:none}
 .tab.on{display:block}
@@ -111,7 +154,10 @@ table.t tr:last-child td{border-bottom:none}
 }
 .param input:focus,.param select:focus{border-color:var(--accent)}
 .param input:disabled,.param select:disabled{opacity:.55;cursor:not-allowed}
-.param .note{font-size:11.5px;color:var(--muted);display:flex;gap:6px;align-items:flex-start}
+/* 這裡原本是 display:flex —— 於是註解裡的每一段文字與每個 <code> 都變成
+   一個 flex item，排成一列不換行。短句看不出問題，句子一長就會整段溢出格子，
+   而且 <code> 會被壓成一個字寬的直排（實測就是這樣壞的）。註解是文字，用 block。 */
+.param .note{font-size:11.5px;color:var(--muted);line-height:1.65}
 .param .note.lock{color:#ffcf7d}
 .param .note.err{color:#ffaeae}
 .param .acts{display:flex;gap:6px;flex-wrap:wrap}
@@ -124,6 +170,36 @@ table.t tr:last-child td{border-bottom:none}
   content:"未儲存";margin-left:8px;font-size:10.5px;font-weight:800;
   color:var(--accent);
 }
+.param.bad{outline:1px solid #5a2626;outline-offset:6px;border-radius:6px}
+/* 被 .env 蓋住的列淡一點，但**不要淡到看不清值** ——
+   「現在到底是多少」正是使用者打開這一頁想知道的第一件事。 */
+.param.ro .meta label{color:var(--muted)}
+.param .roval{
+  padding:9px 11px;border-radius:9px;background:var(--bg-2);
+  border:1px dashed var(--line);min-height:40px;
+  font-size:13px;color:var(--muted);word-break:break-all;
+}
+.param .src{color:var(--dim);font-size:11.5px}
+.box.lockhint{font-size:12.5px;color:var(--muted);line-height:1.7;margin-bottom:12px}
+.box.lockhint b{color:var(--text)}
+.box.lockhint code{background:var(--bg-2);padding:1px 5px;border-radius:4px}
+
+/* 受限資料夾（L） */
+.acl-rule{margin-top:10px}
+.acl-rule code{background:var(--bg-2);padding:1px 6px;border-radius:4px;word-break:break-all}
+.acl-users{
+  display:flex;flex-wrap:wrap;gap:6px 14px;margin:8px 0 4px;
+  padding:9px 11px;border-radius:9px;background:var(--bg-2);border:1px solid var(--line);
+}
+.acl-users label{
+  display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
+  min-height:32px;cursor:pointer;
+}
+.acl-users input{width:16px;height:16px}
+.acl-users label:hover{color:var(--text)}
+.param .chk{display:flex;gap:9px;align-items:center;min-height:40px;font-size:12.5px;color:var(--muted)}
+.param .chk input{width:18px;height:18px}
+.param .note code{background:var(--bg-2);padding:1px 5px;border-radius:4px;word-break:break-all}
 .apply{font-size:10.5px;font-weight:800;padding:2px 7px;border-radius:5px;
   background:#173a2c;color:var(--green)}
 .apply.reload{background:#243049;color:var(--blue)}
@@ -161,6 +237,14 @@ table.t tr:last-child td{border-bottom:none}
   table.t{display:none}
   .rowcards{display:block}
   .param{grid-template-columns:1fr;gap:8px}
+  /* #main 在窄螢幕是 padding:14px，儲存列的負邊距要跟著改，不然會有一條縫 */
+  .savebar{margin:14px -14px 0;padding:12px 14px;
+           padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+  /* 窄螢幕上讓搜尋框吃滿整行，計數掉到下一行 ——
+     並排的話輸入框只剩一半寬，打兩個字就看不到自己打了什麼 */
+  .ptools{gap:6px}
+  .ptools input{min-width:0;flex:1 1 100%}
+  .pcount{width:100%}
   .param .ctl{max-width:none}
   /* 寬表單在手機上藏起來，但要留一句話說它在哪裡 */
   .desktop-only{display:none}
