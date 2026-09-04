@@ -233,6 +233,50 @@ def set_value(key: str, raw: Any, *, actor: str = "") -> Dict[str, Any]:
     return after
 
 
+def set_many(values: Dict[str, Any], *, actor: str = "") -> Dict[str, Any]:
+    """一次寫多項。**先全部驗證，再全部寫。**
+
+    為什麼不讓前端自己迴圈打 set_value：那會產生「前三項成功、第四項失敗」
+    的半套狀態，而使用者只會看到一個錯誤訊息，完全不知道哪些已經生效了。
+    設定之間又常常互相牽連（改了 FFMPEG_PATH 才輪到 FFMPEG_HWACCEL 有意義），
+    半套狀態可能比兩個舊值都更糟。
+
+    所以這裡分兩趟：第一趟只做 parse／權限檢查，任何一項不過就整批拒絕、
+    一個字都不寫；第二趟才真的寫。
+
+    稽核仍然是每個 key 一筆（誰、何時、從什麼改成什麼），不會因為批次而合併 ——
+    「這一項是什麼時候被誰改的」是事後唯一想查的東西。
+
+    回傳 {"items": [...describe...], "errors": {key: message}}；
+    errors 非空時 items 是空的（什麼都沒寫）。
+    """
+    errors: Dict[str, str] = {}
+    plan = []
+    for key, raw in values.items():
+        p = REGISTRY.get(key)
+        if p is None:
+            errors[key] = f"沒有登記的設定：{key}"
+            continue
+        if not p.editable:
+            errors[key] = f"只能在 .env 設定（Tier {p.tier}）"
+            continue
+        if p.secret and raw == params.MASK:
+            continue                    # 遮罩原樣送回 = 沒有改這一格
+        try:
+            params.parse(p, raw)        # 只驗證，不寫
+        except ValueError as e:
+            errors[key] = str(e)
+            continue
+        plan.append((key, raw))
+    if errors:
+        return {"items": [], "errors": errors}
+
+    out = []
+    for key, raw in plan:
+        out.append(set_value(key, raw, actor=actor))
+    return {"items": out, "errors": {}}
+
+
 def clear(key: str, *, actor: str = "") -> Dict[str, Any]:
     """把後台儲存的值刪掉，回到 .env 或預設值。"""
     p = REGISTRY[key]

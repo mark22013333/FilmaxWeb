@@ -45,9 +45,9 @@ def keys_read(path: Path) -> set:
     return found
 
 
-# FILMAX_DATA_DIR 是在讀 .env 之前就要拿到的（決定 .env 在哪），
+# 這兩個是在讀 .env 之前就要拿到的（一個決定資料目錄、一個決定 .env 在哪），
 # 放進 .env.example 會誤導人以為寫在裡面有用。
-NOT_IN_EXAMPLE = {"FILMAX_DATA_DIR"}
+NOT_IN_EXAMPLE = {"FILMAX_DATA_DIR", "FILMAX_ENV_FILE"}
 
 read = set()
 for f in ("app/config.py", "run.py"):

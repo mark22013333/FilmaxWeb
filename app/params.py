@@ -151,6 +151,9 @@ _ALL: List[Param] = [
     _p("FFMPEG_PATH", NO_UI, default="ffmpeg", section="轉碼"),
     _p("FFPROBE_PATH", NO_UI, default="ffprobe", section="轉碼"),
     _p("LIBRARY_ROOTS", NO_UI, default="/|auto", section="媒體庫", sensitive=True),
+    # 第 −1 層：FTP 路徑 → 本機路徑。是路徑、會擴大服務讀得到的範圍，所以跟
+    # LIBRARY_ROOTS 同一類，不進 UI。
+    _p("LIBRARY_LOCAL_ROOTS", NO_UI, section="媒體庫", sensitive=True),
     _p("TRUST_PROXY", NO_UI, type="bool", default=False, section="網路"),
     _p("LOCAL_NETWORKS", NO_UI, section="網路", sensitive=True),
 
@@ -226,20 +229,33 @@ _ALL: List[Param] = [
     _p("TRANSCODE_CRF", HOT, type="int", default=21, apply=APPLY_HOT, section="轉碼",
        label="畫質 CRF", minimum=0, maximum=51,
        help="越小畫質越好、檔越大。硬體編碼會換算成 cq"),
+    _p("NVENC_CQ", HOT, type="int", default=28, apply=APPLY_HOT, section="轉碼",
+       label="NVENC 畫質 CQ", minimum=0, maximum=51,
+       help="硬體編碼自己的一把尺，不要跟 CRF 共用。實測同樣寫 21 時 NVENC 會吐出"
+            "接近原檔的位元率（幾乎沒壓縮），28～32 才對得上 x264 crf 21 的區間"),
     _p("TRANSCODE_MAX_HEIGHT", HOT, type="int", default=1080, apply=APPLY_HOT,
        section="轉碼", label="解析度上限", minimum=0, maximum=4320,
-       help="0 = 不縮放"),
+       help="0 = 不縮放（真的不縮放，不是退回預設值）"),
     _p("X264_PRESET", HOT, default="veryfast", apply=APPLY_HOT, section="轉碼",
        label="x264 preset",
        choices=["ultrafast", "superfast", "veryfast", "faster", "fast",
                 "medium", "slow"]),
     _p("HDR_TONEMAP", HOT, default="auto", apply=APPLY_HOT, section="轉碼",
        label="HDR 轉 SDR", choices=["auto", "quality", "fast", "off"]),
+    # `bt2390` 原本列在選項裡，但 **CPU 的 tonemap 濾鏡不接受這個值** ——
+    # 它只認 none/linear/gamma/clip/reinhard/hable/mobius（bt2390 是 libplacebo
+    # 與 tonemap_opencl 才有的）。選到它的話濾鏡鏈直接失敗，HDR 片源的每一段
+    # 轉碼都會 500。已從選項移除。
     _p("HDR_TONEMAP_ALGO", HOT, default="hable", apply=APPLY_HOT, section="轉碼",
        label="色調映射演算法",
-       choices=["hable", "mobius", "reinhard", "bt2390"]),
+       choices=["hable", "mobius", "reinhard", "linear", "gamma", "clip"],
+       help="hable 明暗兼顧（建議）；mobius 保色但亮部容易過曝；reinhard 最快、對比最平"),
     _p("HLS_SEGMENT_SECONDS", HOT, type="int", default=6, apply=APPLY_HOT,
        section="轉碼", label="分段長度（秒）", minimum=1, maximum=30),
+    _p("HLS_TWO_RUNG", HOT, type="bool", default=False, apply=APPLY_HOT,
+       section="轉碼", label="兩階 HLS（remux 上階）",
+       help="開了之後：區網發單一的原檔 remux（零轉碼），遠端發兩階讓播放器自己選。"
+            "只有掃過 keyframe 邊界表、而且 keyframe 間距小於分段長度的 h264 片源才有上階"),
     _p("HLS_PREFETCH_SEGMENTS", HOT, type="int", default=3, apply=APPLY_HOT,
        section="轉碼", label="預轉段數", minimum=0, maximum=20),
     _p("PREFETCH_MIN_SPEED", HOT, type="float", default=1.5, apply=APPLY_HOT,
@@ -252,7 +268,8 @@ _ALL: List[Param] = [
        section="轉碼", label="音訊位元率（kbps）", minimum=32, maximum=640),
 
     _p("REMOTE_MAX_HEIGHT", HOT, type="int", default=720, apply=APPLY_HOT,
-       section="遠端畫質", label="遠端解析度上限", minimum=0, maximum=4320),
+       section="遠端畫質", label="遠端解析度上限", minimum=0, maximum=4320,
+       help="0 = 不縮放"),
     _p("REMOTE_BITRATE_KBPS", HOT, type="int", default=2800, apply=APPLY_HOT,
        section="遠端畫質", label="遠端位元率上限（kbps）", minimum=0),
     _p("LAN_BITRATE_KBPS", HOT, type="int", default=0, apply=APPLY_HOT,
@@ -276,6 +293,17 @@ _ALL: List[Param] = [
     _p("PHOTO_EXCLUDE_VIDEO_ARTWORK", HOT, type="bool", default=True, apply=APPLY_HOT,
        section="相片庫", label="排除影片封面",
        help="關掉的話點「相片」會看到一整牆的影片海報"),
+    _p("SUBTITLE_PREFETCH", HOT, type="bool", default=True, apply=APPLY_HOT,
+       section="字幕", label="開播後在背景把字幕抽好",
+       help="內嵌字幕要把整部片 demux 一遍才收得齊，大檔案動輒幾十秒。"
+            "開著的話播放器會在開播幾秒後、於背景先抽好放進快取，"
+            "按下字幕時就不用等；抽好的快取在來源檔沒換過之前一直有效。"
+            "代價是會跟影片本身的串流搶一點 FTP 頻寬 —— "
+            "如果你幾乎不看字幕，關掉可以省下那次 demux"),
+    _p("PHOTO_PREVIEW_PX", HOT, type="int", default=1920, apply=APPLY_HOT,
+       section="相片庫", label="看大圖的長邊像素", minimum=640, maximum=6000,
+       help="燈箱載入的衍生圖尺寸。放大到超過這個像素時前端會自己換成原圖。"
+            "改了之後舊的衍生圖不會被刪，新尺寸會在下次點開時產生"),
 ]
 
 REGISTRY: Dict[str, Param] = {p.key: p for p in _ALL}

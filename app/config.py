@@ -18,7 +18,17 @@ CACHE_DIR = DATA_DIR / "hls"
 SUB_DIR = DATA_DIR / "subs"
 DB_PATH = DATA_DIR / "library.db"
 
-load_dotenv(BASE_DIR / ".env")
+# 讀哪一個 .env。FILMAX_ENV_FILE 指到別的路徑（或一個不存在的路徑）就能完全隔離
+# 開發機自己的 .env —— 跟上面 FILMAX_DATA_DIR 同一個道理，所以也必須在
+# load_dotenv 之前，只吃真正的環境變數。
+#
+# 為什麼需要它：測試想驗「什麼都沒設時是預設值」，做法是 import app 之前把那些鍵
+# 從 os.environ 移掉。但 load_dotenv 是在 import 時才跑，而它的預設是 override=False
+# —— 鍵剛被移掉，於是它**正好會被 .env 重新填回去**。「先 pop 再 import」對 .env
+# 完全無效，它只擋得住真正的環境變數。實際後果：每往 .env 加一個參數，
+# 就有一組「解析順序」的測試變紅，而那份 pop 清單愈補愈長也補不完。
+ENV_FILE = Path(os.getenv("FILMAX_ENV_FILE") or (BASE_DIR / ".env"))
+load_dotenv(ENV_FILE)
 
 
 def _b(key: str, default: bool) -> bool:
@@ -60,7 +70,14 @@ class Settings:
 
     ffmpeg: str = field(default_factory=lambda: _s("FFMPEG_PATH", "ffmpeg") or "ffmpeg")
     ffprobe: str = field(default_factory=lambda: _s("FFPROBE_PATH", "ffprobe") or "ffprobe")
-    hwaccel: str = field(default_factory=lambda: _s("FFMPEG_HWACCEL", "none").lower() or "none")
+    # 預設 auto，不是 none。理由有兩個：
+    # (1) J 章結論 (a)：必須重編時 NVENC 是首選 —— 同碼率下每一級都贏 x264
+    #     veryfast，而且快 1.5 倍（NVENC 2800k 拿 92.3，x264 veryfast 要 6000k
+    #     才追平）。預設走 CPU 等於預設選了較差的那一邊。
+    # (2) auto 是安全的：resolve_hwaccel() 會實際試編一小段，硬體不在或驅動
+    #     擋掉就自動退回 libx264，而 params.py 與 .env.example 早就寫著 auto ——
+    #     這裡原本是 none，等於後台顯示的預設值跟真的預設值不一致。
+    hwaccel: str = field(default_factory=lambda: _s("FFMPEG_HWACCEL", "auto").lower() or "auto")
     # 解碼加速跟編碼加速是兩套不同的硬體單元（NVDEC vs NVENC），
     # 驅動擋掉編碼不代表解碼也不能用。auto 讓 ffmpeg 自己挑、失敗自動退回 CPU。
     # 實測發現：軟體濾鏡要用畫格時，GPU→CPU 的搬運成本常常比省下的解碼還貴
@@ -278,6 +295,36 @@ class Settings:
             roots.append(LibraryRoot(path=p if p != "/" else "/", kind=k))
         return roots or [LibraryRoot("/", "auto")]
 
+    @property
+    def library_local_roots(self) -> List[Tuple[str, str]]:
+        """FTP 路徑 → 本機路徑的對應表（第 −1 層）。
+
+        格式跟 LIBRARY_ROOTS 一樣用分號分隔、等號左右是「FTP 前綴＝本機根目錄」：
+
+            LIBRARY_LOCAL_ROOTS=/=D:\\1.FTP
+            LIBRARY_LOCAL_ROOTS=/媒體資料庫=D:\\1.FTP\\媒體資料庫;/相片=E:\\photos
+
+        為什麼只能放 .env（Tier 4）：它是路徑，會擴大服務能讀到的範圍 ——
+        跟 LIBRARY_ROOTS、FFMPEG_PATH 同一類，不進後台 UI。
+
+        回傳的前綴一律正規化成「開頭有 /、結尾沒有 /」，長的排前面，
+        這樣比對時先命中最specific 的那一條。
+        """
+        raw = _s("LIBRARY_LOCAL_ROOTS", "")
+        out: List[Tuple[str, str]] = []
+        for chunk in raw.split(";"):
+            chunk = chunk.strip()
+            if not chunk or "=" not in chunk:
+                continue
+            prefix, local = chunk.split("=", 1)
+            prefix = "/" + prefix.strip().strip("/")
+            local = local.strip().strip('"')
+            if not local:
+                continue
+            out.append((prefix, local))
+        out.sort(key=lambda t: len(t[0]), reverse=True)
+        return out
+
     def self_base_url(self) -> str:
         """ffmpeg 讀取影片時用的自身位址 (走本機 HTTP，避免 ffmpeg 處理 FTP 編碼問題)。"""
         return f"http://127.0.0.1:{self.port}"
@@ -303,11 +350,16 @@ _HOT_ATTRS = {
     "tmdb_fallback_language": "TMDB_FALLBACK_LANGUAGE",
     "tmdb_rate_limit": "TMDB_RATE_LIMIT",
     "crf": "TRANSCODE_CRF",
+    "nvenc_cq": "NVENC_CQ",
     "max_height": "TRANSCODE_MAX_HEIGHT",
     "x264_preset": "X264_PRESET",
     "hdr_tonemap": "HDR_TONEMAP",
     "hdr_tonemap_algo": "HDR_TONEMAP_ALGO",
     "hls_segment_seconds": "HLS_SEGMENT_SECONDS",
+    # 兩階 HLS 的開關（J 章第 0 層）。預設關 —— 它改的是播放路徑，
+    # 而 remux 的時間戳行為要在真的片源上驗過才敢開。關著的時候
+    # rungs_for() 只會回下階，也就是現在的行為。
+    "hls_two_rung": "HLS_TWO_RUNG",
     "hls_prefetch": "HLS_PREFETCH_SEGMENTS",
     "prefetch_min_speed": "PREFETCH_MIN_SPEED",
     "audio_channels": "AUDIO_CHANNELS",
@@ -322,6 +374,8 @@ _HOT_ATTRS = {
     "min_photo_kb": "MIN_PHOTO_KB",
     "max_photo_mb": "MAX_PHOTO_MB",
     "photo_exclude_artwork": "PHOTO_EXCLUDE_VIDEO_ARTWORK",
+    "photo_preview_px": "PHOTO_PREVIEW_PX",
+    "subtitle_prefetch": "SUBTITLE_PREFETCH",
     "session_days": "SESSION_DAYS",
     "google_allowed_domains": "GOOGLE_ALLOWED_DOMAINS",
     "google_admin_emails": "GOOGLE_ADMIN_EMAILS",
