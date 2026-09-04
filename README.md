@@ -59,7 +59,7 @@
 ```ini
 FTP_HOST=127.0.0.1
 FTP_USER=你的帳號
-FTP_PASS=你的密碼
+FTP_PASSWORD=你的密碼
 TMDB_API_KEY=去 themoviedb.org 免費申請
 ```
 
@@ -276,7 +276,7 @@ flowchart LR
 | Tier | 意思 | 例子 |
 |---|---|---|
 | 0 `ENV_ONLY` | 只能放 `.env`，UI 完全不出現 | 登入鎖定的門檻 |
-| 1 `SECRET` | 秘密，UI 是唯寫欄位 | `TMDB_API_KEY`、`FTP_PASS` |
+| 1 `SECRET` | 秘密，UI 是唯寫欄位 | `TMDB_API_KEY`、`FTP_PASSWORD` |
 | 2 `HOT` | 後台改、**即時生效** | `TRANSCODE_CRF`、`HLS_TWO_RUNG` |
 | 3 `NEEDS_RELOAD` | 要重載或重開服務 | `FTP_HOST`、`FFMPEG_HWACCEL` |
 | 4 `NO_UI` | 是路徑或會被當命令執行，不放 UI | `FFMPEG_PATH`、`LIBRARY_LOCAL_ROOTS` |

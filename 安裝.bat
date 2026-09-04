@@ -144,14 +144,16 @@ if not "!FAILED!"=="" (
   echo.
   echo   請「關掉這個視窗」，然後重新執行一次本檔案做驗證。
 ) else (
-  echo   全部就緒。
+  echo   All set.
   echo.
-  echo   接下來：
-  echo     1. 確認 .env 的 FFMPEG_PATH / FFPROBE_PATH 填的是完整路徑
-  echo        ^(不要留空、不要靠 PATH —— 這台機器上有 ImageMagick 附帶的
-  echo         舊版 ffmpeg，靠 PATH 會拿到它。見 J 章第 3 步^)
-  echo     2. 雙擊「啟動.bat」
-  echo     3. 在網頁按一次「掃描媒體庫」，重新分析之前失敗的檔案
+  echo   Next steps:
+  echo     1. In .env, set FFMPEG_PATH / FFPROBE_PATH to FULL paths.
+  echo        Do not leave them empty and do not rely on PATH: some machines
+  echo        carry the old ffmpeg bundled with ImageMagick, and PATH finds
+  echo        that one instead. See chapter J step 3.
+  echo     2. Double-click the launcher .bat
+  echo     3. In the web UI, run a library scan once to re-analyze the files
+  echo        that previously failed.
 )
 echo ===============================================================
 echo.
