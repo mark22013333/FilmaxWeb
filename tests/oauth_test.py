@@ -27,6 +27,8 @@ if USE_MSSQL:
                        "MSSQL_USER": "filmax_app", "MSSQL_PASSWORD": "x"})
 os.environ.update({
     "FILMAX_DATA_DIR": TMP,
+    # 隔離開發機的 .env（見 config.py 的 ENV_FILE 註解）
+    "FILMAX_ENV_FILE": os.path.join(TMP, "no-such.env"),
     "AUTH_ENABLED": "true",
     "AUTH_PASSWORD": "", "VIEWER_PASSWORD": "",
     "AUTH_SECRET": "test-secret-do-not-use",
