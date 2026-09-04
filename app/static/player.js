@@ -322,10 +322,64 @@ function parseVTT(text) {
   return out.sort((a, b) => a.start - b.start);
 }
 
+/* ------------------------------------------------ 開播後才抽字幕 ------------------------------------------------ */
+/* 內嵌字幕要把整部片 demux 一遍才收得齊。原本在 boot() 裡是「開播的同一瞬間」
+ * 就開始抽 —— 於是抽字幕的 ffmpeg 跟正在轉碼的 ffmpeg 同時對同一個來源檔全速讀，
+ * 兩邊搶同一條 FTP。影片的起播因此變慢，而使用者會覺得「整個都在等」。
+ *
+ * 所以分兩種情況：
+ *   已經有快取（info.subtitles[i].cached，由 /api/play 回報）
+ *       → 那是本機檔案，讀它沒有頻寬問題，立刻載入。
+ *   還沒有快取
+ *       → 等影片緩衝穩定幾秒再開始。
+ */
+const SUB_WARMUP_MS = 5000;
+let warmTimer = null;
+
+function subCached(idx) {
+  return !!(info?.subtitles?.[idx]?.cached);
+}
+
+function startSubtitles(idx, opts = {}) {
+  if (idx < 0) return;
+  if (subCached(idx)) return loadSubtitle(idx, opts);
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(() => loadSubtitle(idx, opts), SUB_WARMUP_MS);
+}
+
+/* 字幕是關著的（使用者上次刻意關掉），但還是先把它抽進快取 ——
+ * 這是唯一「顯示路徑不會順便產生快取」的情況：真的想看字幕時，
+ * 不做預抽就得從零等一次整片 demux。 */
+function prefetchSubtitles() {
+  if (!info?.subtitle_prefetch) return;
+  const idx = pickAutoTrack();
+  if (idx < 0 || subCached(idx)) return;
+  const url = info.subtitles[idx]?.url;
+  if (!url) return;
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(async () => {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return;
+      // **一定要把 body 讀完。** 伺服器端 aiter_subtitle_vtt 是非同步產生器，
+      // Starlette 靠「取消回應」收尾 —— 前端不讀 body 就等於取消，ffmpeg 會被
+      // kill，而半截的快取會被丟掉（media.py 那邊是對的），等於白跑一趟。
+      // 內容本身不要，直接排掉。
+      if (r.body?.pipeTo) await r.body.pipeTo(new WritableStream({ write() {} }));
+      else await r.text();                     // 舊瀏覽器沒有 pipeTo
+      const t = info.subtitles[idx];
+      if (t) t.cached = true;
+    } catch {
+      /* 預抽失敗不影響播放：使用者按下字幕時會走正常的載入路徑 */
+    }
+  }, SUB_WARMUP_MS);
+}
+
 // remember：把這次選擇記在這個檔案上（使用者自己點的才要）
 // auto    ：這一軌是程式挑的，所以載入後可以看內容決定要不要改挑別軌。
 //           使用者指定的軌永遠不會被換掉，即使內容是簡體 —— 那是他要的。
 async function loadSubtitle(idx, opts = {}) {
+  clearTimeout(warmTimer);        // 使用者自己動作了，取消排程中的暖機
   const { remember = true, auto = false, tried = [] } = opts;
   const track = idx >= 0 ? info?.subtitles?.[idx] : null;
   if (track?.graphic) {
@@ -365,12 +419,30 @@ async function loadSubtitle(idx, opts = {}) {
       }
     };
 
-    // 語言標籤分不出繁簡時看實際內容。收到夠多句就判斷，不必等整份下載完。
+    // 語言標籤分不出繁簡時看實際內容。
+    //
+    // **顯示不等判斷。** 原本是「收滿 20 句 → 判斷 → 才畫第一句」，於是即使字幕
+    // 已經在串流進來，畫面上還是要空等 20 句。而把門檻降到 10 句並不是好解法：
+    // hantScore 在 10 句上明顯更吵（樣本不足時它回 0，就會挑錯軌）。
+    //
+    // 所以改成：**一有句子就畫**（renderCues 在下面的迴圈裡無條件呼叫），
+    // 判斷照舊等 60 句才做、才夠準。判定簡體且還有別軌時那時再換，並提示使用者。
+    // 代價是「拿到的是簡體軌」這個少數情況會先看到簡體再換掉 ——
+    // 比起所有情況都先等 20 句，這個交換是划算的。
+    // 而且有了預抽快取之後，第二次播放整份是瞬間到齊，判斷根本不會被感覺到。
+    const CHECK_AT = 60;
     let checked = !auto, simplified = false;
     const check = done => {
-      if (checked || (cues.length < 20 && !done)) return;
+      if (checked || (cues.length < CHECK_AT && !done)) return;
       checked = true;
-      if (cues.length) simplified = hantScore(cues.slice(0, 60).map(c => c.html).join('')) < -0.3;
+      if (!cues.length) return;
+      if (hantScore(cues.slice(0, CHECK_AT).map(c => c.html).join('')) >= -0.3) return;
+      // 判定是簡體。但**只有真的有別軌可換時才中止這一軌** ——
+      // 沒有替代品還把它砍掉，結果是「整部片只剩前 60 句字幕」：
+      // 迴圈 break、reader.cancel()、ffmpeg 被收掉，而後面的句子永遠不會到。
+      // 實測確認過這個行為（只有一條簡體軌的片，60 句之後就沒字幕了）。
+      if (pickAutoTrack([...tried, idx]) >= 0) simplified = true;
+      else toast('這部片只有簡體字幕');
     };
 
     reader = r.body?.getReader?.();
@@ -384,8 +456,8 @@ async function loadSubtitle(idx, opts = {}) {
         if (done) feed(dec.decode(), true);
         check(done);
         if (simplified) break;
-        // 判斷完才畫，免得簡體字幕先閃一下才換掉
-        if (checked && cues.length) renderCues(true);
+        // 有句子就畫，不等繁簡判斷（見上面 CHECK_AT 那段註解）
+        if (cues.length) renderCues(true);
         busy(done ? '' : `載入字幕 ${cues.length} 句`);
         if (done) break;
       }
@@ -394,12 +466,17 @@ async function loadSubtitle(idx, opts = {}) {
     if (simplified) {
       reader?.cancel().catch(() => {});
       const next = pickAutoTrack([...tried, idx]);
-      if (next >= 0) {
+      if (next >= 0) {          // check() 只在有替代軌時才會設 simplified，這裡必成立
         busy('');
+        // 已經畫了幾十句簡體出去，換軌時要講一聲 —— 不然畫面自己變了很像壞掉
+        if (cues.length) toast('這一軌是簡體，已改用繁體字幕');
         return loadSubtitle(next, { remember: false, auto: true, tried: [...tried, idx] });
       }
       toast(`找不到繁體字幕，已選：${s.label}`);
     } else if (cues.length) {
+      // 完整抽完了 → 伺服器已經把 .vtt 寫進 SUB_DIR。標記起來，
+      // 之後在這個頁面裡重新選同一軌就會走「立刻載入」而不是再等暖機。
+      if (info.subtitles[idx]) info.subtitles[idx].cached = true;
       toast(`字幕：${s.label}`);
     } else {
       toast(`這一軌沒有可顯示的字幕：${s.label}`);
@@ -537,6 +614,19 @@ async function switchAudio(index) {
   buildPanel();
 }
 
+// 切換之後的提示要跟面板上寫的一致：級別 ＋ 實際解析度。
+function qualityToast(height) {
+  const q = info?.quality || {};
+  const src = q.source;
+  if (height === 0) return '畫質：自動';
+  if (height === -1) {
+    return src ? `畫質：原畫質 ${src.label}（${src.width}×${src.height}）` : '畫質：原畫質';
+  }
+  const lv = (q.levels || []).find(l => l.h === height);
+  return lv ? `畫質：${lv.label}（${lv.width}×${lv.height}）` : `畫質：${height}p`;
+}
+
+
 async function switchQuality(height) {
   cfg.quality = height; saveCfg();
   const at = v.currentTime;
@@ -545,7 +635,7 @@ async function switchQuality(height) {
     info = await (await fetch(playUrl({ height, audio: info.audio_index }))).json();
   } catch { busy(''); toast('切換畫質失敗'); return; }
   play(info.mode, at);
-  toast(height > 0 ? `畫質：${height}p` : height === -1 ? '畫質：原畫質' : '畫質：自動');
+  toast(qualityToast(height));
   buildPanel();
 }
 
@@ -773,8 +863,11 @@ const fmtRate = kbps => !kbps ? '' : kbps >= 1000
 function mediaInfoRows() {
   if (!info) return [];
   const rows = [];
+  // 級別放前面、實際解析度放後面：「1080p · 1920 × 804」一眼就看得懂
+  // 「這是 1080p 的片，畫面比較扁」，而不是誤以為畫質被降到 804。
   const res = info.width && info.height ? `${info.width} × ${info.height}` : '未知';
-  rows.push(['解析度', res + (info.fps ? ` · ${info.fps} fps` : '')]);
+  const cls = info?.quality?.source?.label;
+  rows.push(['解析度', (cls ? cls + ' · ' : '') + res + (info.fps ? ` · ${info.fps} fps` : '')]);
 
   const vbits = [(info.video_codec || '').toUpperCase()];
   if (info.bit_depth) vbits.push(info.bit_depth + '-bit');
@@ -847,6 +940,12 @@ function buildPanel() {
   };
   const tracks = info?.audio_tracks || [];
   const ladder = info?.quality?.ladder || [];
+  // 級別（1080p）與實際解析度（1920×804）兩個都要顯示。只給高度的話，
+  // 寬螢幕片會被標成「804p」看起來像降級 —— 那其實就是原檔的畫面高度。
+  const levels = info?.quality?.levels || ladder.map(h => ({ h, label: h + 'p' }));
+  const srcQ = info?.quality?.source;
+  const dim = q => q && q.width ? `${q.width}×${q.height}` : '';
+  const srcLabel = srcQ ? `原畫質 ${srcQ.label}` : '原畫質';
 
   const seg = (id, opts, cur) => `<div class="seg" data-seg="${id}">` +
     opts.map(([val, lab]) => `<button data-v="${val}" class="${String(cur)===String(val)?'on':''}">${lab}</button>`).join('') + '</div>';
@@ -894,7 +993,9 @@ function buildPanel() {
     <div class="pi"><label>速度</label></div>
     ${seg('rate', [['0.75','0.75x'],['1','1x'],['1.25','1.25x'],['1.5','1.5x'],['2','2x']], cfg.rate)}
     ${ladder.length ? `<div class="pi"><label>畫質${info.quality.auto_reason ? ' <small style="color:var(--dim)">'+esc(info.quality.auto_reason)+'</small>' : ''}</label></div>
-      ${seg('quality', [['0','自動'], ['-1','原畫質'], ...ladder.map(h => [String(h), h + 'p'])], cfg.quality)}
+      ${srcQ ? `<div class="pi"><small style="color:var(--dim)">片源 ${esc(srcQ.label)}・${esc(dim(srcQ))}</small></div>` : ''}
+      ${seg('quality', [['0','自動'], ['-1', srcLabel],
+                        ...levels.map(l => [String(l.h), l.label + (dim(l) ? ` <small>${dim(l)}</small>` : '')])], cfg.quality)}
       ${info.is_hdr ? `<div class="pi"><label style="font-size:12px;color:var(--dim)">
         HDR 片源：${info.tonemap_available ? (info.hdr_mode === 'fast'
           ? '快速轉換中（色彩正確，高光削掉）。要最佳畫質可在 .env 設 HDR_TONEMAP=quality，但 4K 可能會卡'
@@ -1090,11 +1191,11 @@ async function boot() {
   const saved = savedPick();
   if (saved !== undefined && (saved < 0 || info.subtitles[saved])) {
     // 這部片手動選過（含刻意關掉）—— 照舊，不要自作聰明
-    if (saved >= 0) loadSubtitle(saved, { remember: false });
-    else $('#btnSubs').classList.remove('on');
+    if (saved >= 0) startSubtitles(saved, { remember: false });
+    else { $('#btnSubs').classList.remove('on'); prefetchSubtitles(); }
   } else {
     const best = pickAutoTrack();
-    if (best >= 0) loadSubtitle(best, { remember: false, auto: true });
+    if (best >= 0) startSubtitles(best, { remember: false, auto: true });
     else $('#btnSubs').classList.remove('on');
   }
   wake();

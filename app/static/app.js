@@ -1,8 +1,18 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const api = async (url, opt) => {
-  const r = await fetch(url, opt);
-  if (!r.ok) throw new Error((await r.text()).slice(0, 200) || r.status);
+const api = async (url, opt = {}) => {
+  // 有 body 就一定要帶 Content-Type: application/json —— FastAPI 的 Pydantic
+  // 是看這個標頭決定要不要解析 body 的，少了它會回 422 而不是「欄位錯」，
+  // 而 422 的訊息看起來完全不像「你忘了設標頭」。
+  const opts = opt.body && !opt.headers
+    ? { ...opt, headers: { 'Content-Type': 'application/json' } } : opt;
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    let msg = (await r.text()).slice(0, 300);
+    try { const j = JSON.parse(msg); if (j.detail) msg = typeof j.detail === 'string'
+      ? j.detail : JSON.stringify(j.detail); } catch (e) { /* 不是 JSON 就用原文 */ }
+    throw new Error(msg || r.status);
+  }
   return r.json();
 };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -153,6 +163,8 @@ async function loadContinue() {
 
 /* ------------------------- 詳情 ------------------------- */
 async function openItem(id) {
+  // 記住現在開著哪一筆：重新分析完成之後要把彈窗刷新，才看得到新的時長
+  window.__openItemId = id;
   const ov = $('#overlay'); ov.classList.add('show');
   $('#modal').innerHTML = '<div class="loading">載入中…</div>';
   const it = await api('/api/items/' + id);
@@ -179,10 +191,14 @@ async function openItem(id) {
       </div>
     </div>
     <div class="modal-body">
-      <div style="display:flex;gap:8px;margin-bottom:14px">
+      <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
         ${me.is_admin ? `<button class="btn" onclick="rescrape(${it.id})">重新刮削</button>` : ''}
         ${me.is_admin ? `<button class="btn" onclick="manualMatch(${it.id},'${it.kind}','${esc(it.title).replace(/'/g, "\\'")}')">手動指定 TMDB</button>` : ''}
+        ${me.is_admin ? `<button class="btn" onclick="editItem(${it.id})">改片名／年份</button>` : ''}
+        ${me.is_admin ? `<button class="btn" onclick="switchKind(${it.id},'${it.kind}')">改成${it.kind === 'tv' ? '電影' : '影集'}</button>` : ''}
       </div>
+      ${me.is_admin && it.scrape_state === 'manual'
+        ? '<div class="sub" style="margin-bottom:12px;color:var(--accent)">這一筆是手動修正過的，自動刮削不會再蓋掉它。</div>' : ''}
       ${files || '<div class="empty">沒有檔案</div>'}
     </div>`;
 }
@@ -204,6 +220,7 @@ function fileRow(f, label = '') {
     ${pill}
     <button class="btn primary" onclick="location.href='/player?file=${f.id}'">播放</button>
     ${me.is_admin ? `<a class="btn" href="/api/download/${f.id}" download>下載</a>` : ''}
+    ${me.is_admin ? `<button class="btn" onclick="reprobe(${f.id})" title="時長、字幕軌、解析度不對的時候用">重新分析</button>` : ''}
   </div>`;
 }
 
@@ -227,6 +244,61 @@ window.manualMatch = async (id, kind, title) => {
       <small>${esc((r.overview || '').slice(0, 90))}</small></div></div>`).join('')}
     <button class="btn" onclick="openItem(${id})">返回</button></div>`;
 };
+/* 只改片名／年份，不接 TMDB。
+ * TMDB 上的中文片名有時候就是不好，或者根本沒有中譯 —— 那種情況下
+ * 「整筆重刮」解不了問題，使用者要的只是改一個欄位。 */
+window.editItem = async id => {
+  const it = await api('/api/items/' + id).catch(() => null);
+  if (!it) return toast('讀不到這個條目');
+  const title = prompt('片名：', it.title || '');
+  if (title === null) return;
+  const yearRaw = prompt('年份（留空表示清掉）：', it.year || '');
+  if (yearRaw === null) return;
+  const body = {};
+  if (title.trim() && title !== it.title) body.title = title.trim();
+  if (String(yearRaw).trim() !== String(it.year || '')) body.year = +yearRaw || null;
+  if (!Object.keys(body).length) return toast('沒有變更');
+  try {
+    const r = await api('/api/items/' + id, { method: 'PATCH', body: JSON.stringify(body) });
+    toast('已改：' + (r.changed || []).join('、'));
+    openItem(id); loadLibrary();
+  } catch (e) { toast('失敗：' + e.message); }
+};
+
+/* 類型認錯（電影 ↔ 影集）。
+ * 這是「刮到錯的資料」裡最惡劣的一種：TMDB 的搜尋是分 movie / tv 兩個端點的，
+ * 類型錯了的話手動指定也永遠搜不到，而畫面上不會告訴你為什麼。 */
+window.switchKind = async (id, cur) => {
+  const to = cur === 'tv' ? 'movie' : 'tv';
+  const label = to === 'tv' ? '影集' : '電影';
+  const extra = to === 'tv'
+    ? '底下的檔案會依檔名重新指派集數（解析不出集數的就按檔名順序給 S01E01、S01E02…）。'
+    : '底下的集數資料會被刪掉（含劇照）。';
+  if (!confirm(`把這一筆改成${label}？\n\n${extra}\n\n改完會自動重新刮削一次，因為類型錯的時候 TMDB 資料整份都是錯的。`))
+    return;
+  toast('處理中…');
+  try {
+    const r = await api('/api/items/' + id, { method: 'PATCH', body: JSON.stringify({ kind: to }) });
+    toast(r.rescraped === false ? `已改成${label}，但重新刮削失敗：${r.error || ''}`
+          : `已改成${label}${r.episodes ? `，指派了 ${r.episodes} 集` : ''}`);
+    openItem(id); loadLibrary();
+  } catch (e) { toast('失敗：' + e.message); }
+};
+
+/* 重新跑 ffprobe。時長、字幕軌、解析度、HDR 判斷錯的時候用 ——
+ * 端點本來就有，只是之前只有「分析失敗」的情況會呼叫它。 */
+window.reprobe = async fileId => {
+  toast('重新分析中…');
+  try {
+    const r = await api('/api/probe/' + fileId, { method: 'POST' });
+    toast(r.probe_state === 'ok'
+      ? `完成：${r.play_mode === 'direct' ? '直接播放' : '轉碼播放'}${r.duration ? '，' + hhmm(r.duration) : ''}`
+      : `分析失敗：${r.probe_error || ''}`);
+    const open = $('#overlay').classList.contains('show');
+    if (open && window.__openItemId) openItem(window.__openItemId);
+  } catch (e) { toast('失敗：' + e.message); }
+};
+
 window.applyMatch = async (id, tmdbId) => {
   await api(`/api/rescrape/${id}?tmdb_id=${tmdbId}`, { method: 'POST' });
   toast('已套用'); openItem(id); loadLibrary();
@@ -444,7 +516,8 @@ window.testFtp = async () => {
 window.api = api; window.toast = toast; window.pollScan = pollScan; window.openItem = openItem;
 
 /* ------------------------- 相片牆 ------------------------- */
-const pstate = { folder: '', page: 1, sort: 'taken', items: [], total: 0 };
+const pstate = { folder: '', page: 1, sort: 'taken', items: [], total: 0, previewPx: 1920 };
+const dstate = { folder: '', page: 1, sort: 'name', items: [], total: 0 };
 
 const fmtBytes = b => !b ? '—'
   : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GB'
@@ -481,6 +554,7 @@ async function loadPhotos() {
   try { d = await api('/api/photos?' + p); }
   catch (e) { grid.innerHTML = `<div class="loading">載入失敗：${esc(e.message)}</div>`; return; }
   pstate.items = d.items; pstate.total = d.total;
+  pstate.previewPx = d.preview_px || 1920;
   $('#photoCount').textContent = d.total ? `共 ${d.total} 張` : '';
   if (!d.items.length) {
     grid.innerHTML = `<div class="empty"><h3>沒有相片</h3>
@@ -488,12 +562,18 @@ async function loadPhotos() {
     $('#ppager').innerHTML = ''; return;
   }
   grid.innerHTML = d.items.map((x, i) => `
-    <div class="ph" data-i="${i}" title="${esc(x.filename)}">
+    <div class="ph" data-i="${i}" role="button" tabindex="0"
+         aria-label="看大圖：${esc(x.filename)}" title="${esc(x.filename)}">
       <img loading="lazy" src="/api/photo/${x.id}/thumb.jpg" alt="${esc(x.filename)}"
            onerror="this.style.display='none'">
       <div class="ph-meta">${esc(x.filename)}</div>
     </div>`).join('');
-  grid.querySelectorAll('.ph').forEach(el => el.onclick = () => openPhoto(+el.dataset.i));
+  grid.querySelectorAll('.ph').forEach(el => {
+    el.onclick = () => openPhoto(+el.dataset.i);
+    el.onkeydown = e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPhoto(+el.dataset.i); }
+    };
+  });
 
   const pages = Math.ceil(d.total / d.page_size);
   $('#ppager').innerHTML = pages > 1 ? `
@@ -506,33 +586,78 @@ async function loadPhotos() {
   });
 }
 
-/* ------------------------- 燈箱 ------------------------- */
-let lbIndex = -1;
-
-async function openPhoto(i) {
-  if (i < 0 || i >= pstate.items.length) return;
-  lbIndex = i;
-  const brief = pstate.items[i];
-  const lb = $('#lightbox');
-  lb.hidden = false;
-  document.body.style.overflow = 'hidden';
-  // 先放縮圖當預覽，原圖載好再換掉 —— 大圖從 FTP 拉要一點時間
-  const img = $('#lbImg');
-  img.src = `/api/photo/${brief.id}/thumb.jpg`;
-  $('#lbInfo').innerHTML = `<h3>${esc(brief.filename)}</h3><div class="sub">載入中…</div>`;
-  const full = new Image();
-  full.onload = () => { if (lbIndex === i) img.src = full.src; };
-  full.src = `/api/photo/${brief.id}/full`;
-
+/* ------------------------- 文件牆（PDF） ------------------------- */
+async function loadDocFolders() {
   let d;
-  try { d = await api('/api/photos/' + brief.id); }
-  catch { return; }
-  if (lbIndex !== i) return;              // 使用者已經翻到別張了
+  try { d = await api('/api/documents/folders'); } catch { return; }
+  const bar = $('#docFolderBar');
+  bar.innerHTML = `<div class="fchip ${dstate.folder ? '' : 'on'}" data-dfolder="">
+      <span class="fc-n">全部</span></div>` + d.items.map(f => `
+    <div class="fchip ${dstate.folder === f.folder ? 'on' : ''}" data-dfolder="${esc(f.folder)}"
+         title="${esc(f.folder)}">
+      <span><span class="fc-n">${esc(shortFolder(f.folder))}</span>
+      <span class="fc-c"> ${f.c}</span></span>
+    </div>`).join('');
+  bar.querySelectorAll('[data-dfolder]').forEach(el => el.onclick = () => {
+    dstate.folder = el.dataset.dfolder; dstate.page = 1; loadDocs();
+  });
+}
+
+async function loadDocs() {
+  const grid = $('#dgrid');
+  grid.innerHTML = '<div class="loading">載入中…</div>';
+  const p = new URLSearchParams({ page: dstate.page, page_size: 60, sort: dstate.sort });
+  if (dstate.folder) p.set('folder', dstate.folder);
+  if (state.q) p.set('q', state.q);
+  let d;
+  try { d = await api('/api/documents?' + p); }
+  catch (e) { grid.innerHTML = `<div class="loading">載入失敗：${esc(e.message)}</div>`; return; }
+  dstate.items = d.items; dstate.total = d.total;
+  $('#docCount').textContent = d.total ? `共 ${d.total} 份` : '';
+  if (!d.items.length) {
+    grid.innerHTML = `<div class="empty"><h3>沒有文件</h3>
+      <p>把 PDF 放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
+    $('#dpager').innerHTML = ''; return;
+  }
+  // 用 <button> 而不是 <div>：鍵盤 Tab 與 Enter 直接就能用，不必自己補
+  // role 與 keydown（相片牆那邊是後來才補上的）。
+  grid.innerHTML = d.items.map(x => `
+    <button class="doc" data-doc="${x.id}" title="${esc(x.folder + '/' + x.filename)}">
+      <span class="di">PDF</span>
+      <span class="dn"><b>${esc(x.filename)}</b><span>${esc(shortFolder(x.folder))}</span></span>
+      <span class="ds">${fmtBytes(x.size)}</span>
+    </button>`).join('');
+  grid.querySelectorAll('[data-doc]').forEach(el => el.onclick = () => {
+    location.href = '/reader?doc=' + el.dataset.doc;
+  });
+
+  const pages = Math.ceil(d.total / d.page_size);
+  $('#dpager').innerHTML = pages > 1 ? `
+    <button class="btn" ${dstate.page <= 1 ? 'disabled' : ''} data-dp="-1">上一頁</button>
+    <span style="padding:0 12px;color:var(--dim)">${dstate.page} / ${pages}</span>
+    <button class="btn" ${dstate.page >= pages ? 'disabled' : ''} data-dp="1">下一頁</button>` : '';
+  $('#dpager').querySelectorAll('[data-dp]').forEach(b => b.onclick = () => {
+    dstate.page += +b.dataset.dp;
+    pageTo(loadDocs, '#dgrid');
+  });
+}
+
+/* --------------------- 相片檢視器（PhotoSwipe） --------------------- */
+// 檢視器是動態 import 進來的：沒點進相片牆就完全不會下載那 54KB。
+// app.js 本身刻意維持成普通 script —— 改成 module 的話頁面上那些
+// onclick="..." 內聯呼叫會全部找不到函式。
+let _viewer = null;
+async function photoViewer() {
+  if (!_viewer) _viewer = await import('/static/photoview.js');
+  return _viewer;
+}
+
+function photoInfoHtml(d) {
   const row = (k, v) => v ? `<div class="row"><span>${k}</span><b>${esc(v)}</b></div>` : '';
   const shot = [row('拍攝時間', d.taken_at), row('相機', d.camera), row('鏡頭', d.lens),
                 row('快門', d.exposure), row('光圈', d.aperture),
                 row('ISO', d.iso), row('焦距', d.focal_len)].join('');
-  $('#lbInfo').innerHTML = `
+  return `
     <h3>${esc(d.filename)}</h3>
     <div class="sub">${esc(d.folder)}</div>
     <h4>檔案</h4>
@@ -549,43 +674,48 @@ async function openPhoto(i) {
     </div>`;
 }
 
-function closePhoto() {
-  $('#lightbox').hidden = true;
-  document.body.style.overflow = '';
-  $('#lbImg').src = '';
-  lbIndex = -1;
+async function openPhoto(i) {
+  if (i < 0 || i >= pstate.items.length) return;
+  let v;
+  try { v = await photoViewer(); }
+  catch { toast('檢視器載入失敗'); return; }
+  v.openPhotos({
+    items: pstate.items,
+    index: i,
+    previewPx: pstate.previewPx || 1920,
+    loadInfo: item => api('/api/photos/' + item.id).then(photoInfoHtml),
+    thumbEl: n => document.querySelector(`#pgrid .ph[data-i="${n}"] img`),
+  });
 }
 
-$('#lbClose').onclick = closePhoto;
-$('#lightbox').onclick = e => { if (e.target.id === 'lightbox' || e.target.classList.contains('lb-stage')) closePhoto(); };
-$('#lbPrev').onclick = e => { e.stopPropagation(); openPhoto(lbIndex - 1); };
-$('#lbNext').onclick = e => { e.stopPropagation(); openPhoto(lbIndex + 1); };
-document.addEventListener('keydown', e => {
-  if ($('#lightbox').hidden) return;
-  if (e.key === 'Escape') closePhoto();
-  else if (e.key === 'ArrowLeft') openPhoto(lbIndex - 1);
-  else if (e.key === 'ArrowRight') openPhoto(lbIndex + 1);
-});
-
 /* ------------------------- 事件 ------------------------- */
-function showPhotoView(on) {
-  $('#photoView').hidden = !on;
+// 三個檢視（影片／相片／文件）共用同一塊區域，一次只顯示一個。
+function showView(kind) {
+  const photo = kind === 'photo', doc = kind === 'doc';
+  const other = photo || doc;
+  $('#photoView').hidden = !photo;
+  $('#docView').hidden = !doc;
   for (const id of ['#grid', '#pager', '#libTitle', '#continue']) {
-    const el = $(id); if (el) el.hidden = on;
+    const el = $(id); if (el) el.hidden = other;
   }
-  $('.toolbar').hidden = on;              // 類型與排序是影片用的
-  $('#q').placeholder = on ? '搜尋檔名或資料夾…' : '搜尋片名或檔名…';
+  $('.toolbar').hidden = other;           // 類型與排序是影片用的
+  $('#q').placeholder = other ? '搜尋檔名或資料夾…' : '搜尋片名或檔名…';
 }
 
 $$('nav button').forEach(b => b.onclick = () => {
   $$('nav button').forEach(x => x.classList.remove('on'));
   b.classList.add('on');
   if (b.dataset.kind === 'photo') {
-    showPhotoView(true);
+    showView('photo');
     loadFolders(); loadPhotos();
     return;
   }
-  showPhotoView(false);
+  if (b.dataset.kind === 'doc') {
+    showView('doc');
+    loadDocFolders(); loadDocs();
+    return;
+  }
+  showView('video');
   state.kind = b.dataset.kind; state.page = 1; loadLibrary();
 });
 let qTimer;
@@ -594,6 +724,7 @@ $('#q').oninput = e => {
   qTimer = setTimeout(() => {
     state.q = e.target.value.trim();
     if (!$('#photoView').hidden) { pstate.page = 1; loadPhotos(); }
+    else if (!$('#docView').hidden) { dstate.page = 1; loadDocs(); }
     else { state.page = 1; loadLibrary(); }
   }, 320);
 };

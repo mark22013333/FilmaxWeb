@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FilmaxWeb — 我的影音庫</title>
+<link rel="stylesheet" href="/static/vendor/photoswipe/photoswipe.css">
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎬</text></svg>">
 </head>
@@ -16,6 +17,7 @@
     <button data-kind="movie">電影</button>
     <button data-kind="tv">影集</button>
     <button data-kind="photo">相片</button>
+    <button data-kind="doc">文件</button>
   </nav>
   <div class="spacer"></div>
   <div class="search">
@@ -46,6 +48,14 @@
   <div class="grid" id="grid"></div>
   <div id="pager"></div>
 
+  <!-- 文件牆（PDF）。跟影片、相片共用同一塊區域 -->
+  <div id="docView" hidden>
+    <div class="folder-bar" id="docFolderBar"></div>
+    <div class="section-title" id="docTitle">文件 <span id="docCount"></span></div>
+    <div class="dgrid" id="dgrid"></div>
+    <div id="dpager"></div>
+  </div>
+
   <!-- 相片牆。跟影片共用同一塊區域，切分頁時互相顯示/隱藏 -->
   <div id="photoView" hidden>
     <div class="folder-bar" id="folderBar"></div>
@@ -55,14 +65,7 @@
   </div>
 </main>
 
-<!-- 燈箱：看大圖與拍攝資訊 -->
-<div class="lightbox" id="lightbox" hidden>
-  <button class="lb-close" id="lbClose" title="關閉 (Esc)">×</button>
-  <button class="lb-nav prev" id="lbPrev" title="上一張 (←)">‹</button>
-  <button class="lb-nav next" id="lbNext" title="下一張 (→)">›</button>
-  <div class="lb-stage"><img id="lbImg" alt=""></div>
-  <div class="lb-info" id="lbInfo"></div>
-</div>
+<!-- 相片檢視器的 DOM 由 PhotoSwipe 自己建，這裡不需要標記 -->
 
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 
