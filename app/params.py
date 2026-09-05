@@ -269,9 +269,17 @@ _ALL: List[Param] = [
 
     _p("REMOTE_MAX_HEIGHT", HOT, type="int", default=720, apply=APPLY_HOT,
        section="遠端畫質", label="遠端解析度上限", minimum=0, maximum=4320,
-       help="0 = 不縮放"),
+       help="0 = 不縮放。這是「自動」模式的起始檔位；開了下面的高畫質頂階之後，"
+            "網路夠快時 ABR 可以再往上爬（但位元率一樣受下面那項管）"),
     _p("REMOTE_BITRATE_KBPS", HOT, type="int", default=2800, apply=APPLY_HOT,
-       section="遠端畫質", label="遠端位元率上限（kbps）", minimum=0),
+       section="遠端畫質", label="遠端位元率上限（kbps）", minimum=0,
+       help="**這一項才是真正保護上傳頻寬的東西。**解析度上限只決定畫面多大，"
+            "實際佔用的上傳頻寬由這裡封頂"),
+    _p("REMOTE_HIGH_RUNG", HOT, type="bool", default=True, apply=APPLY_HOT,
+       section="遠端畫質", label="遠端高畫質頂階",
+       help="在遠端階梯上面多發一階更高解析度（碼率仍受「遠端位元率上限」管）。"
+            "給大螢幕用：同樣吃 2800 kbps，1080p 在電腦上比 720p 清楚得多。"
+            "網路不夠時 ABR 會自己降回來，所以手機不會因此變卡"),
     _p("LAN_BITRATE_KBPS", HOT, type="int", default=0, apply=APPLY_HOT,
        section="遠端畫質", label="區網位元率上限（kbps）", minimum=0,
        help="0 = 不鎖"),

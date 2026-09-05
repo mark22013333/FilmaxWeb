@@ -286,6 +286,16 @@ def item_detail(item_id: int, request: Request):
     return item
 
 
+def _qs(**kw) -> str:
+    """把非 None 的參數組成查詢字串（含開頭的 `?`）；全是 None 就回空字串。
+
+    `h=None` 與 `h=0` 是不同的意思（沒指定 vs 原畫質），所以只能濾掉 None，
+    不能用真假值判斷 —— `if v` 會把 0 一起丟掉。
+    """
+    parts = [f"{k}={v}" for k, v in kw.items() if v is not None]
+    return "?" + "&".join(parts) if parts else ""
+
+
 @router.get("/play/{file_id}")
 def play_info(file_id: int, request: Request,
               h: Optional[int] = None, a: Optional[int] = None):
@@ -354,30 +364,10 @@ def play_info(file_id: int, request: Request,
     # 「遠端降畫質」的保護，把上傳頻寬吃光。
     ip = auth.client_ip(request.scope)
     remote = not auth.is_local_network(ip)
-    # 這幾個設定裡 0 是「不縮放／不鎖」，不是「沒設定」。
-    # 原本寫 `settings.remote_max_height or 720`，於是 REMOTE_MAX_HEIGHT=0
-    # 不是不限，而是**退回 720** —— 與說明相反。
-    mh = int(settings.max_height or 0)
-    rmh = int(settings.remote_max_height or 0)
-    if remote:
-        caps = [x for x in (rmh, mh) if x > 0]
-        default_h = min(caps) if caps else 0
-        default_b = settings.remote_bitrate_kbps
-    else:
-        default_h = mh
-        default_b = settings.lan_bitrate_kbps
-
-    # h 是使用者在畫質選單裡挑的：None = 自動、0 = 原畫質（不縮放）、其餘 = 指定高度。
-    # 原本寫 `h or default_h`，於是「原畫質」送來的 0 被當成「沒指定」，
-    # 解析度回到自動值、位元率也還是被鎖住 —— 按了選單什麼都沒改變。
-    chosen_h = default_h if h is None else max(0, int(h))
-    if h is None:
-        chosen_b = default_b
-    elif chosen_h == 0 or (mh and chosen_h >= mh):
-        chosen_b = 0                      # 明確要原畫質（或已達上限）就不鎖峰值
-    else:
-        chosen_b = default_b
-    profile = hls.profile_key(chosen_h, chosen_a, chosen_b)
+    # 解析度／位元率的政策集中在 hls.quality_policy() —— master.m3u8 要問的是
+    # 同一個答案（0 = 不縮放／不鎖，不是「沒設定」；h=0 是「原畫質」不是「沒指定」，
+    # 這兩個坑的說明都在那個函式裡）。
+    chosen_h, chosen_b = hls.quality_policy(remote, h)
 
     # 遠端 + 這個檔案有上階可給 → **不要走 direct**。direct 沒有階梯可以降：
     # 那 7 部走 direct 的 mp4 裡有 7.6 GB／4,661 kbps 與 4.8 GB／4,508 kbps
@@ -438,7 +428,17 @@ def play_info(file_id: int, request: Request,
         "audio_index": chosen_a if chosen_a is not None else _default_audio(audio_tracks),
         "audio_channels_out": settings.audio_channels,
         "direct_url": f"/api/stream/{file_id}",
-        "hls_url": f"/api/hls/{file_id}/index.m3u8?p={profile}",
+        # **一定要指到 master，不是 index。**指到 index 等於直接給了單一階的
+        # 媒體播放清單 —— hls.js 的 ABR 引擎沒有第二階可選，卡頓時無階可降，
+        # 而 `build_master()` 裡那整套「區網一階、遠端整條階梯」的邏輯
+        # 一行都不會被執行到。h／a 要原樣帶過去：master 要照使用者選的那一檔
+        # 當階梯的頂端（見 abr_ladder）。
+        #
+        # **`h` 沒給的時候不能自己補上 chosen_h。**補了的話 master 端點就分不出
+        # 「自動」與「手動挑了剛好等於預設的那一檔」—— 而這兩者要發的階梯不一樣：
+        # 自動會多發一階高畫質頂階，手動不會（挑的那一檔就是他要的上限）。
+        "hls_url": f"/api/hls/{file_id}/master.m3u8" + _qs(
+            h=(chosen_h if h is not None else None), a=chosen_a),
         "remote": remote,
         "client_ip": ip,
         "quality": {"height": chosen_h, "bitrate_kbps": chosen_b, "ladder": ladder,
