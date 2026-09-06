@@ -308,11 +308,35 @@ def _index_doc(entry: ftpclient.FtpEntry) -> None:
                 entry.size, entry.mtime, mts, mts or now, now, now))
 
 
+def _size_exempt(path: str) -> bool:
+    """這個檔案的所在目錄有沒有被豁免大小門檻。
+
+    比對的是路徑上**每一層**資料夾的名稱開頭（跟 `_skip_dir` 同一套規則），
+    所以寫一個目錄名就連同它底下的子目錄一起豁免。
+
+    為什麼需要這個：全域把 `MIN_FILE_MB` 調低是唯一的替代做法，而實測那會
+    多收 2,215 個 1–50MB 的影片，其中 2,201 個（99.4%）是手機錄的短片
+    （`手機照片` 底下），真正想收的只有 13 個。門檻本身是對的，
+    要的是「這幾個目錄例外」。
+    """
+    prefixes = settings.min_size_exempt_dirs
+    if not prefixes:
+        return False
+    # 只看目錄部分，檔名本身不參與比對 —— 不然一個叫「白上咲花.mp4」的檔案
+    # 會在任何目錄裡都被豁免。
+    parts = posixpath.dirname(path or "").strip("/").split("/")
+    return any(seg.lower().startswith(prefixes) for seg in parts if seg)
+
+
 def _wanted(f) -> bool:
     """這個檔案要不要收進媒體庫。
 
     順序是刻意的：先看副檔名限制，再看大小。排除清單優先於白名單 ——
     兩邊都寫到同一個副檔名時，使用者的意思幾乎都是「不要」。
+
+    **大小門檻可以按目錄豁免，副檔名的排除清單不行。**兩者的性質不同：
+    大小門檻是個啟發式（「太小的大概是預告片」），在某些目錄裡就是猜錯；
+    而排除清單是使用者明講「這種格式我不要」，那句話不會因為換個目錄就改變。
     """
     ext = (f.ext or "").lower()
     if ext not in ftpclient.VIDEO_EXTS:
@@ -322,6 +346,8 @@ def _wanted(f) -> bool:
     only = settings.only_exts
     if only and ext not in only:
         return False
+    if _size_exempt(getattr(f, "path", "")):
+        return True
     return f.size >= settings.min_file_mb * 1024 * 1024
 
 
