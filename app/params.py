@@ -289,6 +289,11 @@ _ALL: List[Param] = [
        help="小於這個大小的影片會被忽略，用來擋預告片與樣本檔"),
     _p("SCAN_EXCLUDE_DIR_PREFIXES", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的資料夾前綴", help="逗號分隔，比對名稱開頭，整棵子樹都不走訪"),
+    _p("SCAN_MIN_SIZE_EXEMPT_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
+       label="不套用大小門檻的資料夾",
+       help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
+            "這些資料夾底下的影片不論多小都收 —— 用來收特定目錄裡的短片，"
+            "而不必為它把全域的 MIN_FILE_MB 調低（調低會把手機錄的短片全部拉進來）"),
     _p("SCAN_EXCLUDE_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的副檔名", help="逗號分隔。跟下面同時設定時，這裡優先"),
     _p("SCAN_ONLY_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
