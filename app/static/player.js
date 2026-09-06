@@ -6,6 +6,8 @@ const fileId = params.get('file');
 const v = $('#v'), pl = $('#pl');
 
 let info = null, hlsObj = null, mode = null, saveTimer = null, seekingByUs = false;
+// ABR 目前選中的那一階（hls.js 的 level 物件）。是當下狀態，不進 cfg。
+let curLevel = null;
 
 /* ------------------------------------------------ 小工具 ------------------------------------------------ */
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
@@ -28,6 +30,17 @@ function busy(text) {
   if (!el) return;
   el.textContent = text || '';
   el.classList.toggle('show', !!text);
+}
+
+// 這是不是行動裝置。**用來調 ABR 的保守程度，不是用來決定畫質** ——
+// 畫質上限由伺服器按 IP 判（客戶端自報的東西只能收緊、不能放寬）。
+// coarse pointer ＋ 沒有 hover 是目前最可靠的判準：只看 userAgent 會被
+// 桌機的「要求電腦版網站」騙過，只看寬度會把小視窗的桌機誤判成手機。
+function isMobile() {
+  try {
+    if (matchMedia('(pointer: coarse)').matches && matchMedia('(hover: none)').matches) return true;
+  } catch {}
+  return Math.min(screen.width, screen.height) <= 480;
 }
 
 function center(text, spinning = true) {
@@ -519,6 +532,7 @@ function play(which, startAt) {
   renderTags();
 
   teardownHls(hlsObj); hlsObj = null;
+  curLevel = null;              // 上一次的階別不能留到這一次（會標錯畫質）
   v.removeAttribute('src'); v.load();
   center('緩衝中…');
 
@@ -542,13 +556,36 @@ function play(which, startAt) {
   let netRetry = 0, mediaRetry = 0, retryTimer = null, dead = false;
   const kill = () => { dead = true; clearTimeout(retryTimer);
     teardownHls(hlsObj); hlsObj = null; };
+  // 行動網路的緩衝要深一點：訊號在隧道、電梯、移動中會整段掉，
+  // 緩衝越深越撐得過去。桌機在區網不需要，深緩衝反而是多轉一堆用不到的段。
+  const mob = isMobile();
   hlsObj = new Hls({
-    maxBufferLength: 40, maxMaxBufferLength: 90,
+    maxBufferLength: mob ? 60 : 40, maxMaxBufferLength: mob ? 120 : 90,
+    // **這個 timeout 不能照行動網路的直覺改小。**下階是隨選轉碼的，
+    // 一段第一次被要的時候 ffmpeg 可能真的要跑十幾秒（4K 片源更久）。
+    // 改小的話會在「伺服器正常、只是還在轉」的時候誤判成網路失敗。
     fragLoadingTimeOut: 180000, manifestLoadingTimeOut: 60000, levelLoadingTimeOut: 60000,
     startPosition: t > 1 ? t : -1, appendErrorMaxRetry: 5,
+    // ABR：讓它自己挑起始階（-1），但**第一次的頻寬估計要保守**。
+    // hls.js 的預設是 5 Mbps —— 手機在 4G 邊緣開播會直接選到選不動的那一階，
+    // 然後卡住等它自己降下來。給一個行動網路撐得住的值，寧可開播後往上爬。
+    startLevel: -1,
+    abrEwmaDefaultEstimate: mob ? 1_200_000 : 5_000_000,
+    // 往上切保守、往下切果斷：往上切錯的代價是卡頓（要重新緩衝），
+    // 往下切錯的代價只是這幾秒畫質差一點。兩者不對稱，參數就不該對稱。
+    abrBandWidthUpFactor: mob ? 0.5 : 0.7,
+    abrBandWidthFactor: 0.9,
   });
   hlsObj.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
   hlsObj.on(Hls.Events.FRAG_LOADED, () => { netRetry = 0; mediaRetry = 0; });
+  // 自動模式下畫質是浮動的，選單上只寫「自動」不夠 —— 要看得到現在實際在哪一階，
+  // 不然使用者只會覺得「畫質怎麼忽好忽壞」而不知道是 ABR 在work。
+  hlsObj.on(Hls.Events.LEVEL_SWITCHED, (_, d) => {
+    const lv = hlsObj?.levels?.[d.level];
+    if (!lv) return;
+    curLevel = lv;
+    renderTags();
+  });
   hlsObj.on(Hls.Events.ERROR, (_, d) => {
     // destroy 之後 hls.js 仍可能送事件進來，這時候再去碰它就會炸
     if (dead || !hlsObj || !d.fatal) return;
@@ -916,6 +953,13 @@ function renderTags() {
       : `<span class="tg hdr" title="${m === 'fast' ? '快速色域轉換：色彩正確，高光會削掉' : '標準 tonemap：畫質最好'}">HDR → SDR${m === 'fast' ? '（快速）' : ''}</span>`);
   }
   if (info.bit_depth && info.bit_depth > 8) t.push(info.bit_depth + '-bit');
+  // 自動模式下 ABR 會自己上下切，標出「現在實際在哪一階」。只在自動、
+  // 而且真的有第二階可切的時候顯示 —— 使用者鎖死某一階時它是固定的，
+  // 再標一次只是雜訊。
+  if (mode === 'hls' && cfg.quality === 0 && curLevel && (hlsObj?.levels?.length || 0) > 1) {
+    const lab = curLevel.height ? `${curLevel.height}p` : '';
+    if (lab) t.push(`<span class="tg" title="自動調節：依目前網路速度選的畫質">自動 · ${esc(lab)}</span>`);
+  }
   box.innerHTML = t.map(x => x.startsWith('<') ? x : `<span class="tg">${esc(x)}</span>`).join('');
 }
 
@@ -1096,7 +1140,19 @@ v.addEventListener('play', syncPlayBtn);
 v.addEventListener('pause', () => { syncPlayBtn(); wake(); });
 v.addEventListener('play', () => { userPaused = false; });
 v.addEventListener('playing', () => { center(''); busy(''); });
-v.addEventListener('waiting', () => busy(mode === 'hls' ? '轉碼中' : '緩衝中'));
+// 卡住的原因有兩種，講錯會把人引導到錯的方向：伺服器還在轉碼（等一下就好），
+// 還是網路餵不動（那要等 ABR 降階）。已經在最低階還在等 = 網路問題。
+v.addEventListener('waiting', () => {
+  if (mode !== 'hls') return busy('緩衝中');
+  // **不能用 `currentLevel === 0` 判斷「在最低階」** —— level 的索引順序
+  // 由 hls.js 內部決定，不保證跟 master 裡的順序或碼率高低一致。
+  // 直接比碼率，才不會因為換一版 hls.js 就標反。
+  const lv = hlsObj?.levels || [];
+  const cur = lv[hlsObj?.currentLevel];
+  const lowest = lv.length > 1 && cur
+    && cur.bitrate <= Math.min(...lv.map(x => x.bitrate));
+  busy(lowest ? '網路較慢，已降到最低畫質' : '轉碼中');
+});
 v.addEventListener('canplay', () => { center(''); busy(''); });
 v.addEventListener('volumechange', syncVol);
 v.addEventListener('timeupdate', () => {

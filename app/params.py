@@ -269,9 +269,17 @@ _ALL: List[Param] = [
 
     _p("REMOTE_MAX_HEIGHT", HOT, type="int", default=720, apply=APPLY_HOT,
        section="遠端畫質", label="遠端解析度上限", minimum=0, maximum=4320,
-       help="0 = 不縮放"),
+       help="0 = 不縮放。這是「自動」模式的起始檔位；開了下面的高畫質頂階之後，"
+            "網路夠快時 ABR 可以再往上爬（但位元率一樣受下面那項管）"),
     _p("REMOTE_BITRATE_KBPS", HOT, type="int", default=2800, apply=APPLY_HOT,
-       section="遠端畫質", label="遠端位元率上限（kbps）", minimum=0),
+       section="遠端畫質", label="遠端位元率上限（kbps）", minimum=0,
+       help="**這一項才是真正保護上傳頻寬的東西。**解析度上限只決定畫面多大，"
+            "實際佔用的上傳頻寬由這裡封頂"),
+    _p("REMOTE_HIGH_RUNG", HOT, type="bool", default=True, apply=APPLY_HOT,
+       section="遠端畫質", label="遠端高畫質頂階",
+       help="在遠端階梯上面多發一階更高解析度（碼率仍受「遠端位元率上限」管）。"
+            "給大螢幕用：同樣吃 2800 kbps，1080p 在電腦上比 720p 清楚得多。"
+            "網路不夠時 ABR 會自己降回來，所以手機不會因此變卡"),
     _p("LAN_BITRATE_KBPS", HOT, type="int", default=0, apply=APPLY_HOT,
        section="遠端畫質", label="區網位元率上限（kbps）", minimum=0,
        help="0 = 不鎖"),
@@ -281,6 +289,11 @@ _ALL: List[Param] = [
        help="小於這個大小的影片會被忽略，用來擋預告片與樣本檔"),
     _p("SCAN_EXCLUDE_DIR_PREFIXES", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的資料夾前綴", help="逗號分隔，比對名稱開頭，整棵子樹都不走訪"),
+    _p("SCAN_MIN_SIZE_EXEMPT_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
+       label="不套用大小門檻的資料夾",
+       help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
+            "這些資料夾底下的影片不論多小都收 —— 用來收特定目錄裡的短片，"
+            "而不必為它把全域的 MIN_FILE_MB 調低（調低會把手機錄的短片全部拉進來）"),
     _p("SCAN_EXCLUDE_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的副檔名", help="逗號分隔。跟下面同時設定時，這裡優先"),
     _p("SCAN_ONLY_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",

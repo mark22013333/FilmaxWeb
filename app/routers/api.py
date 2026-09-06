@@ -162,12 +162,15 @@ def library(
         where.append(f"EXISTS(SELECT 1 FROM media_file f2 WHERE f2.item_id=i.id AND {acl_frag})")
         params += acl_args
 
+    # 每一種排序都要有決定性的收尾（`i.id`）—— 理由見 photos() 的同一段註解：
+    # 並列的資料列在兩次查詢之間順序不保證，而分頁是重新查一次。
+    # 「同一天加入的一批」「同年份」「都沒有評分（COALESCE 成 0）」都會並列。
     order = {
-        "added": "i.added_at DESC",
-        "title": "i.sort_title ASC",
-        "year": "COALESCE(i.year,0) DESC, i.title ASC",
-        "rating": "COALESCE(i.rating,0) DESC, i.title ASC",
-    }.get(sort, "i.added_at DESC")
+        "added": "i.added_at DESC, i.id DESC",
+        "title": "i.sort_title ASC, i.id ASC",
+        "year": "COALESCE(i.year,0) DESC, i.title ASC, i.id ASC",
+        "rating": "COALESCE(i.rating,0) DESC, i.title ASC, i.id ASC",
+    }.get(sort, "i.added_at DESC, i.id DESC")
 
     page = max(1, page)
     page_size = min(max(1, page_size), 200)
@@ -286,6 +289,16 @@ def item_detail(item_id: int, request: Request):
     return item
 
 
+def _qs(**kw) -> str:
+    """把非 None 的參數組成查詢字串（含開頭的 `?`）；全是 None 就回空字串。
+
+    `h=None` 與 `h=0` 是不同的意思（沒指定 vs 原畫質），所以只能濾掉 None，
+    不能用真假值判斷 —— `if v` 會把 0 一起丟掉。
+    """
+    parts = [f"{k}={v}" for k, v in kw.items() if v is not None]
+    return "?" + "&".join(parts) if parts else ""
+
+
 @router.get("/play/{file_id}")
 def play_info(file_id: int, request: Request,
               h: Optional[int] = None, a: Optional[int] = None):
@@ -354,30 +367,10 @@ def play_info(file_id: int, request: Request,
     # 「遠端降畫質」的保護，把上傳頻寬吃光。
     ip = auth.client_ip(request.scope)
     remote = not auth.is_local_network(ip)
-    # 這幾個設定裡 0 是「不縮放／不鎖」，不是「沒設定」。
-    # 原本寫 `settings.remote_max_height or 720`，於是 REMOTE_MAX_HEIGHT=0
-    # 不是不限，而是**退回 720** —— 與說明相反。
-    mh = int(settings.max_height or 0)
-    rmh = int(settings.remote_max_height or 0)
-    if remote:
-        caps = [x for x in (rmh, mh) if x > 0]
-        default_h = min(caps) if caps else 0
-        default_b = settings.remote_bitrate_kbps
-    else:
-        default_h = mh
-        default_b = settings.lan_bitrate_kbps
-
-    # h 是使用者在畫質選單裡挑的：None = 自動、0 = 原畫質（不縮放）、其餘 = 指定高度。
-    # 原本寫 `h or default_h`，於是「原畫質」送來的 0 被當成「沒指定」，
-    # 解析度回到自動值、位元率也還是被鎖住 —— 按了選單什麼都沒改變。
-    chosen_h = default_h if h is None else max(0, int(h))
-    if h is None:
-        chosen_b = default_b
-    elif chosen_h == 0 or (mh and chosen_h >= mh):
-        chosen_b = 0                      # 明確要原畫質（或已達上限）就不鎖峰值
-    else:
-        chosen_b = default_b
-    profile = hls.profile_key(chosen_h, chosen_a, chosen_b)
+    # 解析度／位元率的政策集中在 hls.quality_policy() —— master.m3u8 要問的是
+    # 同一個答案（0 = 不縮放／不鎖，不是「沒設定」；h=0 是「原畫質」不是「沒指定」，
+    # 這兩個坑的說明都在那個函式裡）。
+    chosen_h, chosen_b = hls.quality_policy(remote, h)
 
     # 遠端 + 這個檔案有上階可給 → **不要走 direct**。direct 沒有階梯可以降：
     # 那 7 部走 direct 的 mp4 裡有 7.6 GB／4,661 kbps 與 4.8 GB／4,508 kbps
@@ -438,7 +431,17 @@ def play_info(file_id: int, request: Request,
         "audio_index": chosen_a if chosen_a is not None else _default_audio(audio_tracks),
         "audio_channels_out": settings.audio_channels,
         "direct_url": f"/api/stream/{file_id}",
-        "hls_url": f"/api/hls/{file_id}/index.m3u8?p={profile}",
+        # **一定要指到 master，不是 index。**指到 index 等於直接給了單一階的
+        # 媒體播放清單 —— hls.js 的 ABR 引擎沒有第二階可選，卡頓時無階可降，
+        # 而 `build_master()` 裡那整套「區網一階、遠端整條階梯」的邏輯
+        # 一行都不會被執行到。h／a 要原樣帶過去：master 要照使用者選的那一檔
+        # 當階梯的頂端（見 abr_ladder）。
+        #
+        # **`h` 沒給的時候不能自己補上 chosen_h。**補了的話 master 端點就分不出
+        # 「自動」與「手動挑了剛好等於預設的那一檔」—— 而這兩者要發的階梯不一樣：
+        # 自動會多發一階高畫質頂階，手動不會（挑的那一檔就是他要的上限）。
+        "hls_url": f"/api/hls/{file_id}/master.m3u8" + _qs(
+            h=(chosen_h if h is not None else None), a=chosen_a),
         "remote": remote,
         "client_ip": ip,
         "quality": {"height": chosen_h, "bitrate_kbps": chosen_b, "ladder": ladder,
@@ -920,9 +923,14 @@ def photos(request: Request, folder: Optional[str] = None, q: Optional[str] = No
     # sort_ts 是寫入時算好的排序鍵。原本是 COALESCE(taken_at, mtime)，
     # 而那兩欄是格式不同的字串 —— 字串比大小的結果是「同一天裡只有 mtime 的
     # 照片永遠排在有 EXIF 的前面」，因為 ' '(0x20) < 'T'(0x54)。
+    # **每一種排序都要有決定性的收尾（`id`）。**沒有的話，並列的那幾筆在
+    # 兩次查詢之間的順序不保證一樣 —— 而分頁是 LIMIT/OFFSET，第 2 頁是重新
+    # 查一次。順序一變，交界處就會有相片重複出現或整個被跳過。
+    # 這座片庫實測有 740 組同檔名、325 組同大小，所以這不是理論風險。
+    # 無限捲動（P-2）會把這個機率放大到每次瀏覽都踩得到。
     order = {"taken": "sort_ts DESC, id DESC",
-             "name": "filename COLLATE NOCASE",
-             "size": "size DESC",
+             "name": "filename COLLATE NOCASE, id DESC",
+             "size": "size DESC, id DESC",
              "added": "added_at DESC, id DESC"}.get(sort, "sort_ts DESC, id DESC")
     total = db.q1(f"SELECT COUNT(*) c FROM photo{sql_where}", tuple(params))["c"]
     rows = db.q(f"""SELECT id, folder, filename, ext, size, mtime, width, height,
@@ -983,8 +991,14 @@ def photo_detail(photo_id: int, request: Request):
 # ------------------------------- 文件庫（PDF） -------------------------------
 @router.get("/documents")
 def documents(request: Request, folder: Optional[str] = None, q: Optional[str] = None,
-              sort: str = "name", page: int = 1, page_size: int = 60):
-    """文件列表。形狀跟 /photos 一致，前端才能共用分頁與資料夾那組元件。"""
+              sort: str = "name", page: int = 1, page_size: int = 60,
+              subtree: bool = False):
+    """文件列表。形狀跟 /photos 一致，前端才能共用分頁與資料夾那組元件。
+
+    subtree=true 時 folder 當「子樹根」用，會連同底下所有層一起列。
+    資料夾樹要能選中上層看見底下全部，靠的就是這個；預設仍是精確比對，
+    舊的呼叫方（與 acl_test）行為不變。
+    """
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
     where, params = ["probe_state='ok'"], []
@@ -993,18 +1007,27 @@ def documents(request: Request, folder: Optional[str] = None, q: Optional[str] =
         where.append(af)
         params += aa
     if folder:
-        where.append("folder=?")
-        params.append(folder)
+        if subtree:
+            sf, sa = acl.subtree_sql("folder", folder)
+            if sf:
+                where.append(sf)
+                params += sa
+        else:
+            where.append("folder=?")
+            params.append(folder)
     if q:
         where.append("(filename LIKE ? OR folder LIKE ?)")
         params += [f"%{q}%", f"%{q}%"]
     sql_where = " WHERE " + " AND ".join(where)
     # 白名單排序。文件的預設是檔名而不是時間 —— 一套規格書或一系列講義
     # 的閱讀順序是編號，不是誰先被下載。
-    order = {"name": "filename COLLATE NOCASE",
+    # 收尾一律加 id，理由同 photos()。文件庫最容易並列 —— 同一份規格書的
+    # 不同版本常常同名（放在不同資料夾），而 filename 排序只比檔名。
+    order = {"name": "filename COLLATE NOCASE, id DESC",
              "time": "sort_ts DESC, id DESC",
-             "size": "size DESC",
-             "added": "added_at DESC, id DESC"}.get(sort, "filename COLLATE NOCASE")
+             "size": "size DESC, id DESC",
+             "added": "added_at DESC, id DESC"}.get(sort,
+                                                    "filename COLLATE NOCASE, id DESC")
     total = db.q1(f"SELECT COUNT(*) c FROM document{sql_where}", tuple(params))["c"]
     rows = db.q(f"""SELECT id, folder, filename, ext, size, mtime, sort_ts, pages
                     FROM document{sql_where} ORDER BY {order} LIMIT ? OFFSET ?""",
@@ -1014,13 +1037,118 @@ def documents(request: Request, folder: Optional[str] = None, q: Optional[str] =
 
 
 @router.get("/documents/folders")
-def document_folders(request: Request):
-    """有文件的資料夾清單，附份數。"""
+def document_folders(request: Request, prefix: Optional[str] = None,
+                     flat: bool = False):
+    """資料夾導覽。預設回「prefix 底下的下一層節點」，不是整棵樹。
+
+    這裡本來是把所有資料夾一次攤平回去 —— 實測有 452 個、97% 落在第 7～8 層，
+    前端一次畫成 452 個 chip，而且名字只顯示最後一層，於是畫面上全是分不出來的
+    「PDF」「教用」。改成一次只回一層，深度就不再是問題。
+
+    flat=true 保留舊的扁平清單（相片牆與 acl_test 還在用那個形狀）。
+    """
     af, aa = acl.filter_sql(request, "folder")
+    if flat:
+        rows = db.q(f"""SELECT folder, COUNT(*) c, SUM(size) bytes, MAX(sort_ts) latest
+                       FROM document WHERE probe_state='ok'{(" AND " + af) if af else ""}
+                       GROUP BY folder ORDER BY folder COLLATE NOCASE""", aa)
+        return {"items": [db.row_to_dict(r) for r in rows]}
+
+    where, params = ["probe_state='ok'"], list(aa)
+    if af:
+        where.append(af)
+    sf, sa = acl.subtree_sql("folder", prefix or "")
+    if sf:
+        where.append(sf)
+        params += sa
     rows = db.q(f"""SELECT folder, COUNT(*) c, SUM(size) bytes, MAX(sort_ts) latest
-                   FROM document WHERE probe_state='ok'{(" AND " + af) if af else ""}
-                   GROUP BY folder ORDER BY folder COLLATE NOCASE""", aa)
-    return {"items": [db.row_to_dict(r) for r in rows]}
+                   FROM document WHERE {" AND ".join(where)}
+                   GROUP BY folder""", tuple(params))
+    out = _folder_level(rows, prefix or "")
+    # 沒指定 prefix 時，若最外層只有一個節點就自動往下走到第一個分岔為止。
+    # 這個庫的根就是這種形狀（/媒體資料庫 → Book → …），不跳過的話使用者
+    # 開啟文件牆看到的第一個畫面是「一個選項」，等於白點一次。
+    if prefix is None:
+        for _ in range(8):        # 上限純粹是防呆，避免資料異常時在這裡空轉
+            if len(out["items"]) != 1 or not out["items"][0]["has_children"]:
+                break
+            out = _folder_level(rows, out["items"][0]["folder"])
+    return out
+
+
+CHAIN_MAX = 2          # 單鏈穿透一次最多併幾段（見 _folder_level 的說明）
+
+
+def _folder_level(rows, prefix: str) -> Dict[str, Any]:
+    """把子樹裡的資料夾統計，聚合成「下一層」的節點清單。
+
+    每個節點的 c 是**遞迴總數**（含所有子孫）而不是本層的數量 —— 父節點的
+    份數若只算本層，這個庫裡幾乎每個父節點都會顯示 0，導覽時完全看不出
+    哪一條路底下有東西。
+
+    單鏈穿透：一個節點如果只有一條路可走（唯一子節點、且自己本層沒有檔案），
+    就把那一段一路併進顯示名稱，例如「資料庫 / Book / 國小講義」。
+    不這樣做的話，這個庫的前三層每層都只有一個選項，等於強迫使用者連點三次
+    才看得到第一個真正的分岔。
+    """
+    base = acl._norm(prefix) if prefix else "/"
+    blen = len(base)
+
+    # 先把每一列切成「相對於 base 的路徑片段」，之後全部在這份清單上算，
+    # 不再回頭碰 SQL。這個庫只有 452 個資料夾，整批放在記憶體裡很便宜。
+    split: List[Any] = []
+    for r in rows:
+        folder = r["folder"]
+        if not folder.startswith(base):
+            continue
+        segs = [s for s in folder[blen:].split("/") if s]
+        if segs:                          # 沒有 segs 的是前綴自己那一列，不是子節點
+            split.append((segs, r["c"] or 0, r["bytes"] or 0, r["latest"]))
+
+    # seg -> 這個子樹的統計。self 是「剛好停在這一層」的份數，
+    # kids 是再下一段的名字（用來判斷還有沒有分岔）。
+    level: Dict[str, Dict[str, Any]] = {}
+    for segs, c, b, latest in split:
+        n = level.setdefault(segs[0], {"c": 0, "bytes": 0, "latest": None,
+                                       "self": 0, "kids": set()})
+        n["c"] += c
+        n["bytes"] += b
+        if latest is not None:
+            n["latest"] = max(n["latest"] or 0, latest)
+        if len(segs) == 1:
+            n["self"] += c
+        else:
+            n["kids"].add(segs[1])
+
+    items = []
+    for seg, n in level.items():
+        chain = [seg]                     # 已經併進來的路徑片段
+        # 單鏈穿透：只有一條路可走就一路往下併。每一步都在 split 上重算
+        # 下一段的分岔情形，不遞迴、不重查 DB。
+        #
+        # 最多併 CHAIN_MAX 段：這個庫的資料夾名字本來就長（「115學年上學期 國小
+        # 康軒版 課習教PDF(含習作、課本、教師手冊)…」），無限併下去會做出一個
+        # 塞滿整個側欄、還是看不出重點的節點 —— 那只是把「太多選項」換成
+        # 「太長的一個選項」。併不完的部分留給下一次展開。
+        while len(chain) < CHAIN_MAX and n["self"] == 0 and len(n["kids"]) == 1:
+            chain.append(next(iter(n["kids"])))
+            d = len(chain)
+            selfc, kids = 0, set()
+            for segs, c, _b, _l in split:
+                if len(segs) < d or segs[:d] != chain:
+                    continue
+                if len(segs) == d:
+                    selfc += c
+                else:
+                    kids.add(segs[d])
+            n = {"self": selfc, "kids": kids}
+        items.append({"folder": base + "/".join(chain), "name": " / ".join(chain),
+                      "c": level[seg]["c"], "bytes": level[seg]["bytes"],
+                      "latest": level[seg]["latest"],
+                      # 併完之後還有分岔（或併不動但底下還有層）才算有子節點
+                      "has_children": bool(n["kids"])})
+    items.sort(key=lambda x: x["name"].casefold())
+    return {"items": items, "prefix": prefix or ""}
 
 
 @router.get("/documents/{doc_id}")

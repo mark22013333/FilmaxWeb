@@ -222,14 +222,141 @@ def _stream_inf(bw: int, avg: int, w: int, h: int, codecs: Optional[str]) -> str
     return "#EXT-X-STREAM-INF:" + ",".join(parts)
 
 
+# 遠端的轉碼階梯（J 章第 1 層）。每一項是「相對主階的高度、相對主階的碼率」。
+# **1.0 那一項一定要在，而且要排第一** —— 它就是原本唯一的那一階，
+# 使用者在畫質選單挑的值（chosen_h／chosen_b）落在它身上。
+#
+# 為什麼是比例不是絕對值：主階由 REMOTE_MAX_HEIGHT 與使用者的選擇決定，
+# 寫死 480／360 的話，主階被調成 480p 時階梯會變成 480／480／360 —— 
+# 兩階一模一樣，ABR 白切一次。
+_ABR_STEPS: List[Tuple[float, float]] = [
+    (1.0, 1.0),        # 主階：使用者選的（或遠端預設）那一檔
+    (0.667, 0.45),     # 中階：720p → 480p、2800 → 1260 kbps
+    (0.5, 0.25),       # 低階：720p → 360p、2800 → 700 kbps
+]
+# 階與階之間至少要差這麼多高度，否則就不發這一階。兩階只差 60px 的話
+# ABR 切過去省不到頻寬，卻要多養一份轉碼快取。
+_ABR_MIN_GAP = 100
+# 低於這個高度就不再往下發 —— 再低畫質已經不能看，不如讓 ABR 卡在低階
+# 重試（那至少還播得動），而不是給一個沒有人想看的畫面。
+_ABR_MIN_HEIGHT = 240
+
+
+def _high_rung(src_h: int, base_h: int, base_b: int,
+               auto: bool = True) -> Optional[Tuple[int, int]]:
+    """比主階更高的那一階（B 案）。不該發就回 None。
+
+    **這一階只放寬解析度，不放寬碼率** —— 碼率上限（REMOTE_BITRATE_KBPS）才是
+    真正保護上傳頻寬的東西，解析度上限只決定畫面多大。同樣吃 2800 kbps，
+    1080p 在 27 吋螢幕上比 720p 清楚得多，而佔用的上傳頻寬**一模一樣**。
+
+    網路不夠的裝置不會因此變卡：ABR 會自己降回主階（手機在 4G 上幾乎不會
+    停在這一階）。所以這是「讓大螢幕拿得到」，不是「強迫所有人拿」。
+    """
+    if not settings.remote_high_rung:
+        return None
+    # **使用者手動挑過畫質就不要自作主張往上加。**挑「480p」的意思是
+    # 「我最多要 480p」（省流量、或那條線路就是不行），不是「從 480p 開始爬」。
+    # 在上面補一階 1080p 等於把他按掉的東西又塞回去。
+    if not auto:
+        return None
+    if base_h <= 0:
+        return None               # 主階已經是「不縮放」，沒有更高的可給
+    if base_b <= 0:
+        return None               # 主階已經不鎖峰值 —— 使用者手動要了原畫質那一類
+    # 天花板取兩個之中低的：片源本身，以及全域的 TRANSCODE_MAX_HEIGHT。
+    # **不能超過 TRANSCODE_MAX_HEIGHT** —— 那是整個服務的解析度上限，
+    # 遠端的階梯沒有理由比區網還高。
+    mh = int(settings.max_height or 0)
+    ceiling = min(src_h, mh) if mh > 0 else src_h
+    if ceiling - base_h < _ABR_MIN_GAP:
+        return None               # 跟主階差太少，多發一階換不到畫質
+    return (ceiling - ceiling % 2, base_b)
+
+
+def abr_ladder(src_w: int, src_h: int, base_h: int, base_b: int,
+               auto: bool = True) -> List[Tuple[int, int]]:
+    """遠端轉碼階梯：回傳 [(高度, 碼率kbps), ...]，最好的排前面。
+
+    `base_h` 0 代表「不縮放」；那種情況下階梯要從片源的實際高度往下算，
+    不然 0 乘以任何比例都還是 0，整條階梯會退化成三個「不縮放」。
+
+    `auto` 是「使用者沒有手動挑畫質」。手動挑過的話高畫質頂階不發 ——
+    他挑的那一檔就是他要的上限（見 `_high_rung`）。
+    """
+    top = base_h if base_h > 0 else src_h
+    # base_b 0 是「不鎖峰值」。階梯下面幾階一定要有一個數字才算得出碼率，
+    # 用片源尺寸推一個保守值（跟 build_master 的 lower_cap 同一條公式）。
+    top_b = base_b if base_b > 0 else max(1500, int(top * top * 16 / 9 * 4 / 1000))
+
+    out: List[Tuple[int, int]] = []
+    # 高畫質頂階排在主階前面（master 裡最好的要排前面）。
+    high = _high_rung(src_h, base_h, base_b, auto=auto)
+    if high:
+        out.append(high)
+    for i, (fh, fb) in enumerate(_ABR_STEPS):
+        h = top if i == 0 else int(top * fh) // 2 * 2
+        b = base_b if i == 0 else max(300, int(top_b * fb))
+        if i == 0:
+            out.append((base_h, b))       # 主階照原樣傳回（0 = 不縮放要保住）
+            continue
+        if h < _ABR_MIN_HEIGHT or h >= src_h:
+            continue
+        # 跟已經收進來的每一階都要拉開距離（主階是 0 時比的是片源高度）
+        prev = [(top if ph == 0 else ph) for ph, _ in out]
+        if any(abs(h - x) < _ABR_MIN_GAP for x in prev):
+            continue
+        out.append((h, b))
+    return out
+
+
+def quality_policy(remote: bool, h: Optional[int]) -> Tuple[int, int]:
+    """這條鏈路 ＋ 使用者的選擇 → (解析度上限, 位元率上限kbps)。
+
+    **兩個端點必須問同一個函式。**`/api/play` 決定 `hls_url` 要帶什麼、
+    `master.m3u8` 決定階梯的頂端是哪一檔 —— 各算各的話，master 會發出一份
+    跟播放資訊講好的不一樣的階梯（實際發生過的形狀：master 少了位元率上限，
+    遠端的頂階變成「不鎖峰值」，REMOTE_BITRATE_KBPS 整個失效）。
+
+    h 是使用者在畫質選單挑的：None = 自動、0 = 原畫質（不縮放）、其餘 = 指定高度。
+    """
+    # 這幾個設定裡 0 是「不縮放／不鎖」，不是「沒設定」。
+    mh = int(settings.max_height or 0)
+    rmh = int(settings.remote_max_height or 0)
+    if remote:
+        caps = [x for x in (rmh, mh) if x > 0]
+        default_h = min(caps) if caps else 0
+        default_b = settings.remote_bitrate_kbps
+    else:
+        default_h = mh
+        default_b = settings.lan_bitrate_kbps
+
+    chosen_h = default_h if h is None else max(0, int(h))
+    if h is None:
+        chosen_b = default_b
+    elif chosen_h == 0 or (mh and chosen_h >= mh):
+        chosen_b = 0                      # 明確要原畫質（或已達上限）就不鎖峰值
+    else:
+        chosen_b = default_b
+    return chosen_h, chosen_b
+
+
 def build_master(file_id: int, profile: str, remote: bool = False,
-                 duration: float = 0.0) -> str:
-    """master playlist。**區網發一階、遠端發兩階。**
+                 duration: float = 0.0, auto: bool = True) -> str:
+    """master playlist。**區網發一階、遠端發 remux 上階 ＋ 一條轉碼階梯。**
 
     區網不需要 ABR：鏈路夠寬，發單一的上階（remux）就是零轉碼路徑 ——
     這是整個設計最確定會兌現的那一塊，所以它是規則不是最佳化。
-    遠端保留兩階讓客戶端自己按緩衝水位選（伺服器不猜頻寬 —— 那正是
+    遠端發多階讓客戶端自己按緩衝水位選（伺服器不猜頻寬 —— 那正是
     Netflix 在 50 萬使用者上驗證後放棄的做法）。
+
+    **為什麼遠端的轉碼階不只一階**（J 章第 1 層）：上階的峰值是 21.7 Mbps，
+    行動網路根本選不到它 —— 也就是說在只有「上階＋單一轉碼階」的形狀下，
+    遠端實際上只有一階可用，卡頓時無階可降。手機在收訊起伏的地方看片，
+    需要的正是那條往下的路。
+
+    `auto` = 使用者沒有手動挑畫質。手動挑過的話不發高畫質頂階（那一檔就是
+    他要的上限）。預設 True 是為了讓既有呼叫端與測試不必全部改。
     """
     row = db.q1("""SELECT width, height, bitrate, size, video_profile, video_level
                    FROM media_file WHERE id=?""", (file_id,))
@@ -238,7 +365,6 @@ def build_master(file_id: int, profile: str, remote: bool = False,
     prof_h, prof_a, prof_b, _ = _parse_profile(profile)
     want = settings.max_height if prof_h is None else prof_h
     target_h = min(want, h) if want else h        # 0 = 不縮放
-    target_w = int(w * target_h / h / 2) * 2 if h else 1920
 
     rungs = rungs_for(file_id, duration) if duration > 0 else [RUNG_TRANSCODE]
     lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
@@ -256,21 +382,37 @@ def build_master(file_id: int, profile: str, remote: bool = False,
                                             row["video_level"] if row else None))
             upper_profile = profile_key(0, prof_a, 0, RUNG_REMUX)
 
-    lower_profile = profile_key(prof_h, prof_a, prof_b, RUNG_TRANSCODE)
-    # 下階的 BANDWIDTH 填 VBV 上限（保證的天花板）、AVERAGE 填目標碼率。
-    lower_cap = prof_b * 1000 if prof_b else max(1_500_000, int(target_w * target_h * 4))
-    lower_avg = prof_b * 1000 if prof_b else 0
-    lower = _stream_inf(lower_cap, lower_avg, target_w, target_h,
-                        codecs_attr("High", _level_int(target_h)))
+    def transcode_inf(step_h: int, step_b: int) -> Tuple[str, str]:
+        """一階轉碼的 (STREAM-INF, 播放清單網址)。
+
+        解析度一律走 `media.scaled_size()` —— 它跟 `build_video_filters()` 是
+        同一條規則，所以 master 上寫的 RESOLUTION 就是 ffmpeg 真的會吐出來的
+        尺寸。自己再算一次 `w * h / 2 * 2` 遲早會跟濾鏡鏈分岔。
+        """
+        out_w, out_h = media.scaled_size(w, h, step_h)
+        # BANDWIDTH 填 VBV 上限（保證的天花板）、AVERAGE 填目標碼率。
+        cap = step_b * 1000 if step_b else max(1_500_000, int(out_w * out_h * 4))
+        avg_b = step_b * 1000 if step_b else 0
+        inf = _stream_inf(cap, avg_b, out_w, out_h,
+                          codecs_attr("High", _level_int(out_h)))
+        return inf, f"index.m3u8?p={profile_key(step_h, prof_a, step_b, RUNG_TRANSCODE)}"
 
     if upper and not remote:
         # 區網：只發上階。播放全程不會有任何 ffmpeg 被啟動。
         lines += [upper, f"index.m3u8?p={upper_profile}"]
-    elif upper:
-        lines += [upper, f"index.m3u8?p={upper_profile}", lower,
-                  f"index.m3u8?p={lower_profile}"]
-    else:
-        lines += [lower, f"index.m3u8?p={lower_profile}"]
+        return "\n".join(lines) + "\n"
+
+    if upper:
+        lines += [upper, f"index.m3u8?p={upper_profile}"]
+
+    # 遠端發整條階梯讓 ABR 有得降；區網（走到這裡代表沒有上階可給）維持單一階
+    # —— 鏈路夠寬，多發幾階只是多養幾份轉碼快取，換不到東西。
+    base_h = prof_h if prof_h is not None else target_h
+    steps = (abr_ladder(w, h, base_h, prof_b, auto=auto) if remote
+             else [(base_h, prof_b)])
+    for step_h, step_b in steps:
+        inf, url = transcode_inf(step_h, step_b)
+        lines += [inf, url]
     return "\n".join(lines) + "\n"
 
 

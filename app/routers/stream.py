@@ -134,11 +134,14 @@ def _duration_or_404(f: dict) -> float:
 def hls_master(file_id: int, request: Request, h: Optional[int] = None, a: Optional[int] = None):
     f = _file_or_404(file_id, request)
     duration = _duration_or_404(f)
-    profile = hls.profile_key(h, a)
-    # 區網發一階、遠端發兩階（J 章第 0 層）。**一律走 auth.client_ip()** ——
+    # 區網發一階、遠端發整條階梯（J 章第 0／1 層）。**一律走 auth.client_ip()** ——
     # 自己在這裡解 X-Forwarded-For 的話，送一個內網位址就能讓遠端拿到
     # 只給區網的那一階（21.7 Mbps 峰值），把上傳頻寬吃光。
     remote = not auth.is_local_network(auth.client_ip(request.scope))
+    # 位元率上限一定要跟 /api/play 算出同一個值，不然階梯的頂階會變成
+    # 「不鎖峰值」—— REMOTE_BITRATE_KBPS 就整個失效了。
+    chosen_h, chosen_b = hls.quality_policy(remote, h)
+    profile = hls.profile_key(chosen_h, a, chosen_b)
     # 開播插隊：這個檔案還沒算好邊界表的話，把它排到佇列最前面。
     # **不等它** —— 一個檔案要 30 秒，等於開不起來。這一次照舊發單階，
     # 算好之後下一次開播就有上階（keyframes.request_soon 的註解寫了同一件事）。
@@ -152,8 +155,10 @@ def hls_master(file_id: int, request: Request, h: Optional[int] = None, a: Optio
                 keyframes.start_background()
         except Exception as e:
             log.debug("邊界表插隊失敗 file=%s: %s", file_id, e)
+    # h 沒帶 = 使用者沒有手動挑畫質。這一維決定要不要多發高畫質頂階 ——
+    # 手動挑過的那一檔就是他要的上限，不能自作主張在上面再加一階。
     return PlainTextResponse(hls.build_master(file_id, profile, remote=remote,
-                                              duration=duration),
+                                              duration=duration, auto=(h is None)),
                              media_type="application/vnd.apple.mpegurl")
 
 

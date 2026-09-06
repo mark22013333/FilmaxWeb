@@ -22,6 +22,11 @@ os.environ.update({
     "HLS_SEGMENT_SECONDS": "6", "AUDIO_BITRATE_KBPS": "192",
     "AUDIO_CHANNELS": "2", "TRANSCODE_MAX_HEIGHT": "1080",
     "HLS_TWO_RUNG": "true",
+    # 階梯與政策的測試都拿這兩個當基準，釘住才不會被開發機的值影響
+    "REMOTE_MAX_HEIGHT": "720", "REMOTE_BITRATE_KBPS": "2800",
+    "LAN_BITRATE_KBPS": "0",
+    # 高畫質頂階（B 案）預設開著；下面有一段會把它關掉再驗一次
+    "REMOTE_HIGH_RUNG": "true",
 })
 sys.path.insert(0, str(ROOT))
 
@@ -137,7 +142,9 @@ head("[J 0] master playlist")
 
 m_remote = hls.build_master(fid, lower, remote=True, duration=DUR)
 m_lan = hls.build_master(fid, lower, remote=False, duration=DUR)
-check("遠端發兩階", m_remote.count("#EXT-X-STREAM-INF") == 2, m_remote)
+# 上階 ＋ 一條轉碼階梯（J 章第 1 層）。上階的峰值 21.7 Mbps 行動網路選不到，
+# 所以「上階＋單一轉碼階」等於遠端只有一階可用、卡頓時無階可降。
+check("遠端發上階＋整條階梯（不只兩階）", m_remote.count("#EXT-X-STREAM-INF") >= 3, m_remote)
 check("區網只發一階（零轉碼路徑）", m_lan.count("#EXT-X-STREAM-INF") == 1, m_lan)
 check("區網那一階是上階", f"?p={upper}" in m_lan and f"?p={lower}" not in m_lan, m_lan)
 
@@ -158,13 +165,134 @@ up_np = [l for l in m_np.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
 check("推不出 profile／level 就整個省略 CODECS（規格允許；填錯會被 Safari 拒收）",
       "CODECS" not in up_np, up_np)
 
-second = [l for l in m_remote.splitlines() if l.startswith("#EXT-X-STREAM-INF")][1]
-check("下階的 BANDWIDTH 是 VBV 上限", "BANDWIDTH=8000000" in second, second)
-check("下階的解析度是縮放後的", "RESOLUTION=" in second and "x960" not in second, second)
+# 主階（使用者選的那一檔）在階梯裡，但**不保證是第 1 行** —— 自動模式下
+# 上面還有一階高畫質頂階。用碼率去找它，不要用位置。
+infs = [l for l in m_remote.splitlines() if l.startswith("#EXT-X-STREAM-INF")]
+base_inf = [l for l in infs if "BANDWIDTH=8000000" in l and "x960" not in l]
+check("主轉碼階的 BANDWIDTH 是 VBV 上限", len(base_inf) == 1, infs)
+check("主轉碼階的解析度是縮放後的",
+      base_inf and "RESOLUTION=" in base_inf[0] and "x960" not in base_inf[0], base_inf)
 
 m_single = hls.build_master(fid_hevc, lower, remote=True, duration=DUR)
-check("沒有上階可給 → 遠端也只發一階", m_single.count("#EXT-X-STREAM-INF") == 1)
-check("那一階是下階", f"?p={lower}" in m_single, m_single)
+check("沒有上階可給 → 遠端仍然發得出轉碼階梯（這正是最需要降階的片源）",
+      m_single.count("#EXT-X-STREAM-INF") >= 2, m_single)
+check("階梯的頂端是使用者選的那一檔", f"?p={lower}" in m_single, m_single)
+check("沒有上階時不會混進 m1 的階", "_m1" not in m_single, m_single)
+
+m_single_lan = hls.build_master(fid_hevc, lower, remote=False, duration=DUR)
+check("區網沒有上階 → 只發單一轉碼階（不必多養快取）",
+      m_single_lan.count("#EXT-X-STREAM-INF") == 1, m_single_lan)
+
+
+# ============================================================ 轉碼階梯
+head("[J 1] 遠端的轉碼階梯（ABR 要有得降）")
+
+# auto=False = 使用者手動挑過畫質，不加高畫質頂階；先驗這條乾淨的階梯。
+lad = hls.abr_ladder(1920, 1080, 720, 2800, auto=False)
+check("主階排第一，而且就是傳進來的那一檔（使用者選的）",
+      lad[0] == (720, 2800), lad)
+check("階梯往下走，不是往上", [x[0] for x in lad] == sorted([x[0] for x in lad], reverse=True), lad)
+check("碼率也跟著往下", [x[1] for x in lad] == sorted([x[1] for x in lad], reverse=True), lad)
+check("三階（720/480/360）", len(lad) == 3, lad)
+
+check("每一階的高度都不重複（重複的話 ABR 白切一次）",
+      len({x[0] for x in lad}) == len(lad), lad)
+gaps = [lad[i][0] - lad[i + 1][0] for i in range(len(lad) - 1)]
+check("階與階至少差 100px（差太少省不到頻寬，卻要多養一份快取）",
+      all(g >= 100 for g in gaps), gaps)
+
+# 主階被調低時階梯要跟著縮，不能寫死 480／360
+lad_low = hls.abr_ladder(1920, 1080, 480, 1400, auto=False)
+check("主階 480p 時階梯從 480 往下（不是還在發 480）",
+      lad_low[0][0] == 480 and all(x[0] < 480 for x in lad_low[1:]), lad_low)
+check("不會發低到不能看的階（240p 以下就停）",
+      all(x[0] >= 240 for x in lad_low), lad_low)
+
+lad_orig = hls.abr_ladder(1920, 1080, 0, 0)
+check("主階是「原畫質」(0) → 0 要原樣保住，不能被當成高度 0",
+      lad_orig[0] == (0, 0), lad_orig)
+check("原畫質底下的階梯從片源實際高度往下算（不是 0 乘比例還是 0）",
+      len(lad_orig) > 1 and all(0 < x[0] < 1080 for x in lad_orig[1:]), lad_orig)
+check("原畫質底下的階都有碼率（0 = 不鎖只能給主階，下面幾階要算得出數字）",
+      all(x[1] > 0 for x in lad_orig[1:]), lad_orig)
+
+lad_small = hls.abr_ladder(640, 360, 720, 2800, auto=False)
+check("片源比主階還小 → 不發比片源高的階（不放大）",
+      all((x[0] == 720 or x[0] < 360) for x in lad_small), lad_small)
+
+
+head("[J 1] 高畫質頂階：遠端用大螢幕看不該被 720p 綁死（B 案）")
+
+# 這一階只放寬解析度、不放寬碼率 —— 上傳頻寬由 REMOTE_BITRATE_KBPS 管，
+# 解析度上限只決定畫面多大。同樣 2800 kbps，1080p 在大螢幕上明顯清楚。
+lad_hi = hls.abr_ladder(1920, 1080, 720, 2800, auto=True)
+check("自動模式會多發一階更高解析度", lad_hi[0][0] == 1080, lad_hi)
+check("**頂階的碼率跟主階一樣，沒有放寬**（放寬了就是在偷吃上傳頻寬）",
+      lad_hi[0][1] == 2800, lad_hi)
+check("頂階排在最前面（master 裡最好的要排前面）",
+      [x[0] for x in lad_hi] == sorted([x[0] for x in lad_hi], reverse=True), lad_hi)
+check("主階還在（網路不夠時 ABR 要降得回來）", (720, 2800) in lad_hi, lad_hi)
+check("底下那幾階沒有被影響", lad_hi[1:] == lad, (lad_hi[1:], lad))
+
+check("手動挑過畫質就不加頂階（挑 480p 的意思是「最多 480p」）",
+      all(x[0] <= 480 for x in hls.abr_ladder(1920, 1080, 480, 2800, auto=False)),
+      hls.abr_ladder(1920, 1080, 480, 2800, auto=False))
+check("手動挑原畫質也不加（已經是最高了）",
+      hls.abr_ladder(1920, 1080, 0, 0, auto=True)[0] == (0, 0),
+      hls.abr_ladder(1920, 1080, 0, 0, auto=True))
+
+# 天花板：片源與 TRANSCODE_MAX_HEIGHT 取低的那一個
+check("4K 片源的頂階被 TRANSCODE_MAX_HEIGHT(1080) 壓住，不會發 2160p",
+      hls.abr_ladder(3840, 2160, 720, 2800, auto=True)[0][0] == 1080,
+      hls.abr_ladder(3840, 2160, 720, 2800, auto=True))
+check("720p 片源沒有更高的可給 → 不發頂階（不放大）",
+      hls.abr_ladder(1280, 720, 720, 2800, auto=True)[0][0] == 720,
+      hls.abr_ladder(1280, 720, 720, 2800, auto=True))
+check("寬螢幕 1920×804：跟主階只差 84px < 100 → 不值得多發一階",
+      hls.abr_ladder(1920, 804, 720, 2800, auto=True)[0][0] == 720,
+      hls.abr_ladder(1920, 804, 720, 2800, auto=True))
+
+os.environ["REMOTE_HIGH_RUNG"] = "false"
+check("開關關掉就回到上一版的形狀（三階，沒有頂階）",
+      hls.abr_ladder(1920, 1080, 720, 2800, auto=True) == lad,
+      hls.abr_ladder(1920, 1080, 720, 2800, auto=True))
+os.environ["REMOTE_HIGH_RUNG"] = "true"
+
+# 階梯上的高度要真的能對到 profile key，不然分段會落到別的資料夾
+for hh, bb in lad:
+    k = hls.profile_key(hh, None, bb, hls.RUNG_TRANSCODE)
+    check(f"階 {hh}p 的 key 解析得回來", hls._parse_profile(k)[:3] == (hh, None, bb), k)
+
+
+head("[J 1] 解析度／位元率政策：兩個端點必須問同一個函式")
+
+check("遠端自動 = REMOTE_MAX_HEIGHT ＋ REMOTE_BITRATE_KBPS",
+      hls.quality_policy(True, None) == (720, 2800), hls.quality_policy(True, None))
+check("區網自動 = TRANSCODE_MAX_HEIGHT，不鎖碼率",
+      hls.quality_policy(False, None) == (1080, 0), hls.quality_policy(False, None))
+check("h=0（原畫質）不是「沒指定」—— 不縮放也不鎖峰值",
+      hls.quality_policy(True, 0) == (0, 0), hls.quality_policy(True, 0))
+check("已達上限就不鎖峰值", hls.quality_policy(True, 1080)[1] == 0,
+      hls.quality_policy(True, 1080))
+
+# master 端點自己算 profile 的話，位元率上限會掉 —— 釘住這件事
+import inspect as _insp
+from app.routers import stream as _sr
+_src = _insp.getsource(_sr.hls_master)
+check("master 端點走 quality_policy（自己算的話 REMOTE_BITRATE_KBPS 會失效）",
+      "quality_policy" in _src, _src[:300])
+from app.routers import api as _api
+check("/api/play 也走同一個函式", "quality_policy" in _insp.getsource(_api.play_info))
+check("/api/play 的 hls_url 指到 master（指到 index 等於 ABR 沒有階可選）",
+      "master.m3u8" in _insp.getsource(_api.play_info), "hls_url 還指著 index.m3u8")
+check("master 端點把「有沒有手動挑畫質」傳下去（不然分不出自動與剛好選到預設值）",
+      "auto=" in _src, _src[-400:])
+
+# _qs：h=0（原畫質）與 h=None（沒指定）是不同的意思，不能用真假值濾
+check("_qs 留得住 h=0（用 `if v` 會把原畫質一起丟掉）",
+      _api._qs(h=0, a=None) == "?h=0", _api._qs(h=0, a=None))
+check("_qs 濾掉 None", _api._qs(h=None, a=None) == "", _api._qs(h=None, a=None))
+check("_qs 兩個都在時用 & 接", _api._qs(h=720, a=2) == "?h=720&a=2", _api._qs(h=720, a=2))
 
 
 # ============================================================ 速度樣本
@@ -247,7 +375,7 @@ check("狀態寫進 DB", row["remux_state"] == "failed", dict(row))
 check("原因只留第一行（後台清單看得到）",
       row["remux_error"] == "Non-monotonous DTS in output stream", row["remux_error"])
 m = hls.build_master(fid, lower, remote=True, duration=DUR)
-check("master 改發單階", m.count("#EXT-X-STREAM-INF") == 1, m)
+check("master 不再發上階（轉碼階梯還在，播放不中斷）", "_m1" not in m, m)
 
 import time as _time
 with db.batch() as bt:

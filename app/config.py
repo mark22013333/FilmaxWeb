@@ -188,19 +188,33 @@ class Settings:
     def only_exts(self) -> set:
         return self._ext_set(self.scan_only_exts)
 
-    @property
-    def exclude_dir_prefixes(self) -> tuple:
-        """回傳小寫的前綴 tuple，直接給 str.startswith 用。
+    @staticmethod
+    def _dir_prefixes(raw: str) -> tuple:
+        """逗號／分號分隔的資料夾名稱前綴 → 小寫 tuple，直接給 str.startswith 用。
 
         不用 _ext_set：那個會把空白也當分隔符，但資料夾名稱本來就可能有空白
         （"New Folder"、"未 分類"）。這裡只用逗號與分號分隔。
         """
         out = []
-        for chunk in (self.scan_exclude_dir_prefixes or "").replace(";", ",").split(","):
+        for chunk in (raw or "").replace(";", ",").split(","):
             chunk = chunk.strip().lower()
             if chunk:
                 out.append(chunk)
         return tuple(out)
+
+    @property
+    def exclude_dir_prefixes(self) -> tuple:
+        return self._dir_prefixes(self.scan_exclude_dir_prefixes)
+
+    @property
+    def min_size_exempt_dirs(self) -> tuple:
+        """這些資料夾底下不套用 MIN_FILE_MB 的大小門檻。
+
+        跟 exclude_dir_prefixes 刻意共用同一套解析與比對規則（名稱開頭、
+        大小寫不分、放在哪一層都有效）—— 兩個設定長得一樣，行為也就該一樣，
+        不然使用者得記兩套規則。
+        """
+        return self._dir_prefixes(self.scan_min_size_exempt_dirs)
 
     @property
     def mssql_configured(self) -> bool:
@@ -366,9 +380,11 @@ _HOT_ATTRS = {
     "audio_bitrate_kbps": "AUDIO_BITRATE_KBPS",
     "remote_max_height": "REMOTE_MAX_HEIGHT",
     "remote_bitrate_kbps": "REMOTE_BITRATE_KBPS",
+    "remote_high_rung": "REMOTE_HIGH_RUNG",
     "lan_bitrate_kbps": "LAN_BITRATE_KBPS",
     "min_file_mb": "MIN_FILE_MB",
     "scan_exclude_dir_prefixes": "SCAN_EXCLUDE_DIR_PREFIXES",
+    "scan_min_size_exempt_dirs": "SCAN_MIN_SIZE_EXEMPT_DIRS",
     "scan_exclude_exts": "SCAN_EXCLUDE_EXTS",
     "scan_only_exts": "SCAN_ONLY_EXTS",
     "min_photo_kb": "MIN_PHOTO_KB",
