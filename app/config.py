@@ -366,6 +366,7 @@ _HOT_ATTRS = {
     "audio_bitrate_kbps": "AUDIO_BITRATE_KBPS",
     "remote_max_height": "REMOTE_MAX_HEIGHT",
     "remote_bitrate_kbps": "REMOTE_BITRATE_KBPS",
+    "remote_high_rung": "REMOTE_HIGH_RUNG",
     "lan_bitrate_kbps": "LAN_BITRATE_KBPS",
     "min_file_mb": "MIN_FILE_MB",
     "scan_exclude_dir_prefixes": "SCAN_EXCLUDE_DIR_PREFIXES",
