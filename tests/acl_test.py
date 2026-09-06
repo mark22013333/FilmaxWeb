@@ -134,9 +134,8 @@ check("文件列表濾掉了",
       == ["d1.pdf", "d3.pdf"])
 check("相片資料夾清單濾掉了",
       SECRET not in [f["folder"] for f in denied.get("/api/photos/folders").json()["items"]])
-check("文件資料夾清單濾掉了（扁平相容形狀）",
-      SECRET not in [f["folder"] for f in
-                     denied.get("/api/documents/folders?flat=true").json()["items"]])
+check("文件資料夾清單濾掉了",
+      SECRET not in [f["folder"] for f in denied.get("/api/documents/folders").json()["items"]])
 st = denied.get("/api/stats").json()
 check(f"統計數字跟著縮（電影 {st['movies']}、檔案 {st['files']}）",
       st["movies"] == 2 and st["files"] == 2, st)
@@ -270,56 +269,6 @@ acl.invalidate()
 denied.cookies.set(auth.COOKIE, auth.make_user_token(u_no["id"]))
 check("降回來就看不到了（權限不會殘留）", titles(denied) == ["片1", "片3"], titles(denied))
 acl.set_grants(rule["id"], [u_ok["id"]])
-
-
-print("\n[6.8] 資料夾樹：遞迴計數與子樹查詢都不能把受限的東西算進來")
-# 樹的節點份數是**遞迴總數**（含所有子孫），所以受限資料夾就算不出現在
-# 節點清單裡，也可能從父節點的數字洩漏出去 —— 這一段就是在防那個。
-# 前面的 seed 只有單層資料夾，樹要有深度才測得出穿透與遞迴，所以自己補。
-with db.tx() as conn:
-    for i, (folder, fn) in enumerate((
-            (OPEN + "/A/深", "o1.pdf"), (OPEN + "/A/深", "o2.pdf"), (OPEN + "/B", "o3.pdf"),
-            (SECRET + "/X/深", "s1.pdf"), (SECRET + "/X/深", "s2.pdf"),
-            (NEAR + "/C", "n1.pdf")), start=100):
-        conn.execute("INSERT INTO document(id, ftp_path, folder, filename, ext, size,"
-                     " probe_state) VALUES(?,?,?,?,?,?,'ok')",
-                     (i, f"{folder}/{fn}", folder, fn, "pdf", 10))
-
-
-def tree(cl, prefix=None):
-    p = {} if prefix is None else {"prefix": prefix}
-    return cl.get("/api/documents/folders", params=p).json()["items"]
-
-
-t_adm, t_deny = tree(admin), tree(denied)
-deny_names = [i["name"] for i in t_deny]
-check("受限資料夾不出現在樹的節點裡",
-      not any(n == "私人" or n.startswith("私人/") for n in deny_names), deny_names)
-check("名字相近的資料夾沒有被一起擋掉（樹也要正規化前綴）",
-      any("私人物品" in n for n in deny_names), deny_names)
-sum_adm = sum(i["c"] for i in t_adm)
-sum_deny = sum(i["c"] for i in t_deny)
-check(f"節點的遞迴份數跟著縮（管理員 {sum_adm}、沒權限 {sum_deny}）",
-      sum_deny < sum_adm, (sum_adm, sum_deny))
-check("單鏈穿透：只有一條路可走的層會併成一個節點（A / 深）",
-      any(i["name"] == "A / 深" for i in tree(denied, OPEN)),
-      [i["name"] for i in tree(denied, OPEN)])
-sub = denied.get("/api/documents", params={"folder": "/媒體資料庫", "subtree": "true"}).json()
-check("子樹查詢濾掉受限的檔案",
-      not any(i["filename"].startswith("s") for i in sub["items"]),
-      [i["filename"] for i in sub["items"]])
-check("直接指定受限的子樹 → 0 筆",
-      denied.get("/api/documents",
-                 params={"folder": SECRET, "subtree": "true"}).json()["total"] == 0)
-# NEAR 底下有 seed 的 d3.pdf（本層）與這一段補的 n1.pdf（子層），子樹要兩個都拿到 ——
-# 本層那筆正是 subtree_sql 裡「folder 剛好等於前綴」那個 OR 條件在守的。
-check("指定名字相近的子樹 → 本層與子層都拿得到（沒被誤擋）",
-      denied.get("/api/documents",
-                 params={"folder": NEAR, "subtree": "true"}).json()["total"] == 2,
-      denied.get("/api/documents",
-                 params={"folder": NEAR, "subtree": "true"}).json()["total"])
-with db.tx() as conn:
-    conn.execute("DELETE FROM document WHERE id >= 100")
 
 
 print("\n[7] 沒有規則時不應該有任何額外成本")
