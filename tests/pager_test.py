@@ -183,8 +183,20 @@ check("瀑布流沒有「第幾頁」的概念 → 分頁器收起來",
 
 head("[P-2] 回到頂端")
 
-check("有這顆按鈕", 'id="pTop"' in (ROOT / "app" / "static" / "index.html")
-      .read_text(encoding="utf-8"))
+HTML = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+check("左右各一顆", 'id="pTop"' in HTML and 'id="pTopR"' in HTML)
+check("右邊那顆不進 Tab 順序、螢幕報讀器也不念（同一個功能的第二個入口）",
+      'aria-hidden="true" tabindex="-1"' in HTML)
+check("兩顆共用同一個 class，開關與點擊一起處理",
+      HTML.count('class="to-top') == 2)
+check("兩顆一起開關（只同步一顆的話另一顆會留在畫面上）",
+      "for (const b of $$('.to-top'))" in src)
+check("兩顆共用同一個 handler", "$$('.to-top').forEach(b => b.onclick = goTop)" in src)
+# `~` 選擇器要求兩者是兄弟：按鈕必須在 <body> 底下、#scanPanel 之後，
+# 放在 <main> 裡的話選擇器永遠不會命中（而且不會有任何錯誤訊息）。
+_i_panel = HTML.index('id="scanPanel"')
+check("按鈕在 #scanPanel 之後且同層（否則 `~` 選不到）",
+      HTML.index('id="pTopR"') > _i_panel and HTML.index('id="pTopR"') > HTML.index("</main>"))
 # **不能用 scrollToGrid('#pgrid')**：那是給換頁用的（捲到格線頂端、跳過篩選列），
 # 而相簿標籤那一列在真實片庫有 110 個標籤、高 2,974px —— 於是「回頂端」
 # 會停在 3,095px，完全不是頂端。實機量到才發現的。
@@ -202,10 +214,14 @@ check("除了 scroll 事件還有輪詢兜底（有些環境收不到 window 的
 check("值沒變就不碰 DOM（輪詢每 300ms 叫一次）",
       "if (b.hidden !== want)" in src)
 TOP = CSS[CSS.index(".to-top{"):CSS.index(".pmode{")]
-check("位置避開掃描面板（右下）與 toast（正下方置中）",
-      "left:" in TOP and "bottom:" in TOP, TOP[:120])
+check("左右各自定位", ".to-top.left{left:20px}" in TOP and ".to-top.right{right:20px}" in TOP)
 check("z-index 比掃描面板(80)低", "z-index:70" in TOP)
 check("手機上只留箭頭", ".to-top span{display:none}" in CSS)
+# 掃描面板在 right:20/bottom:20、寬 390px —— 正好是右邊那顆的位置
+check("掃描面板開著時右邊那顆要讓開（不然兩個疊在一起）",
+      ".scan-panel.show ~ #pTopR{bottom:" in CSS)
+check("手機的掃描面板是滿版寬 → 右邊那顆直接收起來（左邊那顆還在）",
+      ".scan-panel.show ~ #pTopR{display:none}" in CSS)
 check("prefers-reduced-motion 有涵蓋", ".to-top" in rm, rm[:400])
 
 

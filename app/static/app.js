@@ -891,23 +891,26 @@ $('#pmore').addEventListener('click', e => {
 const TOP_SHOW_AT = 600;          // 捲超過這麼多 px 才出現
 
 function syncTopBtn() {
-  const b = $('#pTop');
-  if (!b) return;
   const y = window.scrollY || document.documentElement.scrollTop || 0;
   const want = !(pstate.mode === 'flow' && !$('#photoView').hidden && y > TOP_SHOW_AT);
-  // 只在真的要變的時候寫 —— 下面那個輪詢每 300ms 會叫一次，
-  // 無條件寫 hidden 等於每次都碰 DOM。
-  if (b.hidden !== want) b.hidden = want;
+  // 兩顆一起開關 —— 只同步一顆的話另一顆會留在畫面上（而且點了還是有作用，
+  // 使用者會以為介面壞掉）。
+  for (const b of $$('.to-top')) {
+    // 只在真的要變的時候寫 —— 下面那個輪詢每 300ms 會叫一次，
+    // 無條件寫 hidden 等於每次都碰 DOM。
+    if (b.hidden !== want) b.hidden = want;
+  }
 }
 
-$('#pTop').onclick = () => {
+function goTop() {
   // **不能用 scrollToGrid('#pgrid')。**那是給換頁用的（捲到格線頂端，
   // 跳過已經看過的篩選列），而相簿標籤這一列在這個片庫有 110 個標籤、
   // 高 2,974px —— 於是「回頂端」會停在 3,095px 的位置，完全不是頂端。
   // 這顆按鈕的語意就是「回到最上面」，那就真的捲到 0。
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
-};
+}
+$$('.to-top').forEach(b => b.onclick = goTop);
 
 let _topTimer;
 const _onScroll = () => {

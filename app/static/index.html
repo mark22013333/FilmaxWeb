@@ -95,14 +95,6 @@
     <div class="pgrid" id="pgrid"></div>
     <!-- 瀑布流的哨兵：捲到它就載下一頁。放在格線外面，重畫格線不會弄丟它。 -->
     <div id="pmore" hidden></div>
-    <!-- 回到頂端。瀑布流沒有分頁器可以當「這一頁結束了」的錨點，
-         滑了兩千張之後要回去只能一直往上滑。 -->
-    <button id="pTop" class="to-top" hidden type="button" title="回到最上面">
-      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-        <path d="M12 5l7 7-1.4 1.4L13 8.8V20h-2V8.8l-4.6 4.6L5 12z" fill="currentColor"/>
-      </svg>
-      <span>回頂端</span>
-    </button>
     <div id="ppager"></div>
   </div>
 </main>
@@ -121,6 +113,26 @@
     <div class="scan-log" id="scanLog"></div>
   </div>
 </div>
+
+<!-- 回到頂端。瀑布流沒有分頁器可以當「這一頁結束了」的錨點，
+     滑了兩千張之後要回去只能一直往上滑。
+     左右各放一顆：滑鼠停在哪一邊就近按哪一顆，不必橫越整個螢幕。 -->
+<button id="pTop" class="to-top left" hidden type="button" title="回到最上面">
+  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+    <path d="M12 5l7 7-1.4 1.4L13 8.8V20h-2V8.8l-4.6 4.6L5 12z" fill="currentColor"/>
+  </svg>
+  <span>回頂端</span>
+</button>
+<!-- 右邊那顆是同一個功能的第二個入口，對輔助技術來說是重複的，
+     所以 aria-hidden ＋ tabindex="-1"：鍵盤 Tab 只會停在左邊那顆，
+     螢幕報讀器也只會念一次。 -->
+<button id="pTopR" class="to-top right" hidden type="button" title="回到最上面"
+        aria-hidden="true" tabindex="-1">
+  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+    <path d="M12 5l7 7-1.4 1.4L13 8.8V20h-2V8.8l-4.6 4.6L5 12z" fill="currentColor"/>
+  </svg>
+  <span>回頂端</span>
+</button>
 
 <div class="toast" id="toast"></div>
 <script src="/static/app.js"></script>
