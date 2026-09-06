@@ -225,7 +225,15 @@ check("封面不再在 _probe_one 裡直接 make_thumbnail",
 # ============================================================ E / F 靜態檢查
 head("[E] 換頁捲動")
 js = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-check("不再捲到文件頂端", "window.scrollTo({ top: 0" not in js)
+# E 的不變量是「**換頁**不要捲到文件頂端」（那會捲到標頭、搜尋列、相簿標籤
+# 之上，離第一列還有一大段）。原本用「整個檔案都不准出現 scrollTo top:0」
+# 來釘，但那太寬 —— 「回頂端」那顆按鈕的語意就是捲到 0，而它是對的。
+# 改成只看換頁那條路徑：pageTo／scrollToGrid 裡不准出現。
+_page_path = js[js.index("function scrollToGrid"):js.index("let toastTimer")]
+check("換頁的路徑不捲到文件頂端", "window.scrollTo({ top: 0" not in _page_path,
+      _page_path[:200])
+check("「回頂端」按鈕是刻意捲到 0 的（唯一允許的地方）",
+      js.count("window.scrollTo({ top: 0") == 1, js.count("window.scrollTo({ top: 0"))
 check("有共用的 scrollToGrid", "function scrollToGrid" in js)
 check("扣掉 sticky 標頭的高度", "getBoundingClientRect" in js and "header" in js)
 # 「要不要捲」必須在載入新內容之前判斷：換頁時格線會先塌成「載入中」，

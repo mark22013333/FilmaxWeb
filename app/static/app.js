@@ -75,6 +75,104 @@ async function pageTo(loader, sel) {
   if (wasScrolled) scrollToGrid(sel);
 }
 
+/* ------------------------- 分頁器（媒體庫／相片／文件共用） -------------------------
+
+   原本三個列表各寫一份上一頁／下一頁，而且行為已經開始分岔（媒體庫走全域的
+   window.go，另外兩個各自綁 data-pp）。併成一份不是為了少幾行 ——
+   而是「加跳頁按鈕」如果要改三次，第四個列表出現時就變成改四次。
+
+   版面：首末頁固定顯示 ＋ 目前頁附近展開 ＋ 中間省略。
+     第 1 頁：   [上一頁] (1) 2 3 4 5 … 335 [下一頁]
+     第 8 頁：   [上一頁] 1 … 6 7 (8) 9 10 … 335 [下一頁]
+   省略號是純文字不可點：有些實作讓它跳 ±10 頁，但那個行為沒有任何視覺
+   提示，點下去的結果無法預期。                                            */
+const PAGER_JUMP_MIN = 20;      // 超過這麼多頁才給「跳到第幾頁」的輸入框
+
+// 目前頁前後各留幾頁。手機螢幕塞不下，收成 1。
+const pagerWindow = () => (window.innerWidth < 560 ? 1 : 2);
+
+// 要顯示哪些頁碼。回傳陣列，'…' 代表省略號。
+function pagerPages(page, pages, win) {
+  const out = [];
+  const lo = Math.max(2, page - win), hi = Math.min(pages - 1, page + win);
+  out.push(1);
+  // 只跳過一頁的話就直接列出來 —— 省略號跟數字一樣寬，藏一個 2 沒有意義
+  if (lo > 2) out.push(lo === 3 ? 2 : '…');
+  for (let i = lo; i <= hi; i++) out.push(i);
+  if (hi < pages - 1) out.push(hi === pages - 2 ? pages - 1 : '…');
+  if (pages > 1) out.push(pages);
+  return out;
+}
+
+// 每個分頁器最後一次畫的參數。resize 要重畫時得知道畫什麼。
+// 宣告放在 paintPager 前面：const 不像 function 會提升，雖然實際呼叫都在
+// 載入之後（不會踩到 TDZ），但讓「宣告在使用之前」是看得出來的。
+const _pagerLast = new Map();
+
+/** 畫出分頁器並塞進 sel。記住參數，resize 時才重畫得出來。 */
+function paintPager(sel, { page, total, pageSize }) {
+  _pagerLast.set(sel, { page, total, pageSize });
+  const box = $(sel);
+  if (box) box.innerHTML = renderPagerHTML({ page, total, pageSize });
+}
+
+function renderPagerHTML({ page, total, pageSize }) {
+  const pages = Math.ceil(total / pageSize);
+  if (pages <= 1) return '';
+  // 夾住頁碼再畫。超出範圍是真的會發生的：停在最後一頁時把相片刪掉，
+  // 總數變少而 page 沒變 —— 那時整排頁碼會一個都沒有「目前頁」的樣式。
+  page = Math.min(Math.max(1, page), pages);
+  const win = pagerWindow();
+  const btn = n => n === '…'
+    ? `<span class="gap">…</span>`
+    : `<button class="pg${n === page ? ' on' : ''}" data-pg="${n}"
+         ${n === page ? 'aria-current="page"' : ''}>${n}</button>`;
+  const jump = pages >= PAGER_JUMP_MIN
+    ? `<span class="jump">跳到
+         <input type="number" min="1" max="${pages}" value="${page}"
+                inputmode="numeric" aria-label="跳到第幾頁"> 頁</span>` : '';
+  return `<div class="pager">
+    <button class="btn" data-pg="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一頁</button>
+    <span class="nums">${pagerPages(page, pages, win).map(btn).join('')}</span>
+    <button class="btn" data-pg="${page + 1}" ${page >= pages ? 'disabled' : ''}>下一頁</button>
+    ${jump}</div>`;
+}
+
+// 轉螢幕方向或改視窗寬度時，window 從 2 變 1（或反過來）要重畫一次，
+// 否則手機橫轉直之後那排頁碼會超出畫面。重畫用最後一次的參數，
+// 所以每個分頁器要記住自己畫的是什麼。
+let _pagerResizeTimer;
+addEventListener('resize', () => {
+  clearTimeout(_pagerResizeTimer);
+  _pagerResizeTimer = setTimeout(() => {
+    for (const [sel, args] of _pagerLast) {
+      const box = $(sel);
+      if (box && box.innerHTML) box.innerHTML = renderPagerHTML(args);
+    }
+  }, 150);
+});
+
+/** 綁一次就好：事件委派在容器上，換頁重畫內容不會失效。 */
+function bindPager(sel, onGo) {
+  const box = $(sel);
+  if (!box || box.dataset.bound) return;
+  box.dataset.bound = '1';
+  box.addEventListener('click', e => {
+    const b = e.target.closest('[data-pg]');
+    if (b && !b.disabled) onGo(+b.dataset.pg);
+  });
+  const jump = e => {
+    const el = e.target.closest('.jump input');
+    if (!el) return;
+    // 超出範圍就夾到邊界，不要當成錯誤 —— 打 999 的人要的顯然是最後一頁
+    const n = Math.min(Math.max(1, parseInt(el.value, 10) || 1), +el.max);
+    el.value = n;
+    onGo(n);
+  };
+  box.addEventListener('keydown', e => { if (e.key === 'Enter') jump(e); });
+  box.addEventListener('change', jump);
+}
+
 let toastTimer;
 function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
@@ -127,15 +225,12 @@ function cardHtml(it) {
 }
 
 function renderPager(d) {
-  const pages = Math.ceil(d.total / d.page_size);
-  $('#pager').innerHTML = pages <= 1 ? '' : `<div class="pager">
-    <button class="btn" ${d.page <= 1 ? 'disabled' : ''} onclick="go(${d.page - 1})">上一頁</button>
-    <span>${d.page} / ${pages}</span>
-    <button class="btn" ${d.page >= pages ? 'disabled' : ''} onclick="go(${d.page + 1})">下一頁</button></div>`;
+  paintPager('#pager',
+    { page: d.page, total: d.total, pageSize: d.page_size });
+  // 要等新內容渲染完才捲。先捲的話，loadLibrary 會把格線換成「載入中」，
+  // 頁面高度瞬間塌掉，瀏覽器把捲動位置夾到 0，接著算出來的目標也是錯的。
+  bindPager('#pager', p => { state.page = p; return pageTo(loadLibrary, '#grid'); });
 }
-// 要等新內容渲染完才捲。先捲的話，loadLibrary 會把格線換成「載入中」，
-// 頁面高度瞬間塌掉，瀏覽器把捲動位置夾到 0，接著算出來的目標也是錯的。
-window.go = p => { state.page = p; return pageTo(loadLibrary, '#grid'); };
 
 async function loadGenres() {
   const { genres } = await api('/api/genres');
@@ -165,7 +260,7 @@ async function loadContinue() {
 async function openItem(id) {
   // 記住現在開著哪一筆：重新分析完成之後要把彈窗刷新，才看得到新的時長
   window.__openItemId = id;
-  const ov = $('#overlay'); ov.classList.add('show');
+  showOverlay();
   $('#modal').innerHTML = '<div class="loading">載入中…</div>';
   const it = await api('/api/items/' + id);
   const files = it.kind === 'tv'
@@ -202,7 +297,16 @@ async function openItem(id) {
       ${files || '<div class="empty">沒有檔案</div>'}
     </div>`;
 }
-window.closeModal = () => $('#overlay').classList.remove('show');
+// 開關集中在這兩個函式：body.modal-open 要跟 .show 同進同出，
+// 分散在三個開啟點各寫一次的話，遲早有一個忘了加而讓背景捲動鎖不掉。
+function showOverlay() {
+  $('#overlay').classList.add('show');
+  document.body.classList.add('modal-open');
+}
+window.closeModal = () => {
+  $('#overlay').classList.remove('show');
+  document.body.classList.remove('modal-open');
+};
 $('#overlay').onclick = e => { if (e.target.id === 'overlay') closeModal(); };
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
@@ -429,7 +533,7 @@ window.patchUser = async (id, body) => {
 };
 
 window.openAccount = async () => {
-  $('#overlay').classList.add('show');
+  showOverlay();
   $('#modal').innerHTML = '<div class="loading">載入中…</div>';
   let users = null;
   if (me.is_admin && me.google_login) {
@@ -468,7 +572,7 @@ window.openAccount = async () => {
 $('#btnAccount').onclick = openAccount;
 
 $('#btnStats').onclick = async () => {
-  $('#overlay').classList.add('show');
+  showOverlay();
   $('#modal').innerHTML = '<div class="loading">檢查中…</div>';
   const [s, d] = await Promise.all([api('/api/stats'), api('/api/diagnostics').catch(() => null)]);
   const problems = (d && d.problems || []).length ? `
@@ -516,7 +620,23 @@ window.testFtp = async () => {
 window.api = api; window.toast = toast; window.pollScan = pollScan; window.openItem = openItem;
 
 /* ------------------------- 相片牆 ------------------------- */
-const pstate = { folder: '', page: 1, sort: 'taken', items: [], total: 0, previewPx: 1920 };
+const pstate = { folder: '', page: 1, sort: 'taken', items: [], total: 0, previewPx: 1920,
+                 // 'grid' = 方格＋分頁（預設，既有行為）／'flow' = 瀑布流＋無限捲動
+                 mode: 'grid', loading: false, done: false,
+                 // 這一輪瀏覽的載入上限。按「繼續載入」會往上推一批。
+                 flowCap: 0 };
+
+// 瀑布流一次滑到底要載幾張就停。**上限的存在理由是記憶體**：20,033 張全部
+// 攤在 DOM 裡，就算有 loading="lazy"，節點本身也要記憶體。
+// 沒做虛擬捲動（windowing）是刻意的 —— 它要處理捲動位置還原與 PhotoSwipe 的
+// 索引對應，複雜度不成比例；真要看第 2,000 張之後的人，用相簿或排序找快得多。
+const FLOW_MAX = 2000;
+const PHOTO_PAGE = 60;
+
+try {
+  const m = localStorage.getItem('photoMode');
+  if (m === 'flow' || m === 'grid') pstate.mode = m;
+} catch { /* 隱私模式讀不到 localStorage，用預設值就好 */ }
 const dstate = { folder: '', page: 1, sort: 'name', items: [], total: 0 };
 
 const fmtBytes = b => !b ? '—'
@@ -526,97 +646,553 @@ const fmtBytes = b => !b ? '—'
 // 資料夾名稱只顯示最後一層，前面的路徑當提示就好
 const shortFolder = f => (f || '').split('/').filter(Boolean).pop() || '/';
 
+/* 相簿的顯示名稱。單看最後一層會撞名 —— 實測庫裡就有「巨乳外拍/巨乳外拍」
+   與「咬一口兔娘ovo…/咬一口兔娘ovo…」這種父子同名的資料夾，兩個標籤長得
+   一模一樣，點下去才知道是哪個。撞名的時候往上找第一個不一樣的層來補。 */
+function albumNames(folders) {
+  const last = folders.map(shortFolder);
+  const dup = new Set(last.filter((n, i) => last.indexOf(n) !== i));
+  return folders.map((f, i) => {
+    if (!dup.has(last[i])) return last[i];
+    const segs = f.split('/').filter(Boolean);
+    // 往上找第一個跟末層不同的祖先。父子同名（…/外拍/外拍）時直接取
+    // segs[-2] 會補出「外拍 / 外拍」，那沒有解決任何問題。
+    for (let j = segs.length - 2; j >= 0; j--) {
+      if (segs[j] !== last[i]) return segs[j] + ' / ' + last[i];
+    }
+    return last[i];
+  });
+}
+
+const pfilter = { q: '', items: [] };
+
 async function loadFolders() {
   let d;
   try { d = await api('/api/photos/folders'); } catch { return; }
+  pfilter.items = d.items;
+  paintFolderBar();
+}
+
+function paintFolderBar() {
   const bar = $('#folderBar');
-  const all = `<div class="fchip ${pstate.folder ? '' : 'on'}" data-folder="">
-      <span class="fc-n">全部</span></div>`;
-  bar.innerHTML = all + d.items.map(f => `
-    <div class="fchip ${pstate.folder === f.folder ? 'on' : ''}" data-folder="${esc(f.folder)}"
+  const needle = pfilter.q.toLowerCase();
+  const all = pfilter.items;
+  const names = albumNames(all.map(f => f.folder));
+  const shown = all
+    .map((f, i) => ({ ...f, label: names[i] }))
+    .filter(f => !needle || f.label.toLowerCase().includes(needle)
+                 || f.folder.toLowerCase().includes(needle));
+  const total = all.reduce((s, f) => s + (f.c || 0), 0);
+  // 搜尋中的話選中的相簿是被忽略的（搜全庫），所以標籤也不該還亮著 ——
+  // 亮著等於告訴使用者「你正在看這個相簿」，但畫面上不是。
+  const sel = state.q ? null : pstate.folder;
+  const head = needle ? '' : `<div class="fchip ${sel ? '' : 'on'}" data-folder=""
+      title="所有相簿"><span class="fc-t"><span class="fc-n">全部</span>
+      <span class="fc-c"> ${total}</span></span></div>`;
+  bar.innerHTML = head + (shown.length ? shown.map(f => `
+    <div class="fchip ${sel === f.folder ? 'on' : ''}" data-folder="${esc(f.folder)}"
          title="${esc(f.folder)}">
       ${f.cover ? `<img loading="lazy" src="/api/image/${esc(f.cover)}" alt="">` : ''}
-      <span><span class="fc-n">${esc(shortFolder(f.folder))}</span>
+      <span class="fc-t"><span class="fc-n">${esc(f.label)}</span>
       <span class="fc-c"> ${f.c}</span></span>
-    </div>`).join('');
+    </div>`).join('') : '<div class="fc-none">找不到符合的相簿</div>');
   bar.querySelectorAll('[data-folder]').forEach(el => el.onclick = () => {
     pstate.folder = el.dataset.folder; pstate.page = 1; loadPhotos();
   });
 }
 
-async function loadPhotos() {
-  const grid = $('#pgrid');
-  grid.innerHTML = '<div class="loading">載入中…</div>';
-  const p = new URLSearchParams({ page: pstate.page, page_size: 60, sort: pstate.sort });
-  if (pstate.folder) p.set('folder', pstate.folder);
-  if (state.q) p.set('q', state.q);
-  let d;
-  try { d = await api('/api/photos?' + p); }
-  catch (e) { grid.innerHTML = `<div class="loading">載入失敗：${esc(e.message)}</div>`; return; }
-  pstate.items = d.items; pstate.total = d.total;
-  pstate.previewPx = d.preview_px || 1920;
-  $('#photoCount').textContent = d.total ? `共 ${d.total} 張` : '';
-  if (!d.items.length) {
-    grid.innerHTML = `<div class="empty"><h3>沒有相片</h3>
-      <p>把圖片放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
-    $('#ppager').innerHTML = ''; return;
-  }
-  grid.innerHTML = d.items.map((x, i) => `
+let pfTimer;
+$('#photoFolderQ').oninput = e => {
+  clearTimeout(pfTimer);
+  pfTimer = setTimeout(() => { pfilter.q = e.target.value.trim(); paintFolderBar(); }, 200);
+};
+
+// 相片的排序後端一直都吃 sort，只是前端沒有地方選 —— 影片的那顆排序在
+// 切到相片牆時整條 toolbar 被藏掉了，所以相片牆得有自己的。
+$('#photoSort').onchange = e => {
+  pstate.sort = e.target.value; pstate.page = 1; loadPhotos();
+};
+
+// 方格 ↔ 瀑布流。選擇存 localStorage（跟 photoview.js 的 infoPref 同一套做法）。
+function paintPhotoMode() {
+  $$('.pmode [data-pmode]').forEach(b => {
+    const on = b.dataset.pmode === pstate.mode;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+$$('.pmode [data-pmode]').forEach(b => b.onclick = () => {
+  if (b.dataset.pmode === pstate.mode) return;
+  pstate.mode = b.dataset.pmode;
+  try { localStorage.setItem('photoMode', pstate.mode); } catch { /* 隱私模式 */ }
+  paintPhotoMode();
+  pstate.page = 1;
+  loadPhotos();
+  syncTopBtn();
+});
+paintPhotoMode();
+
+/** 一張相片的 HTML。`i` 一定要是**累計索引** —— openPhoto 與 PhotoSwipe 的
+ *  thumbEl 都靠 data-i 對回 pstate.items，瀑布流下用頁內索引會開錯張。 */
+function photoTile(x, i) {
+  // 瀑布流要把長寬寫進 <img>：瀏覽器在圖載入前就知道要留多高，版面不會跳動。
+  // 這也是這裡不需要 masonry 函式庫的原因 —— 它們解決的正是「要等圖載完
+  // 才量得到高度」，而這座片庫 100% 的相片在掃描時就存好尺寸了。
+  const dim = (x.width > 0 && x.height > 0)
+    ? ` width="${x.width}" height="${x.height}"` : '';
+  return `
     <div class="ph" data-i="${i}" role="button" tabindex="0"
          aria-label="看大圖：${esc(x.filename)}" title="${esc(x.filename)}">
-      <img loading="lazy" src="/api/photo/${x.id}/thumb.jpg" alt="${esc(x.filename)}"
+      <img loading="lazy" src="/api/photo/${x.id}/thumb.jpg" alt="${esc(x.filename)}"${dim}
            onerror="this.style.display='none'">
       <div class="ph-meta">${esc(x.filename)}</div>
-    </div>`).join('');
-  grid.querySelectorAll('.ph').forEach(el => {
+    </div>`;
+}
+
+function bindTiles(root) {
+  root.querySelectorAll('.ph:not([data-bound])').forEach(el => {
+    el.dataset.bound = '1';
     el.onclick = () => openPhoto(+el.dataset.i);
     el.onkeydown = e => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPhoto(+el.dataset.i); }
     };
   });
+}
 
-  const pages = Math.ceil(d.total / d.page_size);
-  $('#ppager').innerHTML = pages > 1 ? `
-    <button class="btn" ${pstate.page <= 1 ? 'disabled' : ''} data-pp="-1">上一頁</button>
-    <span style="padding:0 12px;color:var(--dim)">${pstate.page} / ${pages}</span>
-    <button class="btn" ${pstate.page >= pages ? 'disabled' : ''} data-pp="1">下一頁</button>` : '';
-  $('#ppager').querySelectorAll('[data-pp]').forEach(b => b.onclick = () => {
-    pstate.page += +b.dataset.pp;
-    pageTo(loadPhotos, '#pgrid');
+/** 從伺服器要一頁。回傳 null 表示失敗（呼叫端自己決定要不要顯示錯誤）。 */
+async function fetchPhotoPage(page) {
+  const p = new URLSearchParams({ page, page_size: PHOTO_PAGE, sort: pstate.sort });
+  // 跟文件牆一樣：搜尋時忽略選中的相簿，直接搜全庫。原本兩者是 AND，
+  // 於是「選了一個相簿之後就再也搜不到別處」，而畫面上沒有線索說明為什麼。
+  const searching = !!state.q;
+  if (pstate.folder && !searching) p.set('folder', pstate.folder);
+  if (searching) p.set('q', state.q);
+  try { return await api('/api/photos?' + p); }
+  catch (e) { return { _err: e.message }; }
+}
+
+async function loadPhotos() {
+  const grid = $('#pgrid');
+  const flow = pstate.mode === 'flow';
+  grid.classList.toggle('flow', flow);
+  grid.innerHTML = '<div class="loading">載入中…</div>';
+  // 換相簿／換排序／換模式都是重新開始 —— 累積下來的東西全部清掉，
+  // 否則上一個相簿的相片會留在 items 裡，PhotoSwipe 就會翻到不存在的圖。
+  pstate.items = []; pstate.done = false; pstate.loading = false;
+  pstate.flowCap = FLOW_MAX;          // 每次重新開始都把上限歸位
+  $('#pmore').hidden = true;
+
+  const d = await fetchPhotoPage(flow ? 1 : pstate.page);
+  if (d._err) {
+    grid.innerHTML = `<div class="loading">載入失敗：${esc(d._err)}</div>`;
+    $('#ppager').innerHTML = ''; return;
+  }
+  pstate.total = d.total;
+  pstate.previewPx = d.preview_px || 1920;
+  const searching = !!state.q;
+  $('#photoCount').textContent = d.total
+    ? `共 ${d.total} 張${searching ? '（全庫搜尋）' : ''}` : '';
+
+  if (!d.items.length) {
+    grid.innerHTML = searching
+      ? `<div class="empty"><h3>找不到「${esc(state.q)}」</h3>
+         <p>換個關鍵字試試，或清空搜尋框回到相簿瀏覽。</p></div>`
+      : `<div class="empty"><h3>沒有相片</h3>
+         <p>把圖片放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
+    $('#ppager').innerHTML = ''; return;
+  }
+
+  pstate.items = d.items.slice();
+  grid.innerHTML = pstate.items.map(photoTile).join('');
+  bindTiles(grid);
+
+  if (flow) {
+    // 瀑布流沒有「第幾頁」的概念，分頁器要收起來
+    $('#ppager').innerHTML = '';
+    pstate.page = 1;
+    pstate.done = pstate.items.length >= d.total;
+    updateFlowFooter();
+    observeFlow();
+    syncTopBtn();
+  } else {
+    paintPager('#ppager',
+      { page: d.page, total: d.total, pageSize: d.page_size });
+    bindPager('#ppager', p => { pstate.page = p; return pageTo(loadPhotos, '#pgrid'); });
+    syncTopBtn();
+  }
+}
+
+/* ---------------- 瀑布流：往下滑自動載入 ---------------- */
+
+/** 接著載下一頁並 append。同一時間只會有一個在跑。 */
+async function loadMorePhotos() {
+  if (pstate.loading || pstate.done || pstate.mode !== 'flow') return;
+  pstate.loading = true;
+  updateFlowFooter();
+  const d = await fetchPhotoPage(pstate.page + 1);
+  pstate.loading = false;
+  if (d._err) {
+    // 載失敗不要把已經看到的清掉，也不要無限重試 —— 停下來讓使用者自己按
+    pstate.done = true;
+    updateFlowFooter(d._err);
+    return;
+  }
+  pstate.page += 1;
+  // **append 而不是覆蓋**：openPhoto(i) 與 thumbEl(n) 都是拿 data-i 對回
+  // 這個陣列，覆蓋的話索引就對不上，PhotoSwipe 會開到別張。
+  const base = pstate.items.length;
+  pstate.items.push(...d.items);
+  const grid = $('#pgrid');
+  grid.insertAdjacentHTML('beforeend',
+    d.items.map((x, k) => photoTile(x, base + k)).join(''));
+  bindTiles(grid);
+  pstate.done = !d.items.length
+    || pstate.items.length >= d.total
+    || pstate.items.length >= pstate.flowCap;
+  updateFlowFooter();
+}
+
+/** 瀑布流底下那一行的狀態：載入中／載入更多／到底了。 */
+function updateFlowFooter(err) {
+  const box = $('#pmore');
+  if (!box) return;
+  if (pstate.mode !== 'flow') { box.hidden = true; return; }
+  box.hidden = false;
+  if (pstate.loading) { box.innerHTML = '<div class="loading">載入中…</div>'; return; }
+  if (err) {
+    box.innerHTML = `<div class="flow-end">載入失敗：${esc(err)}
+      <button class="btn" data-more="1">重試</button></div>`;
+  } else if (!pstate.done) {
+    box.innerHTML = '<div class="flow-end"><button class="btn" data-more="1">載入更多</button></div>';
+  } else if (pstate.items.length >= pstate.flowCap && pstate.items.length < pstate.total) {
+    // 撞到上限而不是真的到底 —— 要講清楚，否則使用者會以為相片只有這些
+    box.innerHTML = `<div class="flow-end">已載入 ${pstate.items.length} 張
+      （共 ${pstate.total} 張）。再往下請用相簿或排序縮小範圍。
+      <button class="btn" data-more="more">繼續載入</button></div>`;
+  } else {
+    box.innerHTML = `<div class="flow-end">已經到底了 · 共 ${pstate.items.length} 張</div>`;
+  }
+}
+
+$('#pmore').addEventListener('click', e => {
+  if (!e.target.closest('[data-more]')) return;
+  // 使用者明確按了才繼續。撞到 FLOW_MAX 時把上限往上推一批 ——
+  // 上限是防呆不是禁令，按下去就代表他知道自己在做什麼。
+  if (pstate.items.length >= pstate.flowCap) pstate.flowCap += FLOW_MAX;
+  pstate.done = false;
+  loadMorePhotos();
+});
+
+/* ---------------- 回到頂端 ----------------
+
+   只在瀑布流出現：方格模式有分頁器，換頁本來就會捲回格線頂端
+   （pageTo → scrollToGrid），不需要這顆。瀑布流沒有那個錨點，
+   滑了兩千張之後要回去只能一直往上滑。                                */
+const TOP_SHOW_AT = 600;          // 捲超過這麼多 px 才出現
+
+function syncTopBtn() {
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  const want = !(pstate.mode === 'flow' && !$('#photoView').hidden && y > TOP_SHOW_AT);
+  // 兩顆一起開關 —— 只同步一顆的話另一顆會留在畫面上（而且點了還是有作用，
+  // 使用者會以為介面壞掉）。
+  for (const b of $$('.to-top')) {
+    // 只在真的要變的時候寫 —— 下面那個輪詢每 300ms 會叫一次，
+    // 無條件寫 hidden 等於每次都碰 DOM。
+    if (b.hidden !== want) b.hidden = want;
+  }
+}
+
+function goTop() {
+  // **不能用 scrollToGrid('#pgrid')。**那是給換頁用的（捲到格線頂端，
+  // 跳過已經看過的篩選列），而相簿標籤這一列在這個片庫有 110 個標籤、
+  // 高 2,974px —— 於是「回頂端」會停在 3,095px 的位置，完全不是頂端。
+  // 這顆按鈕的語意就是「回到最上面」，那就真的捲到 0。
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+}
+$$('.to-top').forEach(b => b.onclick = goTop);
+
+let _topTimer;
+const _onScroll = () => {
+  // 捲動事件很密集，節流一下；60ms 對「按鈕該不該出現」已經夠即時
+  if (_topTimer) return;
+  _topTimer = setTimeout(() => { _topTimer = null; syncTopBtn(); }, 60);
+};
+addEventListener('scroll', _onScroll, { passive: true });
+// 有些環境（嵌在別的容器裡、或捲動的不是 window）收不到 window 的 scroll，
+// 那樣按鈕就永遠不會出現。**視覺元素不該只靠一個訊號源**：
+// 補一個低頻的輪詢，比較的是數字、沒有變化就不碰 DOM，成本可以忽略。
+let _lastY = -1;
+setInterval(() => {
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  if (y === _lastY) return;
+  _lastY = y;
+  syncTopBtn();
+}, 300);
+
+let flowObserver;
+function observeFlow() {
+  const sentinel = $('#pmore');
+  if (!sentinel) return;
+  if (!flowObserver) {
+    // rootMargin 讓它提早 600px 就開始載，滑到底時通常已經接上了
+    flowObserver = new IntersectionObserver(entries => {
+      if (entries.some(x => x.isIntersecting)) loadMorePhotos();
+    }, { rootMargin: '600px 0px' });
+  }
+  flowObserver.disconnect();
+  if (pstate.mode === 'flow') flowObserver.observe(sentinel);
+}
+
+/* ------------------------- 文件牆（PDF） -------------------------
+
+   導覽是一棵懶載入的資料夾樹。原本是把 452 個資料夾一次平鋪成標籤，
+   而且標籤只顯示路徑的最後一層 —— 這個庫 97% 的路徑深達 7～8 層，
+   於是畫面上是一排分不出來的「PDF」「教用」「學用」。
+
+   後端一次只回一層，並且會把「只有一條路可走」的連續層併成一個節點
+   （顯示成「A / B / C」），所以這裡不必自己處理深度。 */
+const dtree = { open: new Set(), kids: new Map(), root: '', q: '' };
+
+// querySelector 的屬性選擇器要吃得下路徑裡的引號與反斜線
+const cssEsc = s => (window.CSS && CSS.escape) ? CSS.escape(s)
+  : String(s).replace(/["\\]/g, '\\$&');
+
+// 展開／收合只動這一層的子節點，不重畫整棵樹 —— 重畫會讓其他已展開的
+// 分支跟著閃一下，而且捲動位置會跳掉。
+async function docKids(prefix) {
+  if (dtree.kids.has(prefix)) return dtree.kids.get(prefix);
+  const p = new URLSearchParams();
+  if (prefix) p.set('prefix', prefix);
+  const d = await api('/api/documents/folders' + (p.toString() ? '?' + p : ''));
+  if (!prefix) dtree.root = d.prefix || '';
+  dtree.kids.set(prefix, d.items);
+  return d.items;
+}
+
+function docNodeHTML(f) {
+  const on = !state.q && dstate.folder === f.folder;
+  const open = dtree.open.has(f.folder);
+  return `<div class="tnode-wrap" data-wrap="${esc(f.folder)}">
+    <div class="tnode ${on ? 'on' : ''}" data-node="${esc(f.folder)}"
+         role="treeitem" tabindex="0" title="${esc(f.folder)}"
+         aria-selected="${on}" aria-expanded="${f.has_children ? open : ''}">
+      <span class="tw ${f.has_children ? '' : 'leaf'} ${open ? 'open' : ''}"
+            data-tw="${esc(f.folder)}" role="presentation">▶</span>
+      <span class="tn">${esc(f.name)}</span>
+      <span class="tc">${f.c}</span>
+    </div>
+    <div class="tkids" data-kids="${esc(f.folder)}" ${open ? '' : 'hidden'}></div>
+  </div>`;
+}
+
+async function paintDocKids(prefix, box) {
+  box.innerHTML = '<div class="loading">載入中…</div>';
+  let items;
+  try { items = await docKids(prefix); }
+  catch (e) { box.innerHTML = `<div class="empty">載入失敗：${esc(e.message)}</div>`; return; }
+  box.innerHTML = items.length ? items.map(docNodeHTML).join('')
+    : '<div class="empty">沒有子資料夾</div>';
+  // 已經展開過的分支要跟著補回來（收合再展開時不必重打 API，kids 有快取）
+  for (const f of items) {
+    if (dtree.open.has(f.folder)) {
+      const kb = box.querySelector(`[data-kids="${cssEsc(f.folder)}"]`);
+      if (kb) paintDocKids(f.folder, kb);
+    }
+  }
+}
+
+// 窄螢幕上側欄是抽屜，預設收起來 —— 不收的話一進文件牆就是滿螢幕的資料夾，
+// 要捲很久才看得到檔案。寬螢幕則永遠並排顯示（hidden 一定要清掉，不然
+// 從窄轉寬時側欄會整個消失）。
+let wasNarrow = null;
+
+function syncDocTreePane() {
+  const narrow = window.matchMedia('(max-width:900px)').matches;
+  wasNarrow = narrow;
+  $('#docTree').hidden = narrow;
+  $('#docTreeToggle').setAttribute('aria-expanded', String(!narrow));
+}
+// 只在真的跨越斷點時才動它。每次 resize 都同步的話，使用者在窄螢幕上
+// 開著抽屜、手指稍微碰到縮放就被關掉。
+window.addEventListener('resize', () => {
+  const narrow = window.matchMedia('(max-width:900px)').matches;
+  if (narrow === wasNarrow) return;
+  wasNarrow = narrow;
+  if (!$('#docView').hidden) syncDocTreePane();
+});
+
+async function loadDocFolders() {
+  const body = $('#docTreeBody');
+  dtree.kids.clear();
+  syncDocTreePane();
+  body.innerHTML = '<div class="loading">載入中…</div>';
+  await paintDocKids('', body);
+  paintCrumbs();
+}
+
+// 點名字＝換內容；點箭頭＝只展開，不換內容。分開是刻意的：想確認
+// 「這底下有什麼」不該把右邊整頁換掉。
+$('#docTreeBody').onclick = async e => {
+  const tw = e.target.closest('[data-tw]');
+  if (tw) {
+    e.stopPropagation();
+    const path = tw.dataset.tw;
+    const box = $('#docTreeBody').querySelector(`[data-kids="${cssEsc(path)}"]`);
+    if (!box) return;
+    if (dtree.open.has(path)) {
+      dtree.open.delete(path); box.hidden = true; tw.classList.remove('open');
+    } else {
+      dtree.open.add(path); box.hidden = false; tw.classList.add('open');
+      if (!box.innerHTML) await paintDocKids(path, box);
+    }
+    const node = tw.closest('.tnode');
+    if (node) node.setAttribute('aria-expanded', dtree.open.has(path));
+    return;
+  }
+  const node = e.target.closest('[data-node]');
+  if (node) selectDocFolder(node.dataset.node);
+};
+
+$('#docTreeBody').onkeydown = e => {
+  const node = e.target.closest('[data-node]');
+  if (!node) return;
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault(); selectDocFolder(node.dataset.node);
+  } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+    const tw = node.querySelector('[data-tw]');
+    const open = dtree.open.has(node.dataset.node);
+    if (tw && !tw.classList.contains('leaf') && (e.key === 'ArrowRight') !== open) {
+      e.preventDefault(); tw.click();
+    }
+  }
+};
+
+function selectDocFolder(path) {
+  dstate.folder = path; dstate.page = 1;
+  if (window.matchMedia('(max-width:900px)').matches) closeDocTree();
+  paintCrumbs();          // 選取標示也在這裡面一起畫
+  loadDocs();
+}
+
+/* 麵包屑。路徑有 7～8 層，全部畫出來會佔掉兩三行，所以中段折成「…」，
+   只留頭一層與最後兩層 —— 頭一層是脈絡，最後兩層是「我現在在哪」。 */
+function paintCrumbs() {
+  const bar = $('#docCrumbs');
+  if (!bar) return;
+  const root = dtree.root || '';
+  const rest = dstate.folder && dstate.folder.startsWith(root)
+    ? dstate.folder.slice(root.length) : dstate.folder || '';
+  const segs = rest.split('/').filter(Boolean);
+  const crumb = (label, path, cur) => cur
+    ? `<span class="cur">${esc(label)}</span>`
+    : `<button data-crumb="${esc(path)}">${esc(label)}</button>`;
+  const parts = [crumb('全部', '', !segs.length)];
+  let acc = root;
+  const keep = segs.length > 3 ? [0, segs.length - 2, segs.length - 1] : segs.map((_, i) => i);
+  segs.forEach((s, i) => {
+    acc += '/' + s;
+    if (!keep.includes(i)) {
+      if (keep.includes(i + 1) && i > 0) parts.push('<span class="sep">…</span>');
+      return;
+    }
+    parts.push('<span class="sep">›</span>', crumb(s, acc, i === segs.length - 1));
+  });
+  bar.innerHTML = parts.join('');
+  bar.querySelectorAll('[data-crumb]').forEach(b => b.onclick = () => {
+    selectDocFolder(b.dataset.crumb);
+  });
+  // 搜尋是跨全庫的，這時樹上不該還有一個節點亮著說「你在這裡」
+  const sel = state.q ? null : dstate.folder;
+  $$('#docTreeBody .tnode').forEach(n => {
+    const on = n.dataset.node === sel;
+    n.classList.toggle('on', on);
+    n.setAttribute('aria-selected', on);
   });
 }
 
-/* ------------------------- 文件牆（PDF） ------------------------- */
-async function loadDocFolders() {
+/* 行動版的抽屜 */
+function closeDocTree() {
+  $('#docTree').hidden = true;
+  $('#docTreeToggle').setAttribute('aria-expanded', 'false');
+}
+$('#docTreeToggle').onclick = () => {
+  const pane = $('#docTree');
+  pane.hidden = !pane.hidden;
+  $('#docTreeToggle').setAttribute('aria-expanded', String(!pane.hidden));
+};
+
+/* 篩選資料夾。輸入時改成打平的搜尋結果（跨層），清空就回到樹。
+   在 452 個資料夾裡逐層點下去找一個名字是很痛的，所以留一個直接跳的入口。 */
+let dfTimer;
+$('#docFolderQ').oninput = e => {
+  clearTimeout(dfTimer);
+  dfTimer = setTimeout(() => filterDocFolders(e.target.value.trim()), 260);
+};
+
+async function filterDocFolders(q) {
+  dtree.q = q;
+  const body = $('#docTreeBody');
+  if (!q) { dtree.kids.clear(); await paintDocKids('', body); return; }
+  body.innerHTML = '<div class="loading">搜尋中…</div>';
   let d;
-  try { d = await api('/api/documents/folders'); } catch { return; }
-  const bar = $('#docFolderBar');
-  bar.innerHTML = `<div class="fchip ${dstate.folder ? '' : 'on'}" data-dfolder="">
-      <span class="fc-n">全部</span></div>` + d.items.map(f => `
-    <div class="fchip ${dstate.folder === f.folder ? 'on' : ''}" data-dfolder="${esc(f.folder)}"
-         title="${esc(f.folder)}">
-      <span><span class="fc-n">${esc(shortFolder(f.folder))}</span>
-      <span class="fc-c"> ${f.c}</span></span>
-    </div>`).join('');
-  bar.querySelectorAll('[data-dfolder]').forEach(el => el.onclick = () => {
-    dstate.folder = el.dataset.dfolder; dstate.page = 1; loadDocs();
-  });
+  try { d = await api('/api/documents/folders?flat=true'); }
+  catch (e) { body.innerHTML = `<div class="empty">載入失敗：${esc(e.message)}</div>`; return; }
+  const needle = q.toLowerCase();
+  const hit = d.items.filter(f => f.folder.toLowerCase().includes(needle)).slice(0, 200);
+  if (!hit.length) { body.innerHTML = '<div class="empty">找不到符合的資料夾</div>'; return; }
+  // 搜尋結果沒有層級可言，所以顯示「最後兩層」讓同名資料夾分得出來
+  body.innerHTML = hit.map(f => {
+    const segs = f.folder.split('/').filter(Boolean);
+    const label = segs.slice(-2).join(' / ');
+    return `<div class="tnode ${dstate.folder === f.folder ? 'on' : ''}"
+      data-node="${esc(f.folder)}" role="treeitem" tabindex="0" title="${esc(f.folder)}">
+      <span class="tw leaf">▶</span>
+      <span class="tn">${esc(label)}</span><span class="tc">${f.c}</span></div>`;
+  }).join('');
+}
+
+/* 每一列要顯示的路徑：相對於目前選中的節點。
+
+   原本一律顯示 shortFolder()（路徑最後一層），在這個庫裡等於整牆都是
+   「教用(PDF)」「學用(PDF)」「PDF」，分不出誰是誰。改成：
+     - 選了資料夾 → 顯示它底下的剩餘路徑；剛好就在選中那層則不顯示（不冗餘）
+     - 沒選（搜尋全庫）→ 顯示最後兩層，前面折成「…」 */
+function docSubPath(folder) {
+  // 搜尋是跨全庫的，結果跟選中的節點沒有關係 —— 這時一律給可辨識的尾段，
+  // 不能拿 dstate.folder 去切（會把不相干的路徑截成看起來像子路徑的東西）。
+  const base = state.q ? '' : dstate.folder;
+  if (base && folder === base) return '';
+  if (base && folder.startsWith(base + '/')) {
+    return folder.slice(base.length + 1).split('/').join(' › ');
+  }
+  const segs = folder.split('/').filter(Boolean);
+  return (segs.length > 2 ? '… › ' : '') + segs.slice(-2).join(' › ');
 }
 
 async function loadDocs() {
   const grid = $('#dgrid');
   grid.innerHTML = '<div class="loading">載入中…</div>';
   const p = new URLSearchParams({ page: dstate.page, page_size: 60, sort: dstate.sort });
-  if (dstate.folder) p.set('folder', dstate.folder);
-  if (state.q) p.set('q', state.q);
+  // 搜尋時忽略選中的資料夾，直接搜全庫。原本兩者是 AND，於是「選了一個
+  // 資料夾之後就再也搜不到別處的東西」，而畫面上沒有任何線索說明為什麼。
+  const searching = !!state.q;
+  // 選中的是樹上的一個節點，要看的是「它與它底下的一切」。精確比對的話，
+  // 選中任何一個中間層都會是 0 筆 —— 這個庫的檔案全都在葉節點上。
+  if (dstate.folder && !searching) { p.set('folder', dstate.folder); p.set('subtree', 'true'); }
+  if (searching) p.set('q', state.q);
   let d;
   try { d = await api('/api/documents?' + p); }
   catch (e) { grid.innerHTML = `<div class="loading">載入失敗：${esc(e.message)}</div>`; return; }
   dstate.items = d.items; dstate.total = d.total;
-  $('#docCount').textContent = d.total ? `共 ${d.total} 份` : '';
+  $('#docCount').textContent = d.total
+    ? `共 ${d.total} 份${searching ? '（全庫搜尋）' : ''}` : '';
   if (!d.items.length) {
-    grid.innerHTML = `<div class="empty"><h3>沒有文件</h3>
-      <p>把 PDF 放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
+    grid.innerHTML = searching
+      ? `<div class="empty"><h3>找不到「${esc(state.q)}」</h3>
+         <p>換個關鍵字試試，或清空搜尋框回到資料夾瀏覽。</p></div>`
+      : `<div class="empty"><h3>沒有文件</h3>
+         <p>把 PDF 放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
     $('#dpager').innerHTML = ''; return;
   }
   // 用 <button> 而不是 <div>：鍵盤 Tab 與 Enter 直接就能用，不必自己補
@@ -624,22 +1200,16 @@ async function loadDocs() {
   grid.innerHTML = d.items.map(x => `
     <button class="doc" data-doc="${x.id}" title="${esc(x.folder + '/' + x.filename)}">
       <span class="di">PDF</span>
-      <span class="dn"><b>${esc(x.filename)}</b><span>${esc(shortFolder(x.folder))}</span></span>
+      <span class="dn"><b>${esc(x.filename)}</b><span>${esc(docSubPath(x.folder))}</span></span>
       <span class="ds">${fmtBytes(x.size)}</span>
     </button>`).join('');
   grid.querySelectorAll('[data-doc]').forEach(el => el.onclick = () => {
     location.href = '/reader?doc=' + el.dataset.doc;
   });
 
-  const pages = Math.ceil(d.total / d.page_size);
-  $('#dpager').innerHTML = pages > 1 ? `
-    <button class="btn" ${dstate.page <= 1 ? 'disabled' : ''} data-dp="-1">上一頁</button>
-    <span style="padding:0 12px;color:var(--dim)">${dstate.page} / ${pages}</span>
-    <button class="btn" ${dstate.page >= pages ? 'disabled' : ''} data-dp="1">下一頁</button>` : '';
-  $('#dpager').querySelectorAll('[data-dp]').forEach(b => b.onclick = () => {
-    dstate.page += +b.dataset.dp;
-    pageTo(loadDocs, '#dgrid');
-  });
+  paintPager('#dpager',
+    { page: d.page, total: d.total, pageSize: d.page_size });
+  bindPager('#dpager', p => { dstate.page = p; return pageTo(loadDocs, '#dgrid'); });
 }
 
 /* --------------------- 相片檢視器（PhotoSwipe） --------------------- */
@@ -690,6 +1260,13 @@ async function openPhoto(i) {
 
 /* ------------------------- 事件 ------------------------- */
 // 三個檢視（影片／相片／文件）共用同一塊區域，一次只顯示一個。
+// 每個檢視有自己的排序選項。後端三邊都吃 sort，但可選的鍵不一樣 ——
+// 影片有年份與評分，文件沒有；文件的預設是檔名（一套講義的順序是編號）。
+const SORTS = {
+  video: [['added', '最近加入'], ['title', '片名'], ['year', '年份'], ['rating', '評分']],
+  doc: [['name', '檔名'], ['time', '檔案時間'], ['size', '大小'], ['added', '最近加入']],
+};
+
 function showView(kind) {
   const photo = kind === 'photo', doc = kind === 'doc';
   const other = photo || doc;
@@ -698,7 +1275,16 @@ function showView(kind) {
   for (const id of ['#grid', '#pager', '#libTitle', '#continue']) {
     const el = $(id); if (el) el.hidden = other;
   }
-  $('.toolbar').hidden = other;           // 類型與排序是影片用的
+  // 整條 toolbar 原本是一起藏的，於是文件牆的排序後端支援了卻沒有 UI 可以選。
+  // 類型 chips 確實只有影片用得到，但排序三邊都要。
+  $('.toolbar').hidden = photo;
+  $('#genres').hidden = other;
+  if (!photo) {
+    const opts = SORTS[doc ? 'doc' : 'video'];
+    const cur = doc ? dstate.sort : state.sort;
+    $('#sort').innerHTML = opts.map(([v, label]) =>
+      `<option value="${v}" ${v === cur ? 'selected' : ''}>${label}</option>`).join('');
+  }
   $('#q').placeholder = other ? '搜尋檔名或資料夾…' : '搜尋片名或檔名…';
 }
 
@@ -723,12 +1309,17 @@ $('#q').oninput = e => {
   clearTimeout(qTimer);
   qTimer = setTimeout(() => {
     state.q = e.target.value.trim();
-    if (!$('#photoView').hidden) { pstate.page = 1; loadPhotos(); }
-    else if (!$('#docView').hidden) { dstate.page = 1; loadDocs(); }
+    // 搜尋會蓋過「選中的相簿／資料夾」，所以那兩塊導覽的選取標示要跟著重畫，
+    // 不然畫面上會同時說「你在看這個相簿」與「這是全庫搜尋結果」。
+    if (!$('#photoView').hidden) { pstate.page = 1; paintFolderBar(); loadPhotos(); }
+    else if (!$('#docView').hidden) { dstate.page = 1; paintCrumbs(); loadDocs(); }
     else { state.page = 1; loadLibrary(); }
   }, 320);
 };
-$('#sort').onchange = e => { state.sort = e.target.value; state.page = 1; loadLibrary(); };
+$('#sort').onchange = e => {
+  if (!$('#docView').hidden) { dstate.sort = e.target.value; dstate.page = 1; loadDocs(); }
+  else { state.sort = e.target.value; state.page = 1; loadLibrary(); }
+};
 
 (async function init() {
   await loadMe();               // 先知道身分，才知道要不要畫出下載與管理按鈕

@@ -162,12 +162,15 @@ def library(
         where.append(f"EXISTS(SELECT 1 FROM media_file f2 WHERE f2.item_id=i.id AND {acl_frag})")
         params += acl_args
 
+    # 每一種排序都要有決定性的收尾（`i.id`）—— 理由見 photos() 的同一段註解：
+    # 並列的資料列在兩次查詢之間順序不保證，而分頁是重新查一次。
+    # 「同一天加入的一批」「同年份」「都沒有評分（COALESCE 成 0）」都會並列。
     order = {
-        "added": "i.added_at DESC",
-        "title": "i.sort_title ASC",
-        "year": "COALESCE(i.year,0) DESC, i.title ASC",
-        "rating": "COALESCE(i.rating,0) DESC, i.title ASC",
-    }.get(sort, "i.added_at DESC")
+        "added": "i.added_at DESC, i.id DESC",
+        "title": "i.sort_title ASC, i.id ASC",
+        "year": "COALESCE(i.year,0) DESC, i.title ASC, i.id ASC",
+        "rating": "COALESCE(i.rating,0) DESC, i.title ASC, i.id ASC",
+    }.get(sort, "i.added_at DESC, i.id DESC")
 
     page = max(1, page)
     page_size = min(max(1, page_size), 200)
@@ -920,9 +923,14 @@ def photos(request: Request, folder: Optional[str] = None, q: Optional[str] = No
     # sort_ts 是寫入時算好的排序鍵。原本是 COALESCE(taken_at, mtime)，
     # 而那兩欄是格式不同的字串 —— 字串比大小的結果是「同一天裡只有 mtime 的
     # 照片永遠排在有 EXIF 的前面」，因為 ' '(0x20) < 'T'(0x54)。
+    # **每一種排序都要有決定性的收尾（`id`）。**沒有的話，並列的那幾筆在
+    # 兩次查詢之間的順序不保證一樣 —— 而分頁是 LIMIT/OFFSET，第 2 頁是重新
+    # 查一次。順序一變，交界處就會有相片重複出現或整個被跳過。
+    # 這座片庫實測有 740 組同檔名、325 組同大小，所以這不是理論風險。
+    # 無限捲動（P-2）會把這個機率放大到每次瀏覽都踩得到。
     order = {"taken": "sort_ts DESC, id DESC",
-             "name": "filename COLLATE NOCASE",
-             "size": "size DESC",
+             "name": "filename COLLATE NOCASE, id DESC",
+             "size": "size DESC, id DESC",
              "added": "added_at DESC, id DESC"}.get(sort, "sort_ts DESC, id DESC")
     total = db.q1(f"SELECT COUNT(*) c FROM photo{sql_where}", tuple(params))["c"]
     rows = db.q(f"""SELECT id, folder, filename, ext, size, mtime, width, height,
@@ -1001,10 +1009,13 @@ def documents(request: Request, folder: Optional[str] = None, q: Optional[str] =
     sql_where = " WHERE " + " AND ".join(where)
     # 白名單排序。文件的預設是檔名而不是時間 —— 一套規格書或一系列講義
     # 的閱讀順序是編號，不是誰先被下載。
-    order = {"name": "filename COLLATE NOCASE",
+    # 收尾一律加 id，理由同 photos()。文件庫最容易並列 —— 同一份規格書的
+    # 不同版本常常同名（放在不同資料夾），而 filename 排序只比檔名。
+    order = {"name": "filename COLLATE NOCASE, id DESC",
              "time": "sort_ts DESC, id DESC",
-             "size": "size DESC",
-             "added": "added_at DESC, id DESC"}.get(sort, "filename COLLATE NOCASE")
+             "size": "size DESC, id DESC",
+             "added": "added_at DESC, id DESC"}.get(sort,
+                                                    "filename COLLATE NOCASE, id DESC")
     total = db.q1(f"SELECT COUNT(*) c FROM document{sql_where}", tuple(params))["c"]
     rows = db.q(f"""SELECT id, folder, filename, ext, size, mtime, sort_ts, pages
                     FROM document{sql_where} ORDER BY {order} LIMIT ? OFFSET ?""",
