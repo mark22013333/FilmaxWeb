@@ -181,6 +181,34 @@ check("切回方格時停止觀察", "flowObserver.disconnect()" in src)
 check("瀑布流沒有「第幾頁」的概念 → 分頁器收起來",
       "$('#ppager').innerHTML = '';" in src)
 
+head("[P-2] 回到頂端")
+
+check("有這顆按鈕", 'id="pTop"' in (ROOT / "app" / "static" / "index.html")
+      .read_text(encoding="utf-8"))
+# **不能用 scrollToGrid('#pgrid')**：那是給換頁用的（捲到格線頂端、跳過篩選列），
+# 而相簿標籤那一列在真實片庫有 110 個標籤、高 2,974px —— 於是「回頂端」
+# 會停在 3,095px，完全不是頂端。實機量到才發現的。
+check("點下去是真的捲到 0，不是捲到格線頂端",
+      "window.scrollTo({ top: 0" in src, "用 scrollToGrid 會停在篩選列底下")
+check("尊重 prefers-reduced-motion",
+      src.count("prefers-reduced-motion") >= 2)
+check("只在瀑布流出現（方格有分頁器，換頁本來就會捲回去）",
+      "pstate.mode === 'flow'" in src and "TOP_SHOW_AT" in src)
+check("相片牆沒開的時候不出現", "!$('#photoView').hidden" in src)
+# 這個環境的 scroll 事件不會觸發（實測 scrollY 到 900、事件 0 次），
+# 只靠 scroll 監聽的話按鈕永遠不會出現。視覺元素不該只靠一個訊號源。
+check("除了 scroll 事件還有輪詢兜底（有些環境收不到 window 的 scroll）",
+      "setInterval(" in src and "_lastY" in src)
+check("值沒變就不碰 DOM（輪詢每 300ms 叫一次）",
+      "if (b.hidden !== want)" in src)
+TOP = CSS[CSS.index(".to-top{"):CSS.index(".pmode{")]
+check("位置避開掃描面板（右下）與 toast（正下方置中）",
+      "left:" in TOP and "bottom:" in TOP, TOP[:120])
+check("z-index 比掃描面板(80)低", "z-index:70" in TOP)
+check("手機上只留箭頭", ".to-top span{display:none}" in CSS)
+check("prefers-reduced-motion 有涵蓋", ".to-top" in rm, rm[:400])
+
+
 FLOW = CSS[CSS.index(".pgrid.flow{"):CSS.index(".flow-end{")]
 check("瀑布流用 CSS columns，不引進 masonry 函式庫",
       "column-count" in FLOW and "break-inside:avoid" in FLOW, FLOW[:200])

@@ -728,6 +728,7 @@ $$('.pmode [data-pmode]').forEach(b => b.onclick = () => {
   paintPhotoMode();
   pstate.page = 1;
   loadPhotos();
+  syncTopBtn();
 });
 paintPhotoMode();
 
@@ -812,10 +813,12 @@ async function loadPhotos() {
     pstate.done = pstate.items.length >= d.total;
     updateFlowFooter();
     observeFlow();
+    syncTopBtn();
   } else {
     paintPager('#ppager',
       { page: d.page, total: d.total, pageSize: d.page_size });
     bindPager('#ppager', p => { pstate.page = p; return pageTo(loadPhotos, '#pgrid'); });
+    syncTopBtn();
   }
 }
 
@@ -879,6 +882,50 @@ $('#pmore').addEventListener('click', e => {
   pstate.done = false;
   loadMorePhotos();
 });
+
+/* ---------------- 回到頂端 ----------------
+
+   只在瀑布流出現：方格模式有分頁器，換頁本來就會捲回格線頂端
+   （pageTo → scrollToGrid），不需要這顆。瀑布流沒有那個錨點，
+   滑了兩千張之後要回去只能一直往上滑。                                */
+const TOP_SHOW_AT = 600;          // 捲超過這麼多 px 才出現
+
+function syncTopBtn() {
+  const b = $('#pTop');
+  if (!b) return;
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  const want = !(pstate.mode === 'flow' && !$('#photoView').hidden && y > TOP_SHOW_AT);
+  // 只在真的要變的時候寫 —— 下面那個輪詢每 300ms 會叫一次，
+  // 無條件寫 hidden 等於每次都碰 DOM。
+  if (b.hidden !== want) b.hidden = want;
+}
+
+$('#pTop').onclick = () => {
+  // **不能用 scrollToGrid('#pgrid')。**那是給換頁用的（捲到格線頂端，
+  // 跳過已經看過的篩選列），而相簿標籤這一列在這個片庫有 110 個標籤、
+  // 高 2,974px —— 於是「回頂端」會停在 3,095px 的位置，完全不是頂端。
+  // 這顆按鈕的語意就是「回到最上面」，那就真的捲到 0。
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+};
+
+let _topTimer;
+const _onScroll = () => {
+  // 捲動事件很密集，節流一下；60ms 對「按鈕該不該出現」已經夠即時
+  if (_topTimer) return;
+  _topTimer = setTimeout(() => { _topTimer = null; syncTopBtn(); }, 60);
+};
+addEventListener('scroll', _onScroll, { passive: true });
+// 有些環境（嵌在別的容器裡、或捲動的不是 window）收不到 window 的 scroll，
+// 那樣按鈕就永遠不會出現。**視覺元素不該只靠一個訊號源**：
+// 補一個低頻的輪詢，比較的是數字、沒有變化就不碰 DOM，成本可以忽略。
+let _lastY = -1;
+setInterval(() => {
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  if (y === _lastY) return;
+  _lastY = y;
+  syncTopBtn();
+}, 300);
 
 let flowObserver;
 function observeFlow() {

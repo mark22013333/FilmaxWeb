@@ -338,6 +338,27 @@ body.viewer #btnStats { display: none; }
   justify-content:center;flex-wrap:wrap;
 }
 
+/* 回到頂端（只在瀑布流出現）
+
+   位置避開另外兩個 fixed 元素：掃描面板在 right:20px/bottom:20px（寬 390px）、
+   toast 在畫面正下方置中。所以這顆放**左下角** —— 三個不會疊在一起。
+   z-index 比掃描面板(80)低：掃描進行中時那個面板比較重要。 */
+.to-top{
+  position:fixed;left:20px;bottom:22px;z-index:70;
+  display:inline-flex;align-items:center;gap:6px;
+  padding:9px 14px 9px 11px;border-radius:99px;
+  background:var(--panel-2);color:var(--text);border:1px solid var(--line);
+  box-shadow:var(--shadow);font-size:13px;font-weight:600;
+  transition:background .15s,border-color .15s,transform .15s;
+}
+.to-top:hover{background:var(--panel);border-color:var(--accent);transform:translateY(-2px)}
+.to-top svg{display:block}
+@media(max-width:560px){
+  /* 手機上只留箭頭，文字佔掉的寬度比它提供的資訊值錢 */
+  .to-top{left:14px;bottom:16px;padding:11px;border-radius:50%}
+  .to-top span{display:none}
+}
+
 /* 檢視方式切換 */
 .pmode{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .pmode button{
@@ -506,6 +527,8 @@ body.viewer #btnStats { display: none; }
   .overlay,.overlay.show{transition:none}
   .modal,.overlay.show .modal{transition:none;transform:none}
   .pager .pg{transition:none}
+  .to-top{transition:none}
+  .to-top:hover{transform:none}
 }
 
 /* ---------- 帳號 / 使用者管理 ---------- */
