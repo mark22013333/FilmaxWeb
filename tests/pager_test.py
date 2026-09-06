@@ -121,6 +121,26 @@ for sel in (".overlay", ".modal", ".pager .pg"):
     check(f"prefers-reduced-motion 有涵蓋 {sel}", sel in rm, rm[:400])
 
 
+# ============================================================ HTML 不准快取
+head("[P] HTML 進入點不准快取")
+
+# **這是「改了程式卻看不到效果」的根因。**/static/* 走 StaticFiles，它會發
+# ETag／Last-Modified 所以每次都會回來問；但 index.html 這幾支是 FileResponse
+# 直接吐檔案，瀏覽器可能整份快取 —— 那就連「要載哪些 script」都是舊的，
+# 新加的 DOM 元素當然不存在。實際發生過：切換鈕與哨兵都在伺服器端了，
+# 使用者的畫面上卻沒有。
+MAIN = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+check("HTML 進入點帶 no-store", '"Cache-Control": "no-store, must-revalidate"' in MAIN)
+check("四支 HTML 路由都走同一個 helper（各寫一次遲早漏一個）",
+      MAIN.count('return _page("') == 4, MAIN.count('return _page("'))
+# 唯一允許的 FileResponse(STATIC_DIR / ...) 是 _page() 自己；
+# 路由裡再出現一次就代表那一支繞過了 no-store。
+check("沒有路由繞過 _page() 直接吐檔案（繞過的那一支就會被快取）",
+      MAIN.count("FileResponse(STATIC_DIR /") == 1,
+      MAIN.count("FileResponse(STATIC_DIR /"))
+check("index.html 也在裡面", '_page("index.html")' in MAIN)
+
+
 # ============================================================ 瀑布流
 head("[P-2] 相片瀑布流＋無限捲動")
 

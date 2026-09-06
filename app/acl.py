@@ -122,6 +122,24 @@ def filter_sql(request, col: str) -> Tuple[str, List[Any]]:
     return "(" + " AND ".join(parts) + ")", args
 
 
+def subtree_sql(col: str, prefix: str) -> Tuple[str, List[Any]]:
+    """「這個資料夾與它底下的一切」的條件。回 ("", []) 表示不必過濾（prefix 是根）。
+
+    刻意跟 filter_sql 用同一套範圍比對（>= 前綴／< 前綴＋最大字元），理由也一樣：
+    LIKE 'x/%' 吃不吃得到索引取決於全域的 case_sensitive_like 與欄位 collation，
+    範圍比對則一定吃得到 idx_doc_folder。順帶避開 LIKE 的萬用字元逸出問題 ——
+    資料夾名字裡的 % 與 _ 在這裡完全不必特別處理。
+
+    自己那一列（folder 剛好等於前綴、沒有結尾斜線）要用 OR 併進來，
+    否則選中一個「自己就有檔案」的資料夾會看不到它本層的東西。
+    """
+    pre = _norm(prefix)
+    if pre == "/":
+        return "", []
+    return (f"(({col} >= ? AND {col} < ?) OR {col} = ?)",
+            [pre, pre + _HI, pre.rstrip("/")])
+
+
 def can_read(request, path: Optional[str]) -> bool:
     if not path:
         return True

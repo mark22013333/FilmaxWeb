@@ -991,8 +991,14 @@ def photo_detail(photo_id: int, request: Request):
 # ------------------------------- 文件庫（PDF） -------------------------------
 @router.get("/documents")
 def documents(request: Request, folder: Optional[str] = None, q: Optional[str] = None,
-              sort: str = "name", page: int = 1, page_size: int = 60):
-    """文件列表。形狀跟 /photos 一致，前端才能共用分頁與資料夾那組元件。"""
+              sort: str = "name", page: int = 1, page_size: int = 60,
+              subtree: bool = False):
+    """文件列表。形狀跟 /photos 一致，前端才能共用分頁與資料夾那組元件。
+
+    subtree=true 時 folder 當「子樹根」用，會連同底下所有層一起列。
+    資料夾樹要能選中上層看見底下全部，靠的就是這個；預設仍是精確比對，
+    舊的呼叫方（與 acl_test）行為不變。
+    """
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
     where, params = ["probe_state='ok'"], []
@@ -1001,8 +1007,14 @@ def documents(request: Request, folder: Optional[str] = None, q: Optional[str] =
         where.append(af)
         params += aa
     if folder:
-        where.append("folder=?")
-        params.append(folder)
+        if subtree:
+            sf, sa = acl.subtree_sql("folder", folder)
+            if sf:
+                where.append(sf)
+                params += sa
+        else:
+            where.append("folder=?")
+            params.append(folder)
     if q:
         where.append("(filename LIKE ? OR folder LIKE ?)")
         params += [f"%{q}%", f"%{q}%"]
@@ -1025,13 +1037,118 @@ def documents(request: Request, folder: Optional[str] = None, q: Optional[str] =
 
 
 @router.get("/documents/folders")
-def document_folders(request: Request):
-    """有文件的資料夾清單，附份數。"""
+def document_folders(request: Request, prefix: Optional[str] = None,
+                     flat: bool = False):
+    """資料夾導覽。預設回「prefix 底下的下一層節點」，不是整棵樹。
+
+    這裡本來是把所有資料夾一次攤平回去 —— 實測有 452 個、97% 落在第 7～8 層，
+    前端一次畫成 452 個 chip，而且名字只顯示最後一層，於是畫面上全是分不出來的
+    「PDF」「教用」。改成一次只回一層，深度就不再是問題。
+
+    flat=true 保留舊的扁平清單（相片牆與 acl_test 還在用那個形狀）。
+    """
     af, aa = acl.filter_sql(request, "folder")
+    if flat:
+        rows = db.q(f"""SELECT folder, COUNT(*) c, SUM(size) bytes, MAX(sort_ts) latest
+                       FROM document WHERE probe_state='ok'{(" AND " + af) if af else ""}
+                       GROUP BY folder ORDER BY folder COLLATE NOCASE""", aa)
+        return {"items": [db.row_to_dict(r) for r in rows]}
+
+    where, params = ["probe_state='ok'"], list(aa)
+    if af:
+        where.append(af)
+    sf, sa = acl.subtree_sql("folder", prefix or "")
+    if sf:
+        where.append(sf)
+        params += sa
     rows = db.q(f"""SELECT folder, COUNT(*) c, SUM(size) bytes, MAX(sort_ts) latest
-                   FROM document WHERE probe_state='ok'{(" AND " + af) if af else ""}
-                   GROUP BY folder ORDER BY folder COLLATE NOCASE""", aa)
-    return {"items": [db.row_to_dict(r) for r in rows]}
+                   FROM document WHERE {" AND ".join(where)}
+                   GROUP BY folder""", tuple(params))
+    out = _folder_level(rows, prefix or "")
+    # 沒指定 prefix 時，若最外層只有一個節點就自動往下走到第一個分岔為止。
+    # 這個庫的根就是這種形狀（/媒體資料庫 → Book → …），不跳過的話使用者
+    # 開啟文件牆看到的第一個畫面是「一個選項」，等於白點一次。
+    if prefix is None:
+        for _ in range(8):        # 上限純粹是防呆，避免資料異常時在這裡空轉
+            if len(out["items"]) != 1 or not out["items"][0]["has_children"]:
+                break
+            out = _folder_level(rows, out["items"][0]["folder"])
+    return out
+
+
+CHAIN_MAX = 2          # 單鏈穿透一次最多併幾段（見 _folder_level 的說明）
+
+
+def _folder_level(rows, prefix: str) -> Dict[str, Any]:
+    """把子樹裡的資料夾統計，聚合成「下一層」的節點清單。
+
+    每個節點的 c 是**遞迴總數**（含所有子孫）而不是本層的數量 —— 父節點的
+    份數若只算本層，這個庫裡幾乎每個父節點都會顯示 0，導覽時完全看不出
+    哪一條路底下有東西。
+
+    單鏈穿透：一個節點如果只有一條路可走（唯一子節點、且自己本層沒有檔案），
+    就把那一段一路併進顯示名稱，例如「資料庫 / Book / 國小講義」。
+    不這樣做的話，這個庫的前三層每層都只有一個選項，等於強迫使用者連點三次
+    才看得到第一個真正的分岔。
+    """
+    base = acl._norm(prefix) if prefix else "/"
+    blen = len(base)
+
+    # 先把每一列切成「相對於 base 的路徑片段」，之後全部在這份清單上算，
+    # 不再回頭碰 SQL。這個庫只有 452 個資料夾，整批放在記憶體裡很便宜。
+    split: List[Any] = []
+    for r in rows:
+        folder = r["folder"]
+        if not folder.startswith(base):
+            continue
+        segs = [s for s in folder[blen:].split("/") if s]
+        if segs:                          # 沒有 segs 的是前綴自己那一列，不是子節點
+            split.append((segs, r["c"] or 0, r["bytes"] or 0, r["latest"]))
+
+    # seg -> 這個子樹的統計。self 是「剛好停在這一層」的份數，
+    # kids 是再下一段的名字（用來判斷還有沒有分岔）。
+    level: Dict[str, Dict[str, Any]] = {}
+    for segs, c, b, latest in split:
+        n = level.setdefault(segs[0], {"c": 0, "bytes": 0, "latest": None,
+                                       "self": 0, "kids": set()})
+        n["c"] += c
+        n["bytes"] += b
+        if latest is not None:
+            n["latest"] = max(n["latest"] or 0, latest)
+        if len(segs) == 1:
+            n["self"] += c
+        else:
+            n["kids"].add(segs[1])
+
+    items = []
+    for seg, n in level.items():
+        chain = [seg]                     # 已經併進來的路徑片段
+        # 單鏈穿透：只有一條路可走就一路往下併。每一步都在 split 上重算
+        # 下一段的分岔情形，不遞迴、不重查 DB。
+        #
+        # 最多併 CHAIN_MAX 段：這個庫的資料夾名字本來就長（「115學年上學期 國小
+        # 康軒版 課習教PDF(含習作、課本、教師手冊)…」），無限併下去會做出一個
+        # 塞滿整個側欄、還是看不出重點的節點 —— 那只是把「太多選項」換成
+        # 「太長的一個選項」。併不完的部分留給下一次展開。
+        while len(chain) < CHAIN_MAX and n["self"] == 0 and len(n["kids"]) == 1:
+            chain.append(next(iter(n["kids"])))
+            d = len(chain)
+            selfc, kids = 0, set()
+            for segs, c, _b, _l in split:
+                if len(segs) < d or segs[:d] != chain:
+                    continue
+                if len(segs) == d:
+                    selfc += c
+                else:
+                    kids.add(segs[d])
+            n = {"self": selfc, "kids": kids}
+        items.append({"folder": base + "/".join(chain), "name": " / ".join(chain),
+                      "c": level[seg]["c"], "bytes": level[seg]["bytes"],
+                      "latest": level[seg]["latest"],
+                      # 併完之後還有分岔（或併不動但底下還有層）才算有子節點
+                      "has_children": bool(n["kids"])})
+    items.sort(key=lambda x: x["name"].casefold())
+    return {"items": items, "prefix": prefix or ""}
 
 
 @router.get("/documents/{doc_id}")

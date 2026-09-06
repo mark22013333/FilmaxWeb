@@ -291,20 +291,37 @@ app.include_router(stream.router, prefix="/api", tags=["stream"])
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+# HTML 進入點一律不准快取。
+#
+# **這是「改了程式卻看不到效果」的根因。**`/static/*` 走 StaticFiles，它會發
+# ETag 與 Last-Modified，所以 app.js／style.css 每次都會回伺服器問一下（304
+# 很便宜）。但 index.html 這幾支是 FileResponse 直接吐檔案，瀏覽器有可能整份
+# 快取起來 —— 那就連「要載哪些 script」都是舊的，新加的 DOM 元素當然不存在。
+# 實際發生過：切換鈕與哨兵元素都在伺服器端了，使用者的畫面上卻沒有。
+#
+# 這幾支是小檔案而且一天不會被要幾次，no-store 的成本可以忽略；
+# 而它換到的是「重新整理就一定看得到最新版」。
+_NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
+
+
+def _page(name: str) -> FileResponse:
+    return FileResponse(STATIC_DIR / name, headers=_NO_CACHE)
+
+
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return _page("index.html")
 
 
 @app.get("/player", include_in_schema=False)
 def player():
-    return FileResponse(STATIC_DIR / "player.html")
+    return _page("player.html")
 
 
 @app.get("/reader", include_in_schema=False)
 def reader():
     """PDF 閱讀器。實際要讀哪一份由網址的 ?doc= 決定，權限在 API 那一層擋。"""
-    return FileResponse(STATIC_DIR / "reader.html")
+    return _page("reader.html")
 
 
 @app.get("/admin", include_in_schema=False)
@@ -327,7 +344,7 @@ def admin_page(request: Request):
             "margin:15vh auto;padding:0 24px;color:#222}</style>"
             "<h2>需要管理員權限</h2><p>你的帳號是唯讀角色，看不到管理後台。</p>"
             "<p><a href=\"/\">回到媒體庫</a></p>", status_code=403)
-    return FileResponse(STATIC_DIR / "admin.html")
+    return _page("admin.html")
 
 
 @app.get("/healthz", include_in_schema=False)
