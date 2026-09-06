@@ -48,19 +48,53 @@
   <div class="grid" id="grid"></div>
   <div id="pager"></div>
 
-  <!-- 文件牆（PDF）。跟影片、相片共用同一塊區域 -->
+  <!-- 文件牆（PDF）。跟影片、相片共用同一塊區域。
+       資料夾有 452 個、深達 7～8 層，所以走側欄樹狀導覽而不是平鋪標籤。 -->
   <div id="docView" hidden>
-    <div class="folder-bar" id="docFolderBar"></div>
-    <div class="section-title" id="docTitle">文件 <span id="docCount"></span></div>
-    <div class="dgrid" id="dgrid"></div>
-    <div id="dpager"></div>
+    <button class="tree-toggle" id="docTreeToggle" aria-expanded="false"
+            aria-controls="docTree">📁 <span id="docTreeLabel">選擇資料夾</span></button>
+    <div class="split">
+      <aside class="tree-pane" id="docTree">
+        <div class="tree-search">
+          <input id="docFolderQ" type="search" placeholder="篩選資料夾…" autocomplete="off">
+        </div>
+        <div class="tree" id="docTreeBody" role="tree" aria-label="文件資料夾"></div>
+      </aside>
+      <div class="split-main">
+        <nav class="crumbs" id="docCrumbs" aria-label="目前位置"></nav>
+        <div class="section-title" id="docTitle">文件 <span id="docCount"></span></div>
+        <div class="dgrid" id="dgrid"></div>
+        <div id="dpager"></div>
+      </div>
+    </div>
   </div>
 
-  <!-- 相片牆。跟影片共用同一塊區域，切分頁時互相顯示/隱藏 -->
+  <!-- 相片牆。跟影片共用同一塊區域，切分頁時互相顯示/隱藏。
+       相簿只有十幾個而且全在同一層，所以維持封面標籤（縮圖才是相簿最好認的
+       線索），不像文件牆那樣走樹狀 —— 那邊是 452 個、深達 7～8 層。 -->
   <div id="photoView" hidden>
+    <div class="album-bar">
+      <input id="photoFolderQ" type="search" placeholder="篩選相簿…" autocomplete="off">
+      <select class="sort" id="photoSort">
+        <option value="taken">最新</option>
+        <option value="name">名稱</option>
+        <option value="size">大小</option>
+        <option value="added">最近加入</option>
+      </select>
+      <!-- 檢視方式。預設維持方格＋分頁：那是既有的行為，把預設換掉等於
+           強迫所有人適應新版面。想要瀑布流的人自己開，選擇存 localStorage。 -->
+      <div class="pmode" role="group" aria-label="相片檢視方式">
+        <button type="button" data-pmode="grid" class="on"
+                aria-pressed="true" title="方格：裁成正方形、分頁">方格</button>
+        <button type="button" data-pmode="flow"
+                aria-pressed="false" title="瀑布流：原始比例、往下滑自動載入">瀑布流</button>
+      </div>
+    </div>
     <div class="folder-bar" id="folderBar"></div>
     <div class="section-title" id="photoTitle">相片 <span id="photoCount"></span></div>
     <div class="pgrid" id="pgrid"></div>
+    <!-- 瀑布流的哨兵：捲到它就載下一頁。放在格線外面，重畫格線不會弄丟它。 -->
+    <div id="pmore" hidden></div>
     <div id="ppager"></div>
   </div>
 </main>

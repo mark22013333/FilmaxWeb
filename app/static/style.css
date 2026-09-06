@@ -123,19 +123,68 @@ main{padding:16px 24px 60px;max-width:1800px;margin:0 auto}
 .empty p{margin:0 0 18px;font-size:13.5px}
 
 /* ---------- 分頁 ---------- */
-.pager{display:flex;justify-content:center;align-items:center;gap:12px;margin:32px 0 0}
-.pager span{color:var(--muted);font-size:13px}
+.pager{
+  display:flex;justify-content:center;align-items:center;gap:10px;
+  margin:32px 0 0;flex-wrap:wrap;
+}
+.pager .nums{display:flex;align-items:center;gap:4px}
+/* 頁碼按鈕。min-width 讓 1 位數與 3 位數同寬，換頁時整排不會左右跳動 */
+.pager .pg{
+  min-width:34px;height:34px;padding:0 8px;
+  background:var(--panel);color:var(--text);border:1px solid var(--line);
+  border-radius:8px;font-size:13px;cursor:pointer;
+  transition:background .15s,border-color .15s;
+}
+.pager .pg:hover{background:var(--panel-2);border-color:var(--muted)}
+/* --accent 是黃色，所以目前頁的文字要用深色，不是白色 */
+.pager .pg.on{
+  background:var(--accent);border-color:var(--accent);
+  color:#1a1a1a;font-weight:700;cursor:default;
+}
+.pager .gap{color:var(--dim);padding:0 2px;user-select:none}
+.pager .jump{color:var(--muted);font-size:13px;display:flex;align-items:center;gap:6px}
+.pager .jump input{
+  width:62px;height:32px;text-align:center;
+  background:var(--panel);color:var(--text);
+  border:1px solid var(--line);border-radius:8px;font-size:13px;
+}
+@media(max-width:560px){
+  .pager{gap:6px}
+  .pager .pg{min-width:30px;height:30px;padding:0 5px;font-size:12px}
+  /* 手機上「跳到第幾頁」自己排一行，不要跟頁碼擠在一起 */
+  .pager .jump{flex-basis:100%;justify-content:center;margin-top:4px}
+}
 
-/* ---------- Modal ---------- */
+/* ---------- Modal ----------
+
+   開關動畫（P-3）。**不能用 display:none ↔ block** —— `display` 沒有中間值，
+   CSS transition 對它無效，所以原本的寫法是「一瞬間出現」。
+
+   改用 opacity ＋ visibility：
+     · 只用 opacity 的話，關掉之後那一層還在，會擋住底下的滑鼠事件。
+     · visibility 本身不能漸變，但它的 **transition-delay 可以** ——
+       關閉時延後到淡出跑完才隱藏，開啟時 0s 立刻可見。
+   這個 delay 的不對稱是整段的關鍵，不是筆誤。                              */
 .overlay{
   position:fixed;inset:0;z-index:100;background:rgba(4,6,10,.8);
-  backdrop-filter:blur(6px);display:none;overflow-y:auto;padding:40px 20px;
+  backdrop-filter:blur(6px);overflow-y:auto;padding:40px 20px;
+  opacity:0;visibility:hidden;
+  transition:opacity .18s ease, visibility 0s linear .18s;
 }
-.overlay.show{display:block}
+.overlay.show{
+  opacity:1;visibility:visible;
+  transition:opacity .18s ease, visibility 0s;
+}
 .modal{
   max-width:1000px;margin:0 auto;background:var(--bg-2);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;box-shadow:var(--shadow);
+  transform:translateY(10px) scale(.985);
+  transition:transform .18s cubic-bezier(.2,.7,.3,1);
 }
+.overlay.show .modal{transform:none}
+/* Modal 開著時鎖住背景捲動。原本沒有處理 —— 開著詳情滑滾輪，底下的媒體庫
+   會跟著捲，關掉之後就跑到別的地方了。 */
+body.modal-open{overflow:hidden}
 .hero{position:relative;min-height:260px;background:#0d1016}
 .hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.42}
 .hero::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,var(--bg-2) 8%,rgba(18,21,29,.6) 55%,rgba(18,21,29,.2))}
@@ -207,17 +256,35 @@ body.viewer #btnScan,
 body.viewer #btnStats { display: none; }
 
 /* ---------------------------------------------------------- 相片牆 */
+/* 相簿的篩選與排序。相片牆用的是封面標籤而不是文件牆那種側邊樹：
+   相簿只有十幾個、全部在同一層，而封面縮圖是這裡最好認的線索 ——
+   換成純文字的樹反而更難挑。 */
+.album-bar{display:flex;gap:10px;align-items:center;padding:0 0 12px;flex-wrap:wrap}
+.album-bar input{
+  flex:1;min-width:150px;max-width:280px;padding:7px 12px;border-radius:9px;
+  background:var(--panel);border:1px solid var(--line);outline:none;transition:.15s;
+  font-size:13px;
+}
+.album-bar input:focus{border-color:var(--accent)}
+
 .folder-bar{display:flex;gap:8px;flex-wrap:wrap;padding:0 0 14px}
 .fchip{
   display:flex;align-items:center;gap:8px;padding:6px 12px 6px 6px;border-radius:10px;
   background:var(--panel);border:1px solid var(--line);cursor:pointer;transition:.12s;
   font-size:13px;color:var(--muted);
+  /* 相簿名字可以非常長（實測有一個一行就佔滿整列），不限寬的話標籤列
+     會擠成四五行，把相片整個推到第一屏之外。截斷後完整路徑仍在 title。 */
+  max-width:260px;
 }
 .fchip:hover{border-color:var(--accent)}
 .fchip.on{border-color:var(--accent);color:var(--accent)}
 .fchip img{width:34px;height:34px;border-radius:7px;object-fit:cover;flex:none;background:#000}
-.fchip .fc-n{font-weight:600}
-.fchip .fc-c{color:var(--dim);font-size:12px}
+.fchip .fc-t{min-width:0;display:flex;align-items:baseline;gap:4px}
+.fchip .fc-n{
+  font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.fchip .fc-c{color:var(--dim);font-size:12px;flex:none}
+.fc-none{padding:8px 2px;color:var(--dim);font-size:12.5px}
 
 /* 網格用固定列高 + object-fit，直式橫式混在一起才不會參差不齊 */
 .pgrid{
@@ -237,6 +304,49 @@ body.viewer #btnStats { display: none; }
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
 .ph:hover .ph-meta{opacity:1}
+
+/* ---------- 相片瀑布流（P-2） ----------
+
+   用 CSS columns 而不是 JS masonry：這座片庫 100% 的相片在掃描時就存好長寬，
+   <img> 上直接寫 width/height 之後瀏覽器在圖載入前就知道要留多高，版面不會跳。
+   masonry 函式庫解決的正是「要等圖載完才量得到高度」，那個問題在這裡不存在。
+
+   **已知代價**：columns 是先填滿第一欄再填第二欄（垂直流向），所以視覺順序
+   是「由上到下、由左到右」，跟方格的「由左到右、由上到下」不同。
+   按時間排序時第 1～20 張會在最左欄。要橫向順序就得用 JS 定位或
+   CSS Grid masonry（後者還不能依賴），成本不成比例，所以接受。 */
+.pgrid.flow{
+  display:block;
+  column-count:5;column-gap:10px;
+}
+.pgrid.flow .ph{
+  aspect-ratio:auto;              /* 不裁切，照原始比例 */
+  break-inside:avoid;             /* 一張圖不要被切到兩欄 */
+  margin:0 0 10px;
+  display:block;
+}
+.pgrid.flow .ph img{height:auto;object-fit:contain}
+@media(max-width:1400px){ .pgrid.flow{column-count:4} }
+@media(max-width:1000px){ .pgrid.flow{column-count:3} }
+@media(max-width:700px){  .pgrid.flow{column-count:2} }
+@media(max-width:420px){  .pgrid.flow{column-count:1} }
+
+/* 瀑布流底下那一行（載入中／載入更多／到底了） */
+.flow-end{
+  text-align:center;color:var(--muted);font-size:13px;
+  padding:22px 12px;display:flex;gap:10px;align-items:center;
+  justify-content:center;flex-wrap:wrap;
+}
+
+/* 檢視方式切換 */
+.pmode{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.pmode button{
+  padding:0 12px;height:34px;background:var(--panel);color:var(--muted);
+  border:0;font-size:13px;cursor:pointer;transition:background .15s,color .15s;
+}
+.pmode button + button{border-left:1px solid var(--line)}
+.pmode button:hover{background:var(--panel-2);color:var(--text)}
+.pmode button.on{background:var(--accent);color:#1a1a1a;font-weight:700}
 
 /* ---------------------------------------------------------- 燈箱 */
 /* ---------- 文件牆（PDF） ----------
@@ -265,6 +375,78 @@ body.viewer #btnStats { display: none; }
 .doc .dn span{display:block;font-size:11.5px;color:var(--dim);margin-top:2px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .doc .ds{flex:none;font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+
+/* ---------- 資料夾樹（文件牆的導覽） ----------
+
+   為什麼是樹而不是原本的平鋪標籤：這個庫有 452 個資料夾，97% 落在第 7～8 層。
+   平鋪等於一次給 452 個選項，而且標籤只顯示路徑最後一層，於是畫面上出現
+   一整排分不出來的「PDF」「教用」。一次只看一層，深度就不再是問題。 */
+.split{display:grid;grid-template-columns:280px minmax(0,1fr);gap:20px;align-items:start}
+.split-main{min-width:0}          /* 沒有這行，格線裡的長檔名會把整欄撐爆 */
+
+.tree-pane{
+  position:sticky;top:74px;                 /* 標頭是 sticky 的，要讓開 */
+  max-height:calc(100vh - 96px);display:flex;flex-direction:column;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  overflow:hidden;
+}
+.tree-search{padding:10px;border-bottom:1px solid var(--line);flex:none}
+.tree-search input{
+  width:100%;padding:7px 10px;border-radius:8px;background:var(--bg-2);
+  border:1px solid var(--line);outline:none;font-size:13px;transition:.15s;
+}
+.tree-search input:focus{border-color:var(--accent)}
+.tree{overflow-y:auto;padding:6px;flex:1}
+
+.tnode{
+  display:flex;align-items:center;gap:6px;width:100%;padding:6px 8px;border-radius:7px;
+  color:var(--muted);font-size:13px;text-align:left;transition:.12s;
+}
+.tnode:hover{background:var(--panel-2);color:var(--text)}
+.tnode.on{background:var(--panel-2);color:var(--accent)}
+.tnode:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* 展開箭頭是節點裡的另一顆按鈕：點箭頭只展開，點名字才會換內容。
+   兩件事分開，才不會「想看看裡面有什麼」就把右邊整頁換掉。 */
+.tnode .tw{
+  flex:none;width:18px;height:18px;display:grid;place-items:center;border-radius:4px;
+  color:var(--dim);font-size:10px;transition:transform .12s,color .12s;
+}
+.tnode .tw:hover{color:var(--accent)}
+.tnode .tw.open{transform:rotate(90deg)}
+.tnode .tw.leaf{visibility:hidden}
+.tnode .tn{
+  flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-weight:500;
+}
+.tnode.on .tn{font-weight:700}
+.tnode .tc{flex:none;font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums}
+.tkids{margin-left:13px;border-left:1px solid var(--line);padding-left:4px}
+.tree .loading,.tree .empty{padding:14px 10px;color:var(--dim);font-size:12.5px}
+
+/* 麵包屑。中段會被 JS 折成「…」，所以這裡不必處理過長的情形 */
+.crumbs{display:flex;align-items:center;gap:2px;flex-wrap:wrap;font-size:12.5px;
+  color:var(--dim);min-height:20px}
+.crumbs button{padding:3px 7px;border-radius:6px;color:var(--muted);font-size:12.5px}
+.crumbs button:hover{background:var(--panel-2);color:var(--accent)}
+.crumbs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.crumbs .sep{color:var(--dim);opacity:.6;user-select:none}
+.crumbs .cur{color:var(--text);font-weight:600;padding:3px 7px}
+
+/* 行動版才會出現的抽屜開關 */
+.tree-toggle{display:none}
+
+@media(max-width:900px){
+  /* 螢幕不夠寬就不並排 —— 側欄改成從上方滑下來的抽屜，選完自動收起。 */
+  .split{grid-template-columns:minmax(0,1fr)}
+  .tree-toggle{
+    display:flex;align-items:center;gap:7px;width:100%;padding:10px 13px;margin-bottom:12px;
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    font-weight:600;font-size:13px;color:var(--muted);
+  }
+  .tree-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .tree-pane{position:static;max-height:min(60vh,420px);margin-bottom:14px}
+  .tree-pane[hidden]{display:none!important}
+}
 
 /* ---------- 相片檢視器（PhotoSwipe 外觀覆寫） ----------
 
@@ -317,6 +499,13 @@ body.viewer #btnStats { display: none; }
 }
 @media(prefers-reduced-motion:reduce){
   .pswp .pswp__info{transition:none}
+  /* P-3 的開關動畫。**visibility 的 delay 必須留著** —— 拿掉的話關閉時
+     那一層會立刻消失沒問題，但這裡是整段 transition 一起關，所以改寫成
+     沒有延遲的版本，而不是 transition:none（那會讓 visibility 的延遲
+     連同淡出一起消失，效果剛好是我們要的：瞬間開、瞬間關）。 */
+  .overlay,.overlay.show{transition:none}
+  .modal,.overlay.show .modal{transition:none;transform:none}
+  .pager .pg{transition:none}
 }
 
 /* ---------- 帳號 / 使用者管理 ---------- */
