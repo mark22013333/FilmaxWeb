@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS media_item (
     runtime         INTEGER,
     genres          TEXT,                       -- JSON array
     cast_json       TEXT,                       -- JSON array
-    scrape_state    TEXT DEFAULT 'pending',     -- pending / ok / failed / manual
+    scrape_state    TEXT DEFAULT 'pending',     -- pending / ok / failed / manual / skip
     guess_key       TEXT UNIQUE,                -- 用來合併同一部作品
     added_at        REAL,
     updated_at      REAL
@@ -293,6 +293,21 @@ _ADDED_COLUMNS = {
         ("user_id", "INTEGER"),
         ("detail", "TEXT"),
     ],
+    # JAV 刮削（javbus / fc2 / d2pass / jav321）帶回來的欄位。TMDB 沒有對應概念，
+    # 所以不塞進既有欄位 —— 番號尤其不能塞 guess_key 以外的地方，它是這類作品
+    # 唯一穩定的識別碼，日後要重刮、去重、比對都靠它。
+    "media_item": [
+        ("jav_number", "TEXT"),       # SSIS-938 / FC2-PPV-4756708 / 021326_01
+        ("jav_maker", "TEXT"),        # 片商，如 S1
+        ("jav_label", "TEXT"),        # 廠牌，如 S1 NO.1 STYLE
+        ("jav_director", "TEXT"),
+        ("jav_source", "TEXT"),       # 實際刮到的來源：javbus / fc2 / d2pass / jav321
+        # 重試觀測。**先只記錄不做退避** —— 退避的閾值要等真實資料說話，
+        # 現在寫死一個數字是在猜。跑幾週之後看 scrape_attempts 的分佈，
+        # 真有條目累積到 20+ 次仍然 failed，那時再加條件。
+        ("scrape_attempts", "INTEGER DEFAULT 0"),
+        ("scrape_last_at", "INTEGER"),
+    ],
     "media_file": [
         ("mtime_ts", "INTEGER"),      # FTP 的 mtime 字串解析後的 epoch
         ("pix_fmt", "TEXT"),
@@ -333,7 +348,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 added.add(f"{table}.{name}")
     if added & {"photo.sort_ts", "photo.mtime_ts", "media_file.mtime_ts"}:
         _backfill_times(conn)
+    if "media_item.scrape_attempts" in added:
+        _backfill_home_videos(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photo_sort ON photo(sort_ts DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_item_jav_number ON media_item(jav_number)")
     _time_guards(conn)
 
 
@@ -368,6 +386,89 @@ def _time_guards(conn: sqlite3.Connection) -> None:
                     f"CREATE TRIGGER {name} BEFORE {op} ON {table} "
                     f"FOR EACH ROW WHEN {cond} "
                     f"BEGIN SELECT RAISE(ABORT, '{table}.{col} 超出合理時間範圍'); END")
+
+
+def _backfill_home_videos(conn: sqlite3.Connection) -> None:
+    """把既有的手機錄影條目改成 kind='home'。一次性，跟著新欄位觸發。
+
+    為什麼需要這支：guess_key 從 `movie::202110022135460800::` 換成
+    `home::<epoch>`，key 一變，重掃會建新條目、舊的變成孤兒被清掉 ——
+    連同使用者可能已經有的播放進度。所以要就地改，不能靠重掃。
+
+    **三個條件同時成立才動，交集就是誤傷防護：**
+
+    1. `kind='movie'` 且 `scrape_state='failed'` —— 已經刮到的、手動修過的
+       （manual）、使用者自己改過分類的，一律不碰。
+    2. 底下**每一個**檔案都在 home 目錄。混合條目（一部分檔案在、一部分不在）
+       整筆跳過 —— 那種情況該由人來看，不是由 migration 猜。
+    3. 檔名真的解得出拍攝時間。
+
+    再加一道 `tmdb_id IS NULL`：有 tmdb_id 表示它曾經刮到過，不管現在什麼狀態。
+
+    任何一條不成立就整筆留著，交給重掃或使用者處理。**寧可漏，不可錯** ——
+    改錯的條目事後看不出來哪些是被誤改的。
+    """
+    from . import nameparser
+    from .config import settings
+
+    prefixes = settings.home_dirs
+    if not prefixes:
+        return
+
+    rows = conn.execute(
+        "SELECT id FROM media_item "
+        "WHERE kind='movie' AND scrape_state='failed' AND tmdb_id IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+
+    changed = merged = 0
+    for row in rows:
+        item_id = row[0]
+        files = conn.execute(
+            "SELECT ftp_path, filename FROM media_file WHERE item_id=?", (item_id,)
+        ).fetchall()
+        if not files:
+            continue
+        # 條件 2：每一個檔案都要在 home 目錄底下（比對規則同 scanner._home_dir）
+        def _in_home(p: str) -> bool:
+            parts = (p or "").rsplit("/", 1)[0].strip("/").split("/")
+            return any(seg.lower().startswith(prefixes) for seg in parts if seg)
+
+        if not all(_in_home(f[0]) for f in files):
+            continue
+        # 條件 3：檔名解得出時間。同一條目的多個檔案取最早的那個當代表。
+        stamps = [t for t in (nameparser.home_video_time(f[1]) for f in files) if t]
+        if len(stamps) != len(files):
+            continue
+
+        ts = min(stamps)
+        key = f"home::{ts}"
+        # 同一支影片被放到兩個目錄時（這座庫裡有 1 組），兩個條目會算出同一個
+        # key。guess_key 是 UNIQUE，硬 UPDATE 會撞 —— 而「撞到」正是它們本來
+        # 就該是同一筆的證據。把檔案接到先建立的那一筆底下，多的整筆刪掉。
+        keeper = conn.execute(
+            "SELECT id FROM media_item WHERE guess_key=? AND id!=?", (key, item_id)
+        ).fetchone()
+        if keeper:
+            conn.execute("UPDATE media_file SET item_id=? WHERE item_id=?",
+                         (keeper[0], item_id))
+            conn.execute("DELETE FROM media_item WHERE id=?", (item_id,))
+            merged += 1
+            continue
+
+        lt = time.localtime(ts)
+        conn.execute(
+            "UPDATE media_item SET kind='home', title=?, sort_title=?, year=?, "
+            "guess_key=?, scrape_state='skip', updated_at=? WHERE id=?",
+            (time.strftime("%Y-%m-%d %H:%M", lt), time.strftime("%Y%m%d-%H%M%S", lt),
+             lt.tm_year, key, now_i(), item_id),
+        )
+        changed += 1
+
+    if changed or merged:
+        log.info("把 %s 筆條目改成家庭錄影（kind=home）%s", changed,
+                 f"，另有 %s 筆是同一支影片的重複條目已合併" % merged if merged else "")
 
 
 def _backfill_times(conn: sqlite3.Connection) -> None:

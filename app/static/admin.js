@@ -132,7 +132,9 @@ TABS.overview = async el => {
   const warn = [];
   if (d.orphans && d.orphans.total) warn.push(`有 ${d.orphans.total} 筆孤兒資料`);
   if (c.failed) warn.push(`${c.failed} 個檔案分析失敗`);
-  if (c.unscraped) warn.push(`${c.unscraped} 個條目還沒刮到資料`);
+  if (c.unscraped) warn.push(`${c.unscraped} 個條目還沒刮到資料`);   // no_metadata 刻意不進 warn：
+  // 手機錄影這類東西本來就不會有 metadata，把它算成「問題」等於天天報一個
+  // 永遠修不好的假警報，久了整條橫幅就沒人看了。
   if (disk.percent != null && disk.percent >= 90) warn.push(`磁碟只剩 ${bytes(disk.free)}`);
   if (d.pendingUsers) warn.push(`${d.pendingUsers} 個帳號等待審核`);
 
@@ -156,7 +158,8 @@ TABS.overview = async el => {
       <div class="stat"><b>${c.shows}</b><small>影集（${c.episodes} 集）</small></div>
       <div class="stat"><b>${c.files}</b><small>影片檔　${bytes(c.size)}</small></div>
       <div class="stat"><b>${c.photos}</b><small>相片</small></div>
-      <div class="stat ${c.unscraped ? 'warn' : ''}"><b>${c.unscraped}</b><small>未刮削</small></div>
+      <div class="stat ${c.unscraped ? 'warn' : ''}"><b>${c.unscraped}</b><small>待處理</small></div>
+      <div class="stat"><b>${c.no_metadata}</b><small>無 metadata</small></div>
       <div class="stat ${c.failed ? 'bad' : ''}"><b>${c.failed}</b><small>分析失敗</small></div>
       <div class="stat ${d.orphans && d.orphans.total ? 'warn' : ''}">
         <b>${d.orphans ? d.orphans.total : '—'}</b><small>孤兒資料</small></div>
@@ -398,17 +401,21 @@ TABS.library = async el => {
       <div id="ftpList"><div class="empty">按「上一層」或下面的資料夾開始瀏覽。</div></div>
     </div>
 
-    <h3 class="sub">還沒刮到資料（${pr.unscraped.length}）</h3>
+    <h3 class="sub">還沒刮到資料（${pr.unscraped_total ?? pr.unscraped.length}）</h3>
     ${pr.unscraped.length ? `<div class="scrollx"><table class="t">
-      <thead><tr><th>標題</th><th>類型</th><th>年份</th><th>狀態</th></tr></thead><tbody>
+      <thead><tr><th>標題</th><th>類型</th><th>年份</th><th>狀態</th><th></th></tr></thead><tbody>
       ${pr.unscraped.map(r => `<tr><td>${esc(r.title)}</td><td>${esc(r.kind)}</td>
-        <td>${r.year || '—'}</td><td>${esc(r.scrape_state)}</td></tr>`).join('')}
+        <td>${r.year || '—'}</td><td>${esc(r.scrape_state)}</td>
+        <td><button class="btn" data-rescrape="${r.id}">重試</button>
+        <button class="btn" data-skip="${r.id}">不用刮</button></td></tr>`).join('')}
       </tbody></table></div>
       <div class="rowcards">${pr.unscraped.map(r => `<div class="rowcard">
         <div class="top"><b>${esc(r.title)}</b><span class="st">${esc(r.scrape_state)}</span></div>
         <dl><dt>類型</dt><dd>${esc(r.kind)}</dd><dt>年份</dt><dd>${r.year || '—'}</dd></dl>
+        <div class="acts"><button class="btn" data-rescrape="${r.id}">重試</button>
+        <button class="btn" data-skip="${r.id}">不用刮</button></div>
         </div>`).join('')}</div>`
-      : '<div class="empty">全部都刮到了。</div>'}
+      : '<div class="empty">沒有待處理的條目。</div>'}
 
     <h3 class="sub">分析失敗（${pr.failed.length}）</h3>
     ${pr.failed.length ? `<div class="scrollx"><table class="t">
@@ -509,7 +516,19 @@ TABS.library = async el => {
   el.onclick = async e => {
     const dir = e.target.closest && e.target.closest('[data-dir]');
     if (dir) return browse(dir.dataset.dir);
-    const id = e.target.dataset && e.target.dataset.probe;
+    const ds = e.target.dataset || {};
+    if (ds.rescrape) {
+      try { await api('/rescrape/' + ds.rescrape, { method: 'POST' }); toast('已重新刮削'); render('library'); }
+      catch (err) { toast(err.message, true); }
+      return;
+    }
+    if (ds.skip) {
+      // 標成「不用刮」：掉出待處理清單，掃描也不會再拿它去打 API。
+      try { await api('/items/' + ds.skip + '/skip', { method: 'POST' }); toast('已標記為不用刮'); render('library'); }
+      catch (err) { toast(err.message, true); }
+      return;
+    }
+    const id = ds.probe;
     if (!id) return;
     try { await api('/probe/' + id, { method: 'POST' }); toast('已重新分析'); render('library'); }
     catch (err) { toast(err.message, true); }

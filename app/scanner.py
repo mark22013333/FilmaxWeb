@@ -10,7 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
-from . import db, ftpclient, keyframes, media, nameparser, photo, purge, timeparse
+from . import (db, ftpclient, javscraper, keyframes, media, nameparser, photo,
+               purge, timeparse)
 from .config import settings
 from .scraper import normalize_details, tmdb
 
@@ -328,6 +329,28 @@ def _size_exempt(path: str) -> bool:
     return any(seg.lower().startswith(prefixes) for seg in parts if seg)
 
 
+def _dir_hits(path: str, prefixes: tuple) -> bool:
+    """路徑上有沒有哪一層目錄命中這組前綴（跟 `_size_exempt` 同一套規則）。
+
+    只看目錄部分，檔名不參與比對 —— 不然一個叫「手機照片.mp4」的檔案
+    會在任何目錄裡都被判定命中。
+    """
+    if not prefixes:
+        return False
+    parts = posixpath.dirname(path or "").strip("/").split("/")
+    return any(seg.lower().startswith(prefixes) for seg in parts if seg)
+
+
+def _jav_dir(path: str) -> bool:
+    """這個檔案的所在目錄是不是走 JAV 刮削。"""
+    return _dir_hits(path, settings.jav_dirs)
+
+
+def _home_dir(path: str) -> bool:
+    """這個檔案的所在目錄是不是家庭錄影。"""
+    return _dir_hits(path, settings.home_dirs)
+
+
 def _wanted(f) -> bool:
     """這個檔案要不要收進媒體庫。
 
@@ -482,7 +505,24 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     parsed = nameparser.parse(entry.name, parents,
                               sibling_dirs=sibling_dirs, sibling_files=sibling_files)
 
-    if root.kind == "movie":
+    # JAV 目錄優先於 root.kind：這些作品既不是 movie 也不是 tv，
+    # 而且 TMDB 查不到番號（丟進去只會變成 scrape_state='failed'）。
+    # 目錄命中之後還要真的解得出番號才算 —— 同一個目錄裡混著沒有番號的
+    # 檔案（預告、寫真附帶影片）是常態，那些照舊走原本的判斷。
+    jav_number = javscraper.extract_number(entry.name) if _jav_dir(entry.path) else None
+    # 家庭錄影同理：TMDB 不會有手機拍的影片，硬送過去只是每次掃描都失敗一次。
+    # 排在 JAV 之後 —— 兩個目錄設定萬一有重疊，番號的判斷比較明確，讓它先贏。
+    home_ts = (nameparser.home_video_time(entry.name)
+               if not jav_number and _home_dir(entry.path) else None)
+    if jav_number:
+        kind = "jav"
+        parsed.is_tv = False
+        parsed.season = parsed.episode = None
+    elif home_ts:
+        kind = "home"
+        parsed.is_tv = False
+        parsed.season = parsed.episode = None
+    elif root.kind == "movie":
         kind = "movie"
         parsed.is_tv = False
         parsed.season = parsed.episode = None
@@ -494,8 +534,17 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     else:
         kind = "tv" if parsed.is_tv else "movie"
 
-    key = nameparser.guess_key(parsed, kind)
-    item_id = _upsert_item(kind, key, parsed)
+    # 番號天生唯一，拿它當 guess_key 正好利用既有的 UNIQUE 約束去重 ——
+    # 同一部作品的不同檔案（cd1/cd2、重複下載）會合併到同一個條目。
+    if jav_number:
+        key = f"jav::{jav_number}"
+    elif home_ts:
+        # 拍攝時間就是這支錄影的身分。同一支影片被放到兩個目錄時
+        # （這座庫裡有 2 組），epoch 相同會正確合併成一個條目。
+        key = f"home::{home_ts}"
+    else:
+        key = nameparser.guess_key(parsed, kind)
+    item_id = _upsert_item(kind, key, parsed, jav_number=jav_number, home_ts=home_ts)
 
     episode_id = None
     if kind == "tv":
@@ -536,7 +585,8 @@ def _load_registry() -> None:
     log.debug("註冊表載入 %s 個條目、%s 集", len(_item_reg), len(_ep_reg))
 
 
-def _upsert_item(kind: str, key: str, parsed) -> int:
+def _upsert_item(kind: str, key: str, parsed, jav_number: str = None,
+                 home_ts: int = None) -> int:
     hit = _item_reg.get(key)
     if hit is not None:
         return hit
@@ -545,12 +595,24 @@ def _upsert_item(kind: str, key: str, parsed) -> int:
         if hit is not None:
             return hit
         title = parsed.title or parsed.raw
+        sort_title = title.lower()
+        year = parsed.year
+        state = "pending"
+        if home_ts:
+            # 標題排成 ISO 風格是刻意的：同一年的錄影在 year 排序底下會退回
+            # title ASC，而這個格式的字典序剛好等於時序，所以同年內仍然正確。
+            lt = time.localtime(home_ts)
+            title = time.strftime("%Y-%m-%d %H:%M", lt)
+            sort_title = time.strftime("%Y%m%d-%H%M%S", lt)
+            year = lt.tm_year
+            # 家庭錄影沒有外部 metadata 可刮，這不是「還沒刮到」而是「不用刮」。
+            state = "skip"
         cur = db.execute(
             """INSERT INTO media_item(kind, title, original_title, sort_title, year, guess_key,
-                                      scrape_state, added_at, updated_at)
-               VALUES(?,?,?,?,?,?,'pending',?,?)""",
-            (kind, title, parsed.alt_title or "", title.lower(), parsed.year, key,
-             db.now_i(), db.now_i()),
+                                      jav_number, scrape_state, added_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (kind, title, parsed.alt_title or "", sort_title, year, key,
+             jav_number or None, state, db.now_i(), db.now_i()),
         )
         _item_reg[key] = int(cur.lastrowid)
         return _item_reg[key]
@@ -636,13 +698,25 @@ def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
     真的要重刮手動修正過的條目時，走 include_manual=True（後台一個預設關閉的
     勾選）。那必須是一個明確的動作，不是「完整重掃」的副作用。
     """
-    if not tmdb.enabled:
-        status.note("未設定 TMDB_API_KEY，跳過刮削（仍可用檔名瀏覽與播放）")
+    # 兩個刮削源各自獨立：TMDB 沒設不該擋住 JAV，反之亦然。
+    # 兩個都沒有才是真的不用刮。
+    if not tmdb.enabled and not javscraper.enabled():
+        status.note("未設定 TMDB_API_KEY，也未設定 OPENAVER_PATH，跳過刮削"
+                    "（仍可用檔名瀏覽與播放）")
         return
+    if not tmdb.enabled:
+        status.note("未設定 TMDB_API_KEY，只刮 JAV 條目")
+    if not javscraper.enabled():
+        status.note("未設定 OPENAVER_PATH，JAV 條目會維持未刮削")
     if force:
         where = "" if include_manual else "WHERE scrape_state != 'manual'"
     else:
         where = "WHERE scrape_state IN ('pending','failed')"
+    # `skip` 一律不刮，連 include_manual 也不刮 —— 「重刮我手動修正過的」跟
+    # 「重刮本來就不該有 metadata 的」是兩件不同的事，前者不該蘊含後者。
+    # 疊在上面而不是寫進那兩行，是因為那兩行的字面被 rescrape_test 釘住了；
+    # 行為由這裡補完，測試改成驗結果集而不是比對字串。
+    where = f"{where} AND scrape_state != 'skip'" if where else "WHERE scrape_state != 'skip'"
     rows = db.q(f"SELECT * FROM media_item {where} ORDER BY id")
     if force and not include_manual:
         kept = db.q1("SELECT COUNT(*) c FROM media_item WHERE scrape_state='manual'")["c"]
@@ -653,6 +727,10 @@ def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
         if _cancel.is_set():
             return
         status.current = row["title"]
+        # 先記一次嘗試再去打 API：這樣即使中途當掉，次數也算得準。
+        # 目前只記錄不做退避 —— 退避的閾值要等這些數字累積出分佈再定。
+        db.execute("UPDATE media_item SET scrape_attempts=COALESCE(scrape_attempts,0)+1, "
+                   "scrape_last_at=? WHERE id=?", (db.now_i(), row["id"]))
         try:
             _scrape_one(dict(row))
         except Exception as e:
@@ -664,6 +742,11 @@ def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
 
 def _scrape_one(item: dict) -> None:
     kind = item["kind"]
+    if kind == "jav":
+        _scrape_one_jav(item)
+        return
+    if not tmdb.enabled:
+        return
     hit = tmdb.search(kind, item["title"], item.get("year"), item.get("original_title") or "")
     if not hit:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
@@ -691,6 +774,51 @@ def _scrape_one(item: dict) -> None:
 
     if kind == "tv":
         _scrape_seasons(item["id"], n["tmdb_id"])
+
+
+def _scrape_one_jav(item: dict) -> None:
+    """番號類作品的刮削。查不到就標 failed，下次掃描會再試。
+
+    **不寫 NFO、不動影片檔旁邊的任何東西** —— 產出只進 media_item。
+    （OpenAver 自己的 GUI 會寫 NFO，那是給 Jellyfin 用的另一條路，
+    跟這裡無關；兩邊同時用不會打架，因為這裡從頭到尾唯讀影片目錄。）
+    """
+    number = item.get("jav_number") or ""
+    if not number:
+        # 理論上不會發生（kind='jav' 一定是解出番號才設的），但條目可能是
+        # 使用者手動改分類來的。沒有番號就沒得查，直接標 failed 而不是
+        # 拿標題去猜 —— 猜錯會掛上完全不相干的作品。
+        db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
+                   (db.now_i(), item["id"]))
+        status.note(f"沒有番號，跳過: {item['title']}")
+        return
+
+    if not javscraper.enabled():
+        return
+
+    raw = javscraper.search(number)
+    if not raw:
+        db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
+                   (db.now_i(), item["id"]))
+        status.note(f"找不到: {number}")
+        return
+
+    n = javscraper.normalize(raw)
+    # 封面抓不到不算失敗 —— 其他欄位仍然有效，只是沒有圖。
+    poster = javscraper.download_image(n["cover"], referer=n["url"])
+    db.execute(
+        """UPDATE media_item SET title=?, original_title=?, sort_title=?, year=?,
+               overview=?, poster=?, runtime=?, rating=?, genres=?, cast_json=?,
+               jav_number=?, jav_maker=?, jav_label=?, jav_director=?, jav_source=?,
+               scrape_state='ok', updated_at=? WHERE id=?""",
+        (n["title"] or item["title"], n["title"], (n["title"] or "").lower(),
+         n["year"] or item.get("year"), n["overview"], poster, n["runtime"], n["rating"],
+         json.dumps(n["genres"], ensure_ascii=False),
+         json.dumps(n["cast"], ensure_ascii=False),
+         n["number"] or number, n["maker"], n["label"], n["director"], n["source"],
+         db.now_i(), item["id"]),
+    )
+    status.note(f"刮到: {n['number'] or number} {n['title'][:30]} ({n['source']})")
 
 
 def _scrape_seasons(item_id: int, tmdb_id: int) -> None:

@@ -17,3 +17,9 @@ Pillow>=10.4.0
 # 不裝也能跑，帳號會存在本機 SQLite。
 # Windows 另外要裝 Microsoft ODBC Driver 18 for SQL Server。
 pyodbc>=5.1.0
+
+# JAV 刮削（OPENAVER_PATH 有設才會用到）。OpenAver 的 core.scraper 需要這兩個；
+# 它自己的 embedded Python 裝了，但我們是 import 進本專案的 venv 跑。
+requests>=2.32.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0

@@ -18,6 +18,11 @@ from ..scraper import tmdb
 
 router = APIRouter()
 
+# 「還要我處理的」＝不是 ok、不是使用者親手修好的（manual）、也不是
+# 本來就不需要 metadata 的（skip）。跟前端角標（app.js）同一個定義 ——
+# 兩邊一旦漂移，後台的數字跟格線上的紅點就對不起來。
+_UNSCRAPED_SQL = "scrape_state NOT IN ('ok','manual','skip')"
+
 
 # ------------------------- 資料整形 -------------------------
 def _item_row(row) -> Dict[str, Any]:
@@ -143,7 +148,7 @@ def library(
 ):
     where: List[str] = ["1=1"]
     params: List[Any] = []
-    if kind in ("movie", "tv"):
+    if kind in ("movie", "tv", "jav", "home"):
         where.append("i.kind=?")
         params.append(kind)
     if genre:
@@ -154,7 +159,7 @@ def library(
                      "SELECT 1 FROM media_file f WHERE f.item_id=i.id AND f.filename LIKE ?))")
         params += [f"%{q}%", f"%{q}%", f"%{q}%"]
     if unscraped:
-        where.append("i.scrape_state!='ok'")
+        where.append(f"i.{_UNSCRAPED_SQL}")
     # 受限資料夾（L）。條目沒有路徑，路徑在 media_file 上，而影集分組可能跨資料夾 ——
     # 所以規則是「只要還有一個看得到的檔案就看得到」。
     acl_frag, acl_args = acl.filter_sql(request, "f2.ftp_path")
@@ -225,8 +230,17 @@ def stats(request: Request):
     out = {
         "movies": c("SELECT COUNT(*) c FROM media_item WHERE kind='movie'" + item_ex, fa),
         "shows": c("SELECT COUNT(*) c FROM media_item WHERE kind='tv'" + item_ex, fa),
+        "javs": c("SELECT COUNT(*) c FROM media_item WHERE kind='jav'" + item_ex, fa),
+        "homes": c("SELECT COUNT(*) c FROM media_item WHERE kind='home'" + item_ex, fa),
         "files": c("SELECT COUNT(*) c FROM media_file" + fw, fa),
-        "unscraped": c("SELECT COUNT(*) c FROM media_item WHERE scrape_state!='ok'" + item_ex, fa),
+        # 兩個不同的問題，之前被塞進同一個數字：
+        #   unscraped  = 我還要做什麼（只有這個該拉警報）
+        #   no_metadata = 資料完整度多少（忠實，但沒有行動意義）
+        # 舊的 `!='ok'` 把 manual（使用者親手修好的）也算成問題，跟前端角標
+        # （app.js 一直都排除 manual）對不上 —— 後台說有 3 筆、格線上只有 1 個
+        # 紅角標。現在兩邊同一個定義。
+        "unscraped": c(f"SELECT COUNT(*) c FROM media_item WHERE {_UNSCRAPED_SQL}" + item_ex, fa),
+        "no_metadata": c("SELECT COUNT(*) c FROM media_item WHERE scrape_state!='ok'" + item_ex, fa),
         "unprobed": c("SELECT COUNT(*) c FROM media_file WHERE probe_state!='ok'"
                       + (f" AND {ff}" if ff else ""), fa),
         "total_size": db.q1("SELECT COALESCE(SUM(size),0) c FROM media_file" + fw, fa)["c"],
@@ -730,7 +744,14 @@ def _rekey(old_key: Optional[str], kind: str, year: Optional[int]) -> Optional[s
     if not old_key or "::" not in old_key:
         return None
     base = old_key.split("::")[1]
-    return f"tv::{base}" if kind == "tv" else f"movie::{base}::{year or ''}"
+    if kind == "tv":
+        return f"tv::{base}"
+    if kind == "jav":
+        # 番號才是 JAV 的識別碼，不是片名。手動把條目改成 jav 而沒有番號時
+        # 回 None，讓呼叫端保留原本的 key —— 硬湊一個 jav::片名 會跟真正
+        # 用番號當 key 的條目混在同一個命名空間裡。
+        return None
+    return f"movie::{base}::{year or ''}"
 
 
 @router.patch("/items/{item_id}")
@@ -747,7 +768,7 @@ def item_patch(item_id: int, body: ItemPatch, request: Request,
     item = db.row_to_dict(row) or {}
     sets, args, notes = [], [], []
 
-    if body.kind is not None and body.kind not in ("movie", "tv"):
+    if body.kind is not None and body.kind not in ("movie", "tv", "jav", "home"):
         raise HTTPException(400, "kind 只能是 movie 或 tv")
 
     kind = body.kind or item["kind"]
@@ -869,6 +890,29 @@ def rescrape(item_id: int, tmdb_id: Optional[int] = None, title: Optional[str] =
     except Exception as e:
         raise HTTPException(500, str(e))
     return {"ok": True}
+
+
+@router.post("/items/{item_id}/skip")
+def item_skip(item_id: int, undo: bool = Query(default=False), _: str = Depends(admin_only)):
+    """把條目標成「不需要 metadata」（或取消）。
+
+    在這之前，「刮不到」的條目沒有出路：manual 要先成功指定一筆正確資料才拿得到
+    （PATCH /items 與 rescrape?tmdb_id= 都是成功之後才標 manual），
+    所以查無資料的片只能永遠停在 failed，每次掃描重打一次必然失敗的 API，
+    並且永遠佔著「未刮削」那個數字。
+
+    用 skip 而不是 manual 是因為兩者語意不同：manual 是「我已經填好正確答案」，
+    skip 是「這東西根本不需要答案」。混在一起的話 /admin/manual 那張
+    「哪幾筆是我自己修的」清單就沒得看了。
+    """
+    item = db.q1("SELECT id, scrape_state FROM media_item WHERE id=?", (item_id,))
+    if not item:
+        raise HTTPException(404, "找不到條目")
+    # 取消時回到 pending 而不是 failed —— 使用者的意思是「再試一次」。
+    state = "pending" if undo else "skip"
+    db.execute("UPDATE media_item SET scrape_state=?, updated_at=? WHERE id=?",
+               (state, db.now_i(), item_id))
+    return {"ok": True, "scrape_state": state}
 
 
 @router.get("/tmdb/search")
@@ -1338,12 +1382,15 @@ def admin_overview(_: str = Depends(admin_only)):
         "counts": {
             "movies": c("SELECT COUNT(*) c FROM media_item WHERE kind='movie'"),
             "shows": c("SELECT COUNT(*) c FROM media_item WHERE kind='tv'"),
+            "javs": c("SELECT COUNT(*) c FROM media_item WHERE kind='jav'"),
+            "homes": c("SELECT COUNT(*) c FROM media_item WHERE kind='home'"),
             "episodes": c("SELECT COUNT(*) c FROM episode"),
             "files": c("SELECT COUNT(*) c FROM media_file"),
             "photos": c("SELECT COUNT(*) c FROM photo"),
             "documents": c("SELECT COUNT(*) c FROM document"),
             "size": db.q1("SELECT COALESCE(SUM(size),0) c FROM media_file")["c"],
-            "unscraped": c("SELECT COUNT(*) c FROM media_item WHERE scrape_state!='ok'"),
+            "unscraped": c(f"SELECT COUNT(*) c FROM media_item WHERE {_UNSCRAPED_SQL}"),
+            "no_metadata": c("SELECT COUNT(*) c FROM media_item WHERE scrape_state!='ok'"),
             "failed": c("SELECT COUNT(*) c FROM media_file WHERE probe_state='failed'"),
         },
         "disk": disk,
@@ -1362,9 +1409,14 @@ def admin_overview(_: str = Depends(admin_only)):
 def admin_problems(_: str = Depends(admin_only)):
     """未刮削與探測失敗的清單。總覽只給數字，這裡給名字。"""
     return {
+        # 只列真的要處理的（同 _UNSCRAPED_SQL）。之前是 `!='ok'`，於是這張
+        # 表會被 127 筆手機錄影塞爆，加了操作按鈕也找不到該按哪一個。
         "unscraped": [db.row_to_dict(r) for r in db.q(
-            "SELECT id, kind, title, year, scrape_state FROM media_item "
-            "WHERE scrape_state!='ok' ORDER BY added_at DESC LIMIT 200")],
+            f"SELECT id, kind, title, year, scrape_state, scrape_attempts, scrape_last_at "
+            f"FROM media_item WHERE {_UNSCRAPED_SQL} ORDER BY added_at DESC LIMIT 200")],
+        # 前端原本拿 list 長度當標題數字，超過 200 就跟總覽卡片對不上。
+        "unscraped_total": db.q1(
+            f"SELECT COUNT(*) c FROM media_item WHERE {_UNSCRAPED_SQL}")["c"],
         "failed": [db.row_to_dict(r) for r in db.q(
             "SELECT f.id, f.filename, f.ftp_path, f.probe_error, i.title "
             "FROM media_file f LEFT JOIN media_item i ON i.id=f.item_id "

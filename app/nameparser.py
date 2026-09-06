@@ -4,6 +4,8 @@ from __future__ import annotations
 import posixpath
 import re
 import unicodedata
+
+from . import timeparse
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -354,6 +356,41 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
         p.title = stem
     p.tags = [t for t in (p.resolution, p.source) if t]
     return p
+
+
+# 手機錄影：`20211002_213546+0800-55744.mp4`。實測這座片庫 129 個檔案
+# 全部是這個格式，而且**全部帶時區偏移**，沒有一個例外。
+_HOME_VIDEO_RE = re.compile(
+    r"^(\d{4})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})(?:([+-]\d{4}))?")
+
+
+def home_video_time(filename: str) -> Optional[int]:
+    """手機錄影檔名 → 拍攝時間的 epoch 整數秒。不是這個格式回 None。
+
+    **檔名是唯一可信的來源**，這點是實測出來的，不是預設：
+
+    - 目錄不可信：`手機照片/20230219/iPhone培` 底下 40 個檔案，實際年份是
+      2019×1、**2022×38**、2023×1 —— 拿目錄名分年會把 38 支 2022 的錄影標成 2023。
+      同層還有 `Cheng🏂`、`Cheng🏂💈`、`iPhone培` 這種完全沒有日期資訊的目錄名。
+    - `mtime` 不可信：那是 FTP 搬檔時間不是拍攝時間（這座庫裡最新的 mtime 到 2026 年）。
+
+    所以解不出檔名就回 None 讓呼叫端放棄，不用 mtime 兜底 —— 兜出來的是搬檔時間，
+    一個看起來合理但其實是別的東西的數字，比沒有更難察覺。
+    """
+    m = _HOME_VIDEO_RE.match(filename or "")
+    if not m:
+        return None
+    y, mo, d, h, mi, se = (int(m.group(i)) for i in range(1, 7))
+    # 月/日/時分秒要自己擋。mktime 與 timegm 都會把 13 月「正規化」成隔年 1 月
+    # 而不是報錯，於是 20211302 會安靜地變成 2022-02-02 —— 一個看起來合理、
+    # 但跟檔名對不上的日期。這種錯事後查不出來。
+    if not (1 <= mo <= 12 and 1 <= d <= 31 and h < 24 and mi < 60 and se < 60):
+        return None
+    off = timeparse.offset_seconds(m.group(7)) if m.group(7) else None
+    # 有時區就照它算（不經過本機時區），沒有就以本機時區解讀。
+    ts = (timeparse._mk_utc(y, mo, d, h, mi, se, off) if off is not None
+          else timeparse._mk(y, mo, d, h, mi, se))
+    return ts if timeparse.valid(ts) else None
 
 
 def guess_key(p: ParsedName, kind: str) -> str:

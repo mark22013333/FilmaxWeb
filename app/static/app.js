@@ -215,12 +215,15 @@ function cardHtml(it) {
   const rate = it.rating ? `<div class="badge rate">★ ${it.rating.toFixed(1)}</div>` : '';
   const kind = it.kind === 'tv'
     ? `<div class="badge ep">${it.season_count > 1 ? it.season_count + ' 季' : ''} ${it.file_count} 集</div>` : '';
-  const unscraped = it.scrape_state !== 'ok' && it.scrape_state !== 'manual'
+  // skip = 本來就不需要 metadata（手機錄影之類），不是「還沒刮到」。
+  // 這個條件要跟後端的 _UNSCRAPED_SQL 一致，不然後台數字跟這裡的紅點對不上。
+  const unscraped = !['ok', 'manual', 'skip'].includes(it.scrape_state)
     ? `<div class="badge" style="background:rgba(255,92,92,.8)">未刮削</div>` : '';
   return `<div class="card" data-id="${it.id}">
     <div class="poster">${poster}${rate}${kind}${unscraped}</div>
     <div class="meta"><div class="t">${esc(it.title)}</div>
-      <div class="s">${it.year || ''}${it.year && it.kind === 'tv' ? ' · ' : ''}${it.kind === 'tv' ? '影集' : ''}</div>
+      <div class="s">${it.year || ''}${it.year && it.kind !== 'movie' ? ' · ' : ''}${
+      it.kind === 'tv' ? '影集' : it.kind === 'home' ? '錄影' : it.kind === 'jav' ? 'JAV' : ''}</div>
     </div></div>`;
 }
 
@@ -590,7 +593,8 @@ $('#btnStats').onclick = async () => {
     ${tools}
     <div class="file-row"><div class="n"><b>電影 / 影集</b><small>條目數</small></div><span class="pill">${s.movies} / ${s.shows}</span></div>
     <div class="file-row"><div class="n"><b>影片檔</b><small>總容量 ${gb(s.total_size)}</small></div><span class="pill">${s.files}</span></div>
-    <div class="file-row"><div class="n"><b>未刮削條目</b><small>TMDB ${s.tmdb_enabled ? '已啟用' : '未設定金鑰'}</small></div><span class="pill ${s.unscraped ? 'warn' : 'direct'}">${s.unscraped}</span></div>
+    <div class="file-row"><div class="n"><b>待處理條目</b><small>TMDB ${s.tmdb_enabled ? '已啟用' : '未設定金鑰'}</small></div><span class="pill ${s.unscraped ? 'warn' : 'direct'}">${s.unscraped}</span></div>
+    <div class="file-row"><div class="n"><b>無 metadata</b><small>含手機錄影等本來就沒有資料的條目</small></div><span class="pill">${s.no_metadata ?? '—'}</span></div>
     <div class="file-row"><div class="n"><b>未分析檔案</b><small>沒有格式資訊就無法轉碼播放</small></div><span class="pill ${s.unprobed ? 'warn' : 'direct'}">${s.unprobed}</span></div>
     ${hwRow(s)}
     <div class="file-row"><div class="n"><b>FTP</b><small>${esc(s.ftp.roots.join(', '))}</small></div><span class="pill">${esc(s.ftp.host)}:${s.ftp.port}</span></div>

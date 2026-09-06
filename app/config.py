@@ -68,6 +68,10 @@ class Settings:
     ftp_timeout: int = field(default_factory=lambda: _i("FTP_TIMEOUT", 20))
 
 
+    # JAV 刮削（番號類作品走 javbus/fc2/d2pass/jav321，不走 TMDB）。
+    # 空 = 停用，掃到的東西照舊全部丟給 TMDB。
+    openaver_path: str = field(default_factory=lambda: _s("OPENAVER_PATH", ""))
+
     ffmpeg: str = field(default_factory=lambda: _s("FFMPEG_PATH", "ffmpeg") or "ffmpeg")
     ffprobe: str = field(default_factory=lambda: _s("FFPROBE_PATH", "ffprobe") or "ffprobe")
     # 預設 auto，不是 none。理由有兩個：
@@ -217,6 +221,32 @@ class Settings:
         return self._dir_prefixes(self.scan_min_size_exempt_dirs)
 
     @property
+    def home_dirs(self) -> tuple:
+        """這些資料夾底下的影片是家庭錄影（kind='home'），不刮 TMDB。
+
+        跟 exclude_dir_prefixes / min_size_exempt_dirs / jav_dirs 共用同一套
+        解析與比對規則 —— 四個設定長得一樣，行為也就該一樣。
+
+        目錄命中之後還要 `nameparser.home_video_time()` 真的解得出時間才算，
+        所以同一個目錄裡混著別種檔案不會被誤判。
+        """
+        return self._dir_prefixes(self.scan_home_dirs)
+
+    @property
+    def jav_dirs(self) -> tuple:
+        """這些資料夾底下的影片走 JAV 刮削，不走 TMDB。
+
+        跟 exclude_dir_prefixes / min_size_exempt_dirs 共用同一套解析與比對
+        規則（名稱開頭、大小寫不分、放在哪一層都有效、含子資料夾）——
+        三個設定長得一樣，行為也就該一樣。
+
+        為什麼不靠檔名自動判斷：`extract_number()` 實測對既有的院線片／影集
+        檔名都正確回 None，但那是這批檔案的性質，不是保證。目錄是使用者
+        自己分好的，用它當判準零誤判成本；番號解析留在目錄內當第二道關卡。
+        """
+        return self._dir_prefixes(self.scan_jav_dirs)
+
+    @property
     def mssql_configured(self) -> bool:
         if self.mssql_odbc_dsn:
             return True
@@ -303,7 +333,7 @@ class Settings:
             else:
                 p, k = chunk, "auto"
             k = k.strip().lower()
-            if k not in ("movie", "tv", "auto"):
+            if k not in ("movie", "tv", "jav", "home", "auto"):
                 k = "auto"
             p = "/" + p.strip().strip("/")
             roots.append(LibraryRoot(path=p if p != "/" else "/", kind=k))
@@ -385,6 +415,8 @@ _HOT_ATTRS = {
     "min_file_mb": "MIN_FILE_MB",
     "scan_exclude_dir_prefixes": "SCAN_EXCLUDE_DIR_PREFIXES",
     "scan_min_size_exempt_dirs": "SCAN_MIN_SIZE_EXEMPT_DIRS",
+    "scan_jav_dirs": "SCAN_JAV_DIRS",
+    "scan_home_dirs": "SCAN_HOME_DIRS",
     "scan_exclude_exts": "SCAN_EXCLUDE_EXTS",
     "scan_only_exts": "SCAN_ONLY_EXTS",
     "min_photo_kb": "MIN_PHOTO_KB",
