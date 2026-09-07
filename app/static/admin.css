@@ -256,3 +256,47 @@ table.t tr:last-child td{border-bottom:none}
 @media (min-width:769px){
   .desktop-note{display:none}
 }
+
+/* ---------------------------------------------------------------- 受限資料夾的資料夾樹
+   原本是一個 <select> 塞 52 個 <option>，用全形空格假裝縮排。三個問題：
+   (1) <option> 在 Chrome/Safari 套不了樣式，深色介面裡它是一塊白的；
+   (2) 全形空格的縮排在不同字型下對不齊，看不出父子關係；
+   (3) 篩選用的是 option.hidden —— 那個屬性只有 Firefox 認，
+       Chrome 完全忽略，所以「篩選」看起來是壞的。
+   改成自訂清單之後三件事都能解，而且能顯示「已受限／被上層涵蓋」的狀態。 */
+.ftree{
+  max-height:320px;overflow-y:auto;background:var(--bg-2);
+  border:1px solid var(--line);border-radius:10px;padding:4px;
+}
+.ftree-row{
+  display:flex;align-items:center;gap:8px;width:100%;
+  padding:6px 8px;border-radius:7px;text-align:left;
+  color:var(--text);font-size:12.5px;line-height:1.4;transition:.12s;
+}
+.ftree-row:hover:not(.is-off){background:var(--panel-2)}
+.ftree-row.on{background:var(--accent);color:#1a1a1a;font-weight:600}
+.ftree-row.on .ftree-meta,.ftree-row.on .ftree-tag{color:#1a1a1a;opacity:.75}
+/* 已經受限、或被上層涵蓋的：列出來但不能選 —— 看得到才知道「為什麼這個不在清單裡」 */
+.ftree-row.is-off{color:var(--dim);cursor:default}
+.ftree-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ftree-meta{
+  flex:none;color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums;
+}
+.ftree-tag{
+  flex:none;font-size:10.5px;padding:1px 6px;border-radius:999px;
+  border:1px solid var(--line);color:var(--dim);
+}
+.ftree-tag.lock{border-color:var(--accent);color:var(--accent)}
+/* 階層用實際的線而不是空白字元 —— 縮排量跟深度綁死，不受字型影響 */
+.ftree-row .ftree-indent{
+  flex:none;align-self:stretch;border-left:1px solid var(--line);
+}
+.ftree-empty{padding:14px;text-align:center;color:var(--dim);font-size:12.5px}
+/* 規則卡片裡列出這條規則實際涵蓋到的子目錄 */
+.acl-covers{
+  margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;
+}
+.acl-covers code{
+  font-size:11px;padding:1px 6px;border-radius:5px;
+  background:var(--bg-2);border:1px solid var(--line);color:var(--muted);
+}

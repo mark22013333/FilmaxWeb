@@ -219,7 +219,19 @@ function aclBlock(ac) {
       <dl><dt>備註</dt><dd>${esc(r.note || '—')}</dd>
         <dt>看得到的人</dt><dd>${r.user_names.length
           ? r.user_names.map(n => esc(n)).join('、') + adminTail
-          : '<span style="color:#ffaeae">目前沒有人</span>' + adminTail}</dd></dl>
+          : '<span style="color:#ffaeae">目前沒有人</span>' + adminTail}</dd>
+        <dt>涵蓋範圍</dt><dd>${(() => {
+          // 子資料夾是「自動跟著受限」的 —— 那句話寫在說明裡，但沒有人
+          // 會去數到底跟了幾個。列出來才知道這條規則的實際影響有多大。
+          const kids = ac.folders.filter(f => f.covered_by === r.prefix);
+          if (!kids.length) return '<span style="color:var(--dim)">底下沒有子資料夾</span>';
+          const show = kids.slice(0, 12);
+          return `<span style="color:var(--dim)">連同底下 ${kids.length} 個子資料夾</span>
+            <div class="acl-covers">${show.map(f =>
+              `<code title="${esc(f.folder)}">${esc(f.folder.split('/').filter(Boolean).pop())}</code>`
+            ).join('')}${kids.length > show.length
+              ? `<code>…另外 ${kids.length - show.length} 個</code>` : ''}</div>`;
+        })()}</dd></dl>
       <div class="acl-users">
         ${viewers.length ? viewers.map(u => `
           <label><input type="checkbox" data-aclu="${u.id}"
@@ -240,13 +252,26 @@ function aclBlock(ac) {
       <div class="acts"><button class="btn primary" data-aclsave="${r.id}">儲存授權</button></div>
     </div>`).join('');
 
-  // 已經受限、或已經在某個受限資料夾底下的，不必再列 —— 子資料夾本來就繼承
+  // **全部列出來，不能選的也列** —— 原本只列可選的，於是「我明明有這個資料夾，
+  // 為什麼清單裡找不到」變成一個沒有答案的問題。標成灰色並寫明原因（已受限／
+  // 被上層涵蓋）比讓它消失有用。
   const free = ac.folders.filter(f => !f.restricted && !f.covered_by);
-  const opt = f => {
-    const pad = '　'.repeat(Math.max(0, f.depth - 1));
+  const row = f => {
+    const off = f.restricted || f.covered_by;
     const bits = [f.videos && `影片 ${f.videos}`, f.photos && `相片 ${f.photos}`,
-                  f.documents && `文件 ${f.documents}`].filter(Boolean).join('／');
-    return `<option value="${esc(f.folder)}">${pad}${esc(f.folder)}　${bits}</option>`;
+                  f.documents && `文件 ${f.documents}`].filter(Boolean).join('　');
+    // 只顯示最後一段，父層靠縮排線表達 —— 完整路徑在 title 裡，
+    // 深層目錄的完整路徑很長，列出來會把數量擠掉。
+    const leaf = f.folder === '/' ? '/' : f.folder.split('/').filter(Boolean).pop();
+    const tag = f.restricted ? '<span class="ftree-tag lock">已受限</span>'
+      : f.covered_by ? `<span class="ftree-tag">在 ${esc(f.covered_by)} 底下</span>` : '';
+    const indent = Array.from({ length: Math.max(0, f.depth - 1) },
+      () => '<span class="ftree-indent" style="width:11px"></span>').join('');
+    return `<button type="button" class="ftree-row${off ? ' is-off' : ''}"
+      data-folder="${esc(f.folder)}" data-path="${esc(f.folder.toLowerCase())}"
+      title="${esc(f.folder)}"${off ? ' disabled' : ''}>
+      ${indent}<span class="ftree-name">${esc(leaf)}</span>
+      ${tag}<span class="ftree-meta">${bits}</span></button>`;
   };
   return `
     <div class="box">
@@ -267,12 +292,15 @@ function aclBlock(ac) {
           <input id="aclFilter" placeholder="篩選資料夾…" style="flex:1;min-width:160px">
           <input id="aclNote" placeholder="備註（選填）" style="flex:1;min-width:140px">
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <select id="aclPick" style="flex:1;min-width:240px">
-            <option value="">— 選一個資料夾（${free.length} 個）—</option>
-            ${free.map(opt).join('')}
-          </select>
-          <button class="btn" id="aclAdd">加入限制</button>
+        <div class="ftree" id="aclTree">
+          ${ac.folders.length ? ac.folders.map(row).join('')
+            : '<div class="ftree-empty">還沒有掃到任何資料夾。</div>'}
+          <div class="ftree-empty" id="aclNoHit" hidden>沒有符合的資料夾。</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center">
+          <span id="aclPicked" style="flex:1;min-width:200px;font-size:12.5px;color:var(--dim)">
+            尚未選擇（可選 ${free.length} 個）</span>
+          <button class="btn" id="aclAdd" disabled>加入限制</button>
         </div>
         <div style="font-size:11.5px;color:var(--dim);margin-top:6px">
           只列到第 4 層。更深的資料夾請選它的上層 —— 子資料夾自動跟著受限，
@@ -283,22 +311,57 @@ function aclBlock(ac) {
 }
 
 function wireAcl(el, ac) {
-  // 篩選：只是把選項藏起來，不讓人打路徑。手打的路徑會拼錯，
-  // 而拼錯的規則等於沒有保護。
+  const tree = el.querySelector('#aclTree');
+  const picked = el.querySelector('#aclPicked');
+  const add = el.querySelector('#aclAdd');
+  let chosen = '';
+
+  // 篩選。**原本用 option.hidden，那個屬性只有 Firefox 認** ——
+  // Chrome／Safari 完全忽略，所以篩選看起來是壞的（打字沒反應）。
+  // 現在是自訂清單，用 style.display 藏，三家都一樣。
+  //
+  // 命中一個深層目錄時，它的父層也要留著 —— 只顯示命中的那一列，
+  // 縮排就沒有參照物，看起來像浮在半空。
   const flt = el.querySelector('#aclFilter');
-  if (flt) flt.oninput = () => {
-    const q = flt.value.trim().toLowerCase();
-    const sel = el.querySelector('#aclPick');
-    [...sel.options].forEach((o, i) => {
-      if (i === 0) return;
-      o.hidden = !!q && !o.value.toLowerCase().includes(q);
-    });
-    if (sel.selectedOptions[0]?.hidden) sel.value = '';
+  const applyFilter = () => {
+    const q = (flt ? flt.value : '').trim().toLowerCase();
+    const rows = [...tree.querySelectorAll('.ftree-row')];
+    let hit = 0;
+    const keep = new Set();
+    if (q) {
+      for (const r of rows) {
+        if (!r.dataset.path.includes(q)) continue;
+        keep.add(r.dataset.folder);
+        // 把祖先一路加進來
+        const segs = r.dataset.folder.split('/').filter(Boolean);
+        for (let i = 1; i < segs.length; i++) keep.add('/' + segs.slice(0, i).join('/'));
+      }
+    }
+    for (const r of rows) {
+      const show = !q || keep.has(r.dataset.folder);
+      r.style.display = show ? '' : 'none';
+      if (show && r.dataset.path.includes(q)) hit++;
+    }
+    const none = el.querySelector('#aclNoHit');
+    if (none) none.hidden = !q || hit > 0;
+  };
+  if (flt) flt.oninput = applyFilter;
+
+  // 選取：自己管 on 樣式與按鈕狀態。disabled 的列（已受限／被涵蓋）點不動。
+  tree.onclick = e => {
+    const row = e.target.closest('.ftree-row');
+    if (!row || row.disabled) return;
+    const same = chosen === row.dataset.folder;
+    tree.querySelectorAll('.ftree-row.on').forEach(r => r.classList.remove('on'));
+    chosen = same ? '' : row.dataset.folder;
+    if (!same) row.classList.add('on');
+    picked.textContent = chosen ? chosen : '尚未選擇';
+    picked.style.color = chosen ? 'var(--text)' : 'var(--dim)';
+    add.disabled = !chosen;
   };
 
-  const add = el.querySelector('#aclAdd');
   if (add) add.onclick = async () => {
-    const prefix = el.querySelector('#aclPick').value;
+    const prefix = chosen;
     if (!prefix) return toast('先選一個資料夾', true);
     if (!await confirmBox({
       title: '把這個資料夾設為受限', ok: '設為受限',
