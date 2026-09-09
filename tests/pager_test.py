@@ -9,6 +9,7 @@
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -213,7 +214,13 @@ check("除了 scroll 事件還有輪詢兜底（有些環境收不到 window 的
       "setInterval(" in src and "_lastY" in src)
 check("值沒變就不碰 DOM（輪詢每 300ms 叫一次）",
       "if (b.hidden !== want)" in src)
-TOP = CSS[CSS.index(".to-top{"):CSS.index(".pmode{")]
+# 從 .to-top{ 切到「檢視方式切換」那一段的註解為止。
+# 原本切到 `.pmode{` —— 那個選擇器在 @media 區塊裡也會出現（行動版把它
+# 靠右對齊），一旦那份規則排在 .to-top 之前，index() 找到的是前面那個，
+# 切出來的是空字串，於是下面兩個斷言永遠通過、測不到任何東西。
+# 用註解當界標：它只出現一次，而且就在 .pmode 那一組規則的正上方。
+TOP = CSS[CSS.index(".to-top{"):CSS.index("/* 檢視方式切換 */")]
+assert TOP.strip(), "切不到 .to-top 那一段（界標變了？）"
 check("左右各自定位", ".to-top.left{left:20px}" in TOP and ".to-top.right{right:20px}" in TOP)
 check("z-index 比掃描面板(80)低", "z-index:70" in TOP)
 check("手機上只留箭頭", ".to-top span{display:none}" in CSS)
@@ -232,9 +239,36 @@ check("不裁切（aspect-ratio 放掉、object-fit 改 contain）",
       "aspect-ratio:auto" in FLOW and "object-fit:contain" in FLOW)
 check("<img> 帶 width/height（圖載入前就知道要留多高，版面不會跳）",
       'width="${x.width}" height="${x.height}"' in src)
-check("欄數隨寬度縮（手機不能還是 5 欄）",
-      CSS.count(".pgrid.flow{column-count") >= 4,
-      CSS.count(".pgrid.flow{column-count"))
+# 原本數的是「有幾條 media query」（要求 >= 4），但那是手段不是目的：
+# 拿掉 420px 那條（單欄的瀑布流就是方格的慢速版，等於功能不存在）之後
+# 條數變 3，而手機的欄數其實是對的。所以直接算各寬度真正生效的欄數。
+_steps = sorted(
+    ((int(w), int(c)) for w, c in re.findall(
+        r"@media\(max-width:(\d+)px\)\{\s*\.pgrid\.flow\{column-count:(\d+)\}", CSS)),
+    reverse=True)
+_base = int(re.search(r"\.pgrid\.flow\{[^}]*column-count:(\d+)", CSS).group(1))
+
+
+def flow_cols(w):
+    """回傳寬度 w 之下最終生效的欄數。
+
+    全部是 max-width、權重相同，所以後面的規則覆蓋前面的 —— 也就是
+    「符合條件的最窄那一條」說話。由寬到窄找第一個符合的即可。
+    """
+    for at, c in sorted(_steps):
+        if w <= at:
+            return c
+    return _base
+
+
+check(f"桌機用得到寬螢幕（1500px → {flow_cols(1500)} 欄）", flow_cols(1500) >= 5)
+check(f"欄數隨寬度縮（手機不能還是 5 欄）：375px → {flow_cols(375)} 欄",
+      flow_cols(375) == 2, flow_cols(375))
+check(f"最窄也不掉到單欄（單欄的瀑布流＝方格的慢速版）：320px → {flow_cols(320)} 欄",
+      flow_cols(320) >= 2, flow_cols(320))
+# 701～720px 曾經是死區：main 已換窄版 padding（720）卻還排 3 欄（700）
+check(f"斷點與版面 padding 對齊，沒有死區（710px → {flow_cols(710)} 欄）",
+      flow_cols(710) == flow_cols(700), (flow_cols(710), flow_cols(700)))
 
 
 # ============================================================ 排序穩定性

@@ -670,7 +670,35 @@ function albumNames(folders) {
 
 const pfilter = { q: '', items: [] };
 
+// 窄螢幕上相簿標籤是抽屜，預設收起來 —— 不收的話一進相片牆就是 7,734px
+// 的標籤（實測 141 個相簿、107 個名字超過 12 字，每列只擠得下一個），
+// 相片要滑到 y≈7,909px 才看得到。
+// 寬螢幕永遠攤開（hidden 一定要清掉，不然從窄轉寬時標籤列會整個消失）。
+//
+// 用自己的 pWasNarrow 而不是共用文件牆的 wasNarrow：共用的話「在文件牆
+// 縮放過」會污染相片牆的下一次判斷。
+let pWasNarrow = null;
+
+function syncAlbumBar() {
+  const narrow = window.matchMedia('(max-width:900px)').matches;
+  pWasNarrow = narrow;
+  $('#folderBar').hidden = narrow;
+  $('#albumToggle').setAttribute('aria-expanded', String(!narrow));
+  paintAlbumToggle();
+}
+// 只在真的跨越斷點時才動它。每次 resize 都同步的話，使用者在窄螢幕上
+// 開著抽屜、手指稍微碰到縮放就被關掉。
+window.addEventListener('resize', () => {
+  const narrow = window.matchMedia('(max-width:900px)').matches;
+  if (narrow === pWasNarrow) return;
+  pWasNarrow = narrow;
+  if (!$('#photoView').hidden) syncAlbumBar();
+});
+
 async function loadFolders() {
+  // 一定在 await 之前：下面的 catch 在 fetch 失敗時會直接 return，
+  // 放在後面的話抽屜就停在未同步的狀態（跟 loadDocFolders() 同一個道理）。
+  syncAlbumBar();
   let d;
   try { d = await api('/api/photos/folders'); } catch { return; }
   pfilter.items = d.items;
@@ -700,10 +728,54 @@ function paintFolderBar() {
       <span class="fc-t"><span class="fc-n">${esc(f.label)}</span>
       <span class="fc-c"> ${f.c}</span></span>
     </div>`).join('') : '<div class="fc-none">找不到符合的相簿</div>');
-  bar.querySelectorAll('[data-folder]').forEach(el => el.onclick = () => {
-    pstate.folder = el.dataset.folder; pstate.page = 1; loadPhotos();
-  });
+  bar.querySelectorAll('[data-folder]').forEach(el =>
+    el.onclick = () => selectAlbum(el.dataset.folder));
+  paintAlbumToggle();     // pfilter.items 剛畫完，名字這時才算得出來
 }
+
+/* 選一本相簿。抽成命名函式是為了讓「選完自動收抽屜」只有一個地方
+   —— 跟文件牆的 selectDocFolder() 同一個形狀。 */
+function selectAlbum(folder) {
+  pstate.folder = folder; pstate.page = 1;
+  // 斷點在「選的那一刻」重新問一次，不看快取的 pWasNarrow ——
+  // 使用者可能在抽屜開著的時候轉了螢幕方向。
+  if (window.matchMedia('(max-width:900px)').matches) closeAlbumBar();
+  // 重畫是為了把 .fchip.on 換到新選的那一個。原本沒有這一句，高亮要等
+  // 下一次篩選或搜尋才更新（paintAlbumToggle 也在它裡面一起叫）。
+  paintFolderBar();
+  loadPhotos();
+}
+
+/* 抽屜開關上的文字。收起來之後這是唯一的「我在看哪一本相簿」——
+   相片牆沒有文件牆那種麵包屑（#photoTitle 只寫張數，相簿名從來沒有
+   出現在畫面上任何地方），所以這一行不是裝飾，是把收起來的定位資訊接回來。 */
+function paintAlbumToggle() {
+  const lab = $('#albumToggleLabel');
+  if (!lab) return;
+  // 三種狀態，順序就是優先序：
+  // 1. 搜尋中 —— 搜尋是跨全庫的，會蓋掉選中的相簿（下面 paintFolderBar 的
+  //    `const sel = state.q ? null : …` 就是同一件事）。這時候顯示相簿名
+  //    等於直接說謊：畫面上放的是全庫結果。
+  if (state.q) { lab.textContent = '全庫搜尋中 · 選擇相簿'; return; }
+  if (!pstate.folder) { lab.textContent = '所有相簿'; return; }
+  // 3. 選了某一本。用 albumNames() 的顯示名而不是原始路徑 —— 那個函式
+  //    已經處理過父子同名（…/外拍/外拍）的撞名，兩邊要顯示一致。
+  const all = pfilter.items || [];
+  const i = all.findIndex(f => f.folder === pstate.folder);
+  if (i < 0) { lab.textContent = shortFolder(pstate.folder); return; }
+  lab.textContent = `${albumNames(all.map(f => f.folder))[i]} · ${all[i].c} 張`;
+}
+
+/* 行動版的抽屜 */
+function closeAlbumBar() {
+  $('#folderBar').hidden = true;
+  $('#albumToggle').setAttribute('aria-expanded', 'false');
+}
+$('#albumToggle').onclick = () => {
+  const bar = $('#folderBar');
+  bar.hidden = !bar.hidden;
+  $('#albumToggle').setAttribute('aria-expanded', String(!bar.hidden));
+};
 
 let pfTimer;
 $('#photoFolderQ').oninput = e => {
@@ -908,9 +980,12 @@ function syncTopBtn() {
 
 function goTop() {
   // **不能用 scrollToGrid('#pgrid')。**那是給換頁用的（捲到格線頂端，
-  // 跳過已經看過的篩選列），而相簿標籤這一列在這個片庫有 110 個標籤、
-  // 高 2,974px —— 於是「回頂端」會停在 3,095px 的位置，完全不是頂端。
+  // 跳過已經看過的篩選列），而相簿標籤這一列在這個片庫有 141 個標籤 ——
+  // 寬螢幕上高 2,974px，於是「回頂端」會停在 3,095px，完全不是頂端。
   // 這顆按鈕的語意就是「回到最上面」，那就真的捲到 0。
+  //
+  // 窄螢幕（≤900px）標籤已經收成抽屜了，不再有這個落差；但這裡不必分兩種
+  // 寬度處理 —— 捲到 0 在兩邊都正確。
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
 }

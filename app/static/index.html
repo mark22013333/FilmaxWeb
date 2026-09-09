@@ -72,9 +72,18 @@
   </div>
 
   <!-- 相片牆。跟影片共用同一塊區域，切分頁時互相顯示/隱藏。
-       相簿只有十幾個而且全在同一層，所以維持封面標籤（縮圖才是相簿最好認的
-       線索），不像文件牆那樣走樹狀 —— 那邊是 452 個、深達 7～8 層。 -->
+       用封面標籤而不是文件牆那種樹狀：相簿全在同一層（文件牆是 452 個、
+       深達 7～8 層），而縮圖才是相簿最好認的線索，換成純文字的樹反而更難挑。
+
+       但「同一層」不等於「數量少」—— 實測 141 個相簿、其中 107 個名字超過
+       12 字，平鋪在 375px 下會攤成 7,734px（9.5 個螢幕），把相片跟檢視切換
+       一起推到視野之外。所以窄螢幕收成抽屜（見下面的 .album-toggle）。 -->
   <div id="photoView" hidden>
+    <!-- 行動版的相簿抽屜開關。**必須放在 #folderBar 外面**：paintFolderBar()
+         是整批覆寫 innerHTML，放進去會被洗掉。位置對應文件牆的 #docTreeToggle
+         （放在 .split 之前、內容之外）。 -->
+    <button class="album-toggle" id="albumToggle" aria-expanded="false"
+            aria-controls="folderBar">🖼 <span id="albumToggleLabel">選擇相簿</span></button>
     <div class="album-bar">
       <input id="photoFolderQ" type="search" placeholder="篩選相簿…" autocomplete="off">
       <select class="sort" id="photoSort">
@@ -84,12 +93,29 @@
         <option value="added">最近加入</option>
       </select>
       <!-- 檢視方式。預設維持方格＋分頁：那是既有的行為，把預設換掉等於
-           強迫所有人適應新版面。想要瀑布流的人自己開，選擇存 localStorage。 -->
+           強迫所有人適應新版面。想要瀑布流的人自己開，選擇存 localStorage。
+
+           圖示與文字兩份都在標記裡，靠 CSS 在 ≤560px 換成只留圖示（先例是
+           .to-top 在同一個斷點藏掉文字）。文字藏起來時 aria-label 接手，
+           所以報讀器兩種寬度下讀到的都一樣。 -->
       <div class="pmode" role="group" aria-label="相片檢視方式">
-        <button type="button" data-pmode="grid" class="on"
-                aria-pressed="true" title="方格：裁成正方形、分頁">方格</button>
-        <button type="button" data-pmode="flow"
-                aria-pressed="false" title="瀑布流：原始比例、往下滑自動載入">瀑布流</button>
+        <button type="button" data-pmode="grid" class="on" aria-pressed="true"
+                aria-label="方格檢視" title="方格：裁成正方形、分頁">
+          <svg viewBox="0 0 14 14" aria-hidden="true" focusable="false">
+            <rect x="0" y="0" width="6" height="6" rx="1"/>
+            <rect x="8" y="0" width="6" height="6" rx="1"/>
+            <rect x="0" y="8" width="6" height="6" rx="1"/>
+            <rect x="8" y="8" width="6" height="6" rx="1"/>
+          </svg><span class="pm-t">方格</span></button>
+        <button type="button" data-pmode="flow" aria-pressed="false"
+                aria-label="瀑布流檢視" title="瀑布流：原始比例、往下滑自動載入">
+          <svg viewBox="0 0 14 14" aria-hidden="true" focusable="false">
+            <rect x="0" y="0" width="4" height="9" rx="1"/>
+            <rect x="5" y="0" width="4" height="5" rx="1"/>
+            <rect x="10" y="0" width="4" height="12" rx="1"/>
+            <rect x="0" y="10" width="4" height="4" rx="1"/>
+            <rect x="5" y="6" width="4" height="8" rx="1"/>
+          </svg><span class="pm-t">瀑布流</span></button>
       </div>
     </div>
     <div class="folder-bar" id="folderBar"></div>
