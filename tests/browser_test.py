@@ -393,16 +393,29 @@ async def main():
 
         # L：受限資料夾。UI 的關鍵不變量是「不讓人手打路徑」——
         # 手打就會拼錯，而拼錯的規則等於沒有保護、畫面上還顯示已設定。
-        aclui = await pg2.evaluate("""() => ({
-            pick: !!document.querySelector('#aclPick'),
-            isSelect: document.querySelector('#aclPick')?.tagName === 'SELECT',
-            freeText: [...document.querySelectorAll('#tab-library input')]
-                        .some(i => i.id === 'aclPrefix'),
-            filter: !!document.querySelector('#aclFilter'),
-            note: (document.querySelector('#tab-library').textContent || '')
-                    .includes('密碼登入沒有帳號身分'),
-        })""")
-        check("受限資料夾有從清單挑選的下拉", aclui["pick"] and aclui["isSelect"], aclui)
+        # 挑選介面是資料夾樹（原本是 <select>，dropdown 藏不住縮排也修不了篩選）：
+        # 每一列是一顆按鈕，點了才進「已選」，再按「加入限制」才送出。
+        aclui = await pg2.evaluate("""() => {
+            const tree = document.querySelector('#aclTree');
+            const rows = tree ? [...tree.querySelectorAll('.ftree-row')] : [];
+            return {
+                pick: !!tree,
+                rows: rows.length,
+                allButtons: rows.length > 0
+                            && rows.every(r => r.tagName === 'BUTTON'),
+                confirm: !!document.querySelector('#aclPicked')
+                         && !!document.querySelector('#aclAdd'),
+                freeText: [...document.querySelectorAll('#tab-library input')]
+                            .some(i => i.id === 'aclPrefix'),
+                filter: !!document.querySelector('#aclFilter'),
+                note: (document.querySelector('#tab-library').textContent || '')
+                        .includes('密碼登入沒有帳號身分'),
+            };
+        }""")
+        check("受限資料夾是從掃到的資料夾樹裡挑，不是自己想一個",
+              aclui["pick"] and aclui["allButtons"], aclui)
+        check("挑完要先看到「已選哪一個」再按加入，不會點一下就直接生效",
+              aclui["confirm"], aclui)
         check("而且沒有可以手打路徑的輸入框", not aclui["freeText"], aclui)
         check("資料夾多的時候可以篩選", aclui["filter"], aclui)
         check("畫面上講明「密碼登入沒有身分、無法授權」", aclui["note"], aclui)
