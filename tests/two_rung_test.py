@@ -7,6 +7,7 @@ remux 真的產生分段是下一批（`build_transcode_cmd` 的 remux 分支）
 """
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -527,6 +528,210 @@ check("目標比片源高就不放大", media.scaled_size(1280, 720, 1080) == (1
 check("target 0 = 不縮放", media.scaled_size(1920, 804, 0) == (1920, 804))
 vf, out_h = media.build_video_filters(1920, 804, 720, False)
 check("跟 build_video_filters 的輸出高度一致", out_h == media.scaled_size(1920, 804, 720)[1])
+
+
+def _js_quality_class(src: str, w: int, h: int) -> str:
+    """把 playback-state.js 的 qualityClass() 抽出來，用 Python 跑一次。
+
+    **為什麼要這樣測而不是「檢查有沒有這段字」**：這兩個函式必須給出
+    一模一樣的答案，而「原始碼裡有 1900 這個數字」證明不了那件事。
+    直接把它的門檻表讀出來重跑，改了任一邊而忘了另一邊就會在這裡爆。
+
+    只認得它現在的形狀（一串 `if (w >= A || h >= B) return 'X';`）——
+    形狀變了這個 helper 會抓不到門檻，然後測試會失敗。那是刻意的：
+    改了形狀就該回來確認兩邊還是一致的。
+    """
+    body = src[src.index("function qualityClass"):]
+    body = body[:body.index("\n  }")]
+    rules = re.findall(r"if \(w >= (\d+) \|\| h >= (\d+)\) return '([^']+)';", body)
+    if len(rules) < 5:
+        raise AssertionError("playback-state.js 的 qualityClass 形狀變了，"
+                             "這個 helper 抓不到門檻 —— 回去確認兩邊還一致")
+    for wt, ht, label in rules:
+        if w >= int(wt) or h >= int(ht):
+            return label
+    return f"{h}p" if h else "—"
+
+
+# ============================================================ 遠端 direct 政策
+head("[J 5] 遠端該不該走 direct：看片源餵不餵得動，不是看有沒有 remux 上階")
+
+# **舊的條件是反的。**舊碼是「remote and mode==direct and 有 remux → 改 HLS」，
+# 於是一部 17 Mbps、沒有邊界表的 mp4 反而被判定「適合遠端 direct」——
+# 正是最不適合的那一種（direct 沒有階可降，鏈路不夠就整段卡住）。
+ok, why = hls.direct_ok_for_remote(3_000_000, has_remux=False)
+check("片源 3 Mbps（在上限內）→ 繼續走 direct，畫質最好、成本最低", ok is True, why)
+
+ok, why = hls.direct_ok_for_remote(17_000_000, has_remux=True)
+check("片源 17 Mbps ＋ 有 remux 上階 → 改走 HLS（畫質一樣，而且降得下去）",
+      ok is False, why)
+# 這一項就是舊條件漏掉的那個洞
+ok, why = hls.direct_ok_for_remote(17_000_000, has_remux=False)
+check("**片源 17 Mbps ＋ 沒有 remux → 一樣要改走 HLS**"
+      "（重編有損，但留在 direct 是完全播不動）", ok is False, why)
+check("而且要講得出理由（後台與前端都要看得到）", "17000 kbps" in why, why)
+
+ok, why = hls.direct_ok_for_remote(None, has_remux=True)
+check("位元率不明 ＋ 有上階 → 不要賭（改 HLS 的代價是零，賭輸的代價是播不動）",
+      ok is False, why)
+ok, why = hls.direct_ok_for_remote(None, has_remux=False)
+check("位元率不明 ＋ 沒有上階 → 改 HLS 一定會重編，那就先讓它試 direct",
+      ok is True, why)
+
+os.environ["REMOTE_DIRECT_MAX_KBPS"] = "0"
+check("上限設 0 = 不檢查，回到舊行為（保留退路）",
+      hls.direct_ok_for_remote(99_000_000, has_remux=True)[0] is True)
+os.environ["REMOTE_DIRECT_MAX_KBPS"] = "6000"
+
+check("剛好等於上限 → 還在安全範圍內（邊界是含的）",
+      hls.direct_ok_for_remote(6_000_000, has_remux=False)[0] is True)
+check("超過一點點就不行", hls.direct_ok_for_remote(6_001_000, has_remux=False)[0] is False)
+
+# L：區網不能被這條政策動到 —— 那裡 direct/remux 一直是最佳解
+_src = _insp.getsource(_api.play_info)
+check("[L] 這條政策只在 remote 時套用（區網的零轉碼路徑不能被破壞）",
+      "if remote and mode == \"direct\"" in _src, _src[:200])
+check("[L] 而且使用者手動要求 direct 時要讓路", "force_direct" in _src)
+check("play_info 會把判斷結果回給前端（前端的 fallback 門檻要用它收緊）",
+      "direct_advised" in _src)
+
+
+# ============================================================ 前端播放狀態
+head("[J] 播放狀態：前端只能有一份事實來源")
+
+_pjs = (ROOT / "app" / "static" / "player.js").read_text(encoding="utf-8")
+_pst = (ROOT / "app" / "static" / "playback-state.js").read_text(encoding="utf-8")
+_html = (ROOT / "app" / "static" / "player.html").read_text(encoding="utf-8")
+
+check("playback-state.js 有被載進 player.html（不然 player.js 一開頁就炸）",
+      "playback-state.js" in _html, _html[-400:])
+check("而且排在 player.js 前面（它是相依）",
+      _html.index("playback-state.js") < _html.index("/static/player.js"))
+
+# **原本的 bug 就是這一行**：renderTags() 拿 info.height 當「現在在播的畫質」。
+# 註解裡會提到那個舊寫法（說明為什麼要改），所以比對前要先把註解剝掉 ——
+# 不然這一項會被自己的說明文字絆倒。
+_tags = _pjs[_pjs.index("function renderTags"):]
+_tags = _tags[:_tags.index("\n}")]
+_tags_code = "\n".join(ln for ln in _tags.splitlines()
+                       if not ln.lstrip().startswith("//"))
+check("[A] renderTags 不再拿 info.height／info.width 當「目前播放解析度」",
+      "info.height" not in _tags_code and "info.width" not in _tags_code, _tags_code[:400])
+check("[A] renderTags 改成從 runtime state 取（statusLine）",
+      "PS.statusLine(playbackState)" in _tags_code, _tags_code[:400])
+
+check("[C] curLevel 這個各自為政的全域已經拿掉",
+      "\nlet curLevel" not in _pjs and "curLevel =" not in _pjs)
+check("[C] 換片／換模式／換畫質都會把狀態清乾淨",
+      "function resetPlaybackState" in _pjs and "PS.emptyState()" in _pjs)
+check("[C] play() 一開始就 reset（不 reset 的話舊的階會留在畫面上）",
+      "const gen = resetPlaybackState(which)" in _pjs)
+
+check("[B/D] UI 只有一支更新入口",
+      "function updatePlaybackState" in _pjs and "function renderPlaybackStatus" in _pjs)
+for ev in ("MANIFEST_PARSED", "LEVEL_SWITCHING", "LEVEL_SWITCHED",
+           "FRAG_LOADING", "FRAG_LOADED", "FRAG_BUFFERED", "ERROR"):
+    check(f"[D] 狀態來源含 Hls.Events.{ev}", f"Hls.Events.{ev}" in _pjs)
+for ev in ("loadedmetadata", "playing", "waiting", "canplay", "progress", "resize"):
+    check(f"[D] 狀態來源含 video 的 {ev}", f"'{ev}'" in _pjs)
+
+check("[I] 所有非同步 callback 都過 generation 閘（切換之後舊事件要丟掉）",
+      "function isStale" in _pjs and "isStale(gen)" in _pjs)
+check("[I] hls 事件的 handler 統一包一層 isStale ＋ 確認還是同一個實例",
+      "if (!isStale(gen) && hlsObj === H)" in _pjs)
+
+check("[G] direct fallback 會把 currentTime 帶過去（不能跳回開頭）",
+      "const at = v.currentTime;" in _pjs and "play('hls', at)" in _pjs)
+check("[H] fallback 只做一次（fellBack 統一由 metrics 管，不再有第二個旗標）",
+      "\nlet fellBack" not in _pjs and "metrics.fellBack" in _pjs)
+
+check("[J 3] 有啟用 capLevelToPlayerSize（手機 390px 不該去拉 4K）",
+      "capLevelToPlayerSize: true" in _pjs)
+check("[J 3] 全螢幕／轉向之後會重新評估（不能永久鎖死低畫質）",
+      "orientationchange" in _pjs and "fullscreenchange" in _pjs)
+check("[J 4] 降階壓的是 autoLevelCapping（上限），不是鎖死 currentLevel",
+      "autoLevelCapping = target" in _pjs and "hlsObj.currentLevel =" not in _pjs)
+check("[J 4] 恢復穩定會把上限拿掉，交還 hls.js 的 Auto ABR",
+      "function releaseCap" in _pjs and "autoLevelCapping = -1" in _pjs)
+
+check("[F] 選單標籤講「上限」，不是讓人以為鎖死", "' 上限'" in _pjs)
+check("[8] debug 疊圖要靠 query parameter 開，不能預設塞在畫面上",
+      "params.get('debugPlayer')" in _pjs and "if (!debugPlayer) return;" in _pjs)
+
+# 級別判定兩邊必須一致 —— 分岔的話同一階在標籤與面板上會被標成不同級別
+for w, h in [(1920, 804), (1920, 1080), (1920, 960), (3840, 1608), (1280, 720),
+             (854, 480), (720, 404)]:
+    check(f"級別判定 {w}×{h} 前後端一致",
+          media.quality_class(w, h) == _js_quality_class(_pst, w, h),
+          (media.quality_class(w, h), _js_quality_class(_pst, w, h)))
+
+
+# ============================================================ 串流量測
+head("[J 7] 效能修改要留下量測依據，不是憑感覺調參數")
+
+from app import streamstat
+from app.config import settings
+streamstat.reset()
+streamstat.record_ftp("/x/a.mkv", 10 * 1024 * 1024, 1.0)
+streamstat.record_ftp("/x/a.mkv", 10 * 1024 * 1024, 2.0)
+snap = streamstat.snapshot()
+check("搬運吞吐記得下來", snap["summary"]["ftp_mbps"]["n"] == 2, snap["summary"])
+check("而且算得出中位數", snap["summary"]["ftp_mbps"]["med"] > 0)
+
+# 走本機路徑的小 Range 常常在 Windows 上量到 0.0（計時器粒度 15.6ms）。
+# **丟掉那些樣本會讓最快的請求整批消失**，命中率與樣本數都失真。
+streamstat.reset()
+streamstat.record_ftp("/x/a.mkv", 4096, 0.0, source="local")
+snap = streamstat.snapshot()
+check("快到量不出來的請求也要留（丟掉的話診斷頁看不到最快的那些）",
+      snap["summary"]["ftp_mbps"]["n"] == 1, snap["summary"])
+check("但要標出來是被夾過的，不然「819 Mbps」會被當成真的量測結果",
+      snap["recent"]["ftp"][0]["capped"] is True, snap["recent"]["ftp"][0])
+check("真的量得到的就不標", (streamstat.reset(),
+      streamstat.record_ftp("/x/a.mkv", 4096, 0.5),
+      streamstat.snapshot()["recent"]["ftp"][0]["capped"])[2] is False)
+streamstat.reset()
+streamstat.record_ftp("/x/a.mkv", 10 * 1024 * 1024, 1.0)
+streamstat.record_ftp("/x/a.mkv", 10 * 1024 * 1024, 2.0)
+
+streamstat.record_segment(1, 0, "h720_m0", 12.5, 2_000_000, cached=False)
+streamstat.record_segment(1, 1, "h720_m0", 0.01, 2_000_000, cached=True)
+snap = streamstat.snapshot()
+check("分段命中率算得出來（分辨「ffmpeg 太慢」與「prefetch 沒跟上」）",
+      snap["segment_hit_rate"] == 0.5, snap["segment_hit_rate"])
+check("**沒命中的那些才問得出「等 ffmpeg 等多久」**（混在一起會被稀釋成沒有意義的數字）",
+      snap["summary"]["segment_miss_elapsed"]["med"] == 12.5,
+      snap["summary"]["segment_miss_elapsed"])
+
+streamstat.record_produce(1, 0, hls.RUNG_TRANSCODE, 6.0, 3.0, background=False)
+snap = streamstat.snapshot()
+check("ffmpeg 速度倍率記得下來（小於 1 就是追不上播放）",
+      snap["summary"]["produce_speed"]["med"] == 2.0, snap["summary"]["produce_speed"])
+
+os.environ["STREAM_DIAG"] = "false"
+streamstat.reset()
+streamstat.record_ftp("/x/a.mkv", 1024, 1.0)
+check("關掉之後取樣點就是一個 early return（極低階機器的退路）",
+      streamstat.snapshot()["summary"]["ftp_mbps"] is None)
+os.environ["STREAM_DIAG"] = "true"
+
+check("搬運塊大小可以調（但預設沒有動：256 KiB，改預設等於在沒有證據下改所有人的行為）",
+      settings.stream_chunk_kb == 256, settings.stream_chunk_kb)
+_ftp_src = (ROOT / "app" / "ftpclient.py").read_text(encoding="utf-8")
+check("iter_chunks 吃設定值而不是寫死 256 KiB",
+      "stream_chunk_kb" in _ftp_src and "chunk_size: Optional[int] = None" in _ftp_src)
+check("而且每一次搬運都會被量到（含中途被切斷的那些 —— 那正是最要看的）",
+      "streamstat.record_ftp" in _ftp_src and "finally:" in _ftp_src)
+
+_str_src = (ROOT / "app" / "routers" / "stream.py").read_text(encoding="utf-8")
+check("[J −1] direct 走本機路徑（不要繞 FTP loopback 讀同一顆磁碟上的同一個檔案）",
+      "localfs.resolve_local" in _str_src, _str_src[:200])
+check("對不到本機路徑就照舊走 FTP（別台機器掛遠端 FTP 時的退路）",
+      "if local is not None:" in _str_src)
+check("分段端點量得到快取命中（在 get_segment 之前問，之後問一定是命中）",
+      "segment_cached" in _str_src
+      and _str_src.index("segment_cached") < _str_src.index("hls.get_segment"))
+check("有一支看得到量測結果的端點", "/diagnostics/stream" in _insp.getsource(_api))
 
 
 print("\n" + "=" * 50)

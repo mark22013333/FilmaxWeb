@@ -6,8 +6,43 @@ const fileId = params.get('file');
 const v = $('#v'), pl = $('#pl');
 
 let info = null, hlsObj = null, mode = null, saveTimer = null, seekingByUs = false;
-// ABR 目前選中的那一階（hls.js 的 level 物件）。是當下狀態，不進 cfg。
-let curLevel = null;
+
+/* ---------------- 播放執行期狀態（唯一的事實來源）----------------
+
+   **原本的問題**：「現在在播什麼」這件事散在四個地方 —— cfg.quality（使用者
+   選的）、info.height（片源的）、curLevel（hls.js 的階）、v.videoWidth（元素的），
+   而 renderTags() 主要讀 info.height。於是選了 1080p 上限、ABR 實際降到 480p 時，
+   右上角照樣寫著片源的 720p。**介面在說謊。**
+
+   現在只有一份 playbackState，所有 UI 都只能從它取值，而它只由
+   updatePlaybackState() 更新。推導邏輯（要顯示什麼字）在 playback-state.js，
+   那是純函式所以測得到。 */
+const PS = window.PlaybackState;
+let playbackState = PS.emptyState();
+
+// 看門狗要用的量測。跟 playbackState 分開放：那個是「要顯示什麼」，
+// 這個是「怎麼判斷網路撐不撐得住」，兩者的生命週期不同（切畫質時前者
+// 要整個清掉，後者的 stall 歷史反而要留一部分才判斷得出「一直在卡」）。
+let metrics = emptyMetrics();
+function emptyMetrics() {
+  return {
+    stallTimes: [], currentStallSince: 0, currentStallMs: 0,
+    lowBufferSince: 0, lastActionAt: 0, cappedAt: 0,
+    // 最近一段的下載耗時與段長（看門狗用來判斷「下載追不追得上播放」）
+    lastFragLoadMs: 0, segmentSeconds: 0, fragLoadingSince: 0, switchingTo: null,
+    fellBack: false,
+  };
+}
+
+// 每次換片源／換模式／換畫質就 +1。所有 hls.js 與 <video> 的非同步 callback
+// 都要帶著自己那一代的號碼回來比對 —— 對不上就直接丟掉。
+// **這是「切換之後舊事件還在飄」那一整類 bug 的統一解法**（規格的 H、I 案）。
+let generation = 0;
+function bumpGeneration() { generation++; return generation; }
+function isStale(gen) { return gen !== generation; }
+
+// ?debugPlayer=1 才顯示的診斷疊圖。正式模式下整排資訊不塞在畫面上。
+const debugPlayer = params.get('debugPlayer') === '1';
 
 /* ------------------------------------------------ 小工具 ------------------------------------------------ */
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
@@ -49,6 +84,102 @@ function center(text, spinning = true) {
     $('#spin').style.display = spinning ? '' : 'none';
     $('#center').classList.add('show');
   } else $('#center').classList.remove('show');
+}
+
+/* ------------------------------------------------ 播放狀態的更新與呈現 ------------------------------------------------ */
+
+// 目前 currentTime 往後還有多少秒 buffer。**要找「涵蓋 currentTime 的那一段」**，
+// 不能直接拿 buffered.end(0) —— 拖過進度條之後 buffered 會有好幾段不連續的區間，
+// 拿第一段等於在講一個播放頭根本不在的地方還有多少緩衝。
+function bufferAhead() {
+  try {
+    const t = v.currentTime;
+    for (let i = 0; i < v.buffered.length; i++)
+      if (v.buffered.start(i) <= t + 0.25 && t < v.buffered.end(i))
+        return Math.max(0, v.buffered.end(i) - t);
+  } catch {}
+  return 0;
+}
+
+/** 把 hls.js 與 <video> 現在的樣子收進 playbackState，然後重畫。
+ *  `patch` 是這一次事件帶來的增量（例如 LEVEL_SWITCHED 帶 level）。
+ *  **所有 UI 都只走這一支** —— 各自去讀 hlsObj 正是原本會不一致的原因。 */
+function updatePlaybackState(patch) {
+  Object.assign(playbackState, patch || {});
+  playbackState.bufferSeconds = bufferAhead();
+  if (hlsObj) {
+    try {
+      playbackState.bandwidthEstimate = Math.round(hlsObj.bandwidthEstimate || 0);
+      playbackState.levelCount = (hlsObj.levels || []).length;
+      playbackState.capping = hlsObj.autoLevelCapping;
+    } catch {}
+  }
+  renderPlaybackStatus();
+}
+
+/** 把 playbackState 畫到畫面上：右上角那一行、debug 疊圖、開著的面板。 */
+function renderPlaybackStatus() {
+  renderTags();
+  renderDebugOverlay();
+  // 面板開著的時候裡面也有同一份資訊，不同步的話就又出現兩個說法
+  const box = $('#playbackRows');
+  if (box) box.innerHTML = PS.detailRows(playbackState).map(([k, val]) =>
+    `<div class="ir"><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('');
+}
+
+/** 切片、切模式、切畫質時把狀態清乾淨。**上一部片／上一階不能留** ——
+ *  殘留正是「選了新畫質、右上角還寫著舊的」那個症狀。 */
+function resetPlaybackState(which) {
+  const gen = bumpGeneration();
+  const src = info?.quality?.source
+    || (info?.width ? { width: info.width, height: info.height,
+                        label: PS.qualityClass(info.width, info.height) } : null);
+  playbackState = PS.emptyState();
+  playbackState.playMode = which;
+  playbackState.sourceQuality = src;
+  playbackState.selectedQuality = cfg.quality;
+  playbackState.remote = !!info?.remote;
+  playbackState.mobile = isMobile();
+  // stall 歷史刻意**不**跨模式保留：direct 卡了三次而切到 HLS 之後，
+  // 那三次不該立刻又讓 HLS 的看門狗降階（它還沒有機會證明自己）。
+  const keptFellBack = metrics.fellBack;
+  metrics = emptyMetrics();
+  metrics.fellBack = keptFellBack;
+  renderPlaybackStatus();
+  return gen;
+}
+
+/* ---------------- debug 疊圖 ---------------- */
+function renderDebugOverlay() {
+  if (!debugPlayer) return;
+  let el = $('#dbg');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'dbg'; el.className = 'dbg';
+    $('#stage').appendChild(el);
+  }
+  const st = playbackState, m = metrics;
+  const rows = [
+    ['Mode', st.playMode || '—'],
+    ['Selected', PS.selectedLabel(st.selectedQuality, st.sourceQuality)],
+    ['Actual level', st.actualLevelIndex >= 0 ? `${st.actualLevelIndex + 1}/${st.levelCount}` : '—'],
+    ['Actual res', PS.resolutionText(st.actualResolution) || '—'],
+    ['Variant bitrate', st.actualBitrate ? PS.fmtKbps(st.actualBitrate / 1000) : '—'],
+    ['Bandwidth est', st.bandwidthEstimate ? PS.fmtKbps(st.bandwidthEstimate / 1000) : '—'],
+    ['Buffer', st.bufferSeconds.toFixed(1) + 's'],
+    ['Stalls', String(st.stallCount)],
+    ['Last frag', st.lastFragSize ? (st.lastFragSize / 1024).toFixed(0) + ' KiB' : '—'],
+    ['Frag load', st.lastFragLoadMs ? st.lastFragLoadMs + ' ms' : '—'],
+    ['Frag thruput', st.lastFragThroughputKbps ? PS.fmtKbps(st.lastFragThroughputKbps) : '—'],
+    ['Last switch', st.lastSwitchReason ? PS.switchReasonText(st.lastSwitchReason) : '—'],
+    ['Switching to', m.switchingTo || '—'],
+    ['Capping', st.capping >= 0 ? `level ≤ ${st.capping}` : 'off'],
+    ['Link', st.remote ? 'remote' : 'LAN'],
+    ['Mobile', st.mobile ? 'yes' : 'no'],
+    ['Fell back', m.fellBack ? 'yes' : 'no'],
+  ];
+  el.innerHTML = rows.map(([k, val]) =>
+    `<div><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('');
 }
 
 /* ------------------------------------------------ 設定保存 ------------------------------------------------ */
@@ -529,16 +660,26 @@ function play(which, startAt) {
   const t = startAt ?? (v.currentTime > 1 ? v.currentTime : (info.resume || 0));
   $('#modePill').textContent = which === 'direct' ? '直接串流' : '即時轉碼';
   $('#modePill').className = 'badge-mode ' + (which === 'direct' ? 'direct' : '');
-  renderTags();
 
   teardownHls(hlsObj); hlsObj = null;
-  curLevel = null;              // 上一次的階別不能留到這一次（會標錯畫質）
+  // 這一支的所有非同步 callback 都要帶著 gen 回來比對。舊的那一代
+  // 一律丟掉 —— 上一部片、上一階、上一個模式的事件都走這道閘。
+  const gen = resetPlaybackState(which);
   v.removeAttribute('src'); v.load();
   center('緩衝中…');
 
   if (which === 'direct') {
     v.src = info.direct_url;
-    v.addEventListener('loadedmetadata', () => { if (t > 1) v.currentTime = t; }, { once: true });
+    v.addEventListener('loadedmetadata', () => {
+      if (isStale(gen)) return;
+      if (t > 1) v.currentTime = t;
+      // direct 沒有 level 可問，實際解析度只能問 <video> 自己。
+      // 這是唯一一個「元素尺寸就是實際播放尺寸」成立的模式。
+      updatePlaybackState({
+        actualResolution: v.videoWidth ? { width: v.videoWidth, height: v.videoHeight } : null,
+        lastSwitchReason: 'initial',
+      });
+    }, { once: true });
     v.play().catch(() => {});
     return;
   }
@@ -546,8 +687,14 @@ function play(which, startAt) {
   const url = info.hls_url;
   if (!window.Hls || !Hls.isSupported()) {
     if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      // 原生 HLS（iOS Safari）：ABR 由系統管，我們拿不到 level 事件。
+      // resize 是唯一問得到「現在實際多大」的訊號。
       v.src = url;
-      v.addEventListener('loadedmetadata', () => { if (t > 1) v.currentTime = t; }, { once: true });
+      v.addEventListener('loadedmetadata', () => {
+        if (isStale(gen)) return;
+        if (t > 1) v.currentTime = t;
+        syncNativeResolution();
+      }, { once: true });
       v.play().catch(() => {});
     } else center('這個瀏覽器不支援 HLS 播放', false);
     return;
@@ -575,20 +722,21 @@ function play(which, startAt) {
     // 往下切錯的代價只是這幾秒畫質差一點。兩者不對稱，參數就不該對稱。
     abrBandWidthUpFactor: mob ? 0.5 : 0.7,
     abrBandWidthFactor: 0.9,
+    // 螢幕放不下的階不要選。手機 390px 寬去拉 4K 是純浪費頻寬 ——
+    // 而浪費頻寬在行動網路上就等於卡頓。hls.js 1.5 內建這一項，
+    // 它會跟著元素尺寸重新評估，所以全螢幕／轉向之後會自己放寬（見下面的
+    // resize handler）。**不是永久鎖死低畫質。**
+    capLevelToPlayerSize: true,
+    // 高 DPI 手機的實體像素要算進去，不然 390 邏輯寬會把 720p 也擋掉
+    ignoreDevicePixelRatio: false,
   });
-  hlsObj.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
-  hlsObj.on(Hls.Events.FRAG_LOADED, () => { netRetry = 0; mediaRetry = 0; });
-  // 自動模式下畫質是浮動的，選單上只寫「自動」不夠 —— 要看得到現在實際在哪一階，
-  // 不然使用者只會覺得「畫質怎麼忽好忽壞」而不知道是 ABR 在work。
-  hlsObj.on(Hls.Events.LEVEL_SWITCHED, (_, d) => {
-    const lv = hlsObj?.levels?.[d.level];
-    if (!lv) return;
-    curLevel = lv;
-    renderTags();
-  });
+
+  attachHlsHandlers(gen, mob, { resetRetry: () => { netRetry = 0; mediaRetry = 0; } });
+
   hlsObj.on(Hls.Events.ERROR, (_, d) => {
-    // destroy 之後 hls.js 仍可能送事件進來，這時候再去碰它就會炸
-    if (dead || !hlsObj || !d.fatal) return;
+    // destroy 之後 hls.js 仍可能送事件進來，這時候再去碰它就會炸。
+    // gen 這道閘另外擋掉「已經切到別的模式，但舊實例的事件還在飄」。
+    if (dead || isStale(gen) || !hlsObj || !d.fatal) return;
     clearTimeout(retryTimer);
     if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
       if (++netRetry > 6) {
@@ -596,7 +744,7 @@ function play(which, startAt) {
       }
       busy(`轉碼中（重試 ${netRetry}）`);
       retryTimer = setTimeout(() => {
-        if (dead || !hlsObj) return;
+        if (dead || isStale(gen) || !hlsObj) return;
         try { hlsObj.startLoad(); } catch {}
       }, Math.min(1000 * 2 ** (netRetry - 1), 15000));
     } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
@@ -614,6 +762,251 @@ function play(which, startAt) {
   hlsObj.attachMedia(v);
 }
 
+/* 全螢幕、旋轉手機、改視窗大小之後要重新評估 —— **不能永久鎖死低畫質**。
+   capLevelToPlayerSize 是跟著元素尺寸算的，但 hls.js 只在自己的計時器上重算；
+   這裡在尺寸真的變了之後戳它一下，讓「橫過來變全螢幕」立刻能拿到高一階。
+   （注意：這裡動的是 capLevelToPlayerSize 那條路，跟看門狗壓的
+   autoLevelCapping 是兩個獨立的上限 —— 看門狗壓的那個仍然由 shouldRelease 管，
+   不會因為轉了個方向就被放掉。） */
+let resizeTimer = null;
+function onViewportChange() {
+  clearTimeout(resizeTimer);
+  // debounce：轉向的過程中會連續送好幾個 resize，每一個都重算是白做工
+  resizeTimer = setTimeout(() => {
+    if (!hlsObj) { syncNativeResolution(); return; }
+    try {
+      // 重新指派一次會讓 hls.js 重跑它的尺寸上限計算
+      hlsObj.capLevelToPlayerSize = true;
+    } catch {}
+    updatePlaybackState({});
+  }, 350);
+}
+window.addEventListener('resize', onViewportChange, { passive: true });
+window.addEventListener('orientationchange', onViewportChange, { passive: true });
+document.addEventListener('fullscreenchange', onViewportChange);
+document.addEventListener('webkitfullscreenchange', onViewportChange);
+
+/** 原生 HLS（iOS Safari）沒有 level 事件，只能從元素尺寸推。 */
+function syncNativeResolution() {
+  if (mode === 'direct' || !v.videoWidth) return;
+  updatePlaybackState({
+    actualResolution: { width: v.videoWidth, height: v.videoHeight },
+  });
+}
+
+/** 掛上所有會影響 playbackState 的 hls.js 事件。
+ *  **每一個 handler 都先過 isStale(gen)** —— 切畫質／切模式之後舊實例
+ *  排隊中的 callback 還會再跑，沒有這道閘就會把上一階的資訊寫進新狀態。 */
+function attachHlsHandlers(gen, mob, ctl) {
+  const H = hlsObj;
+  const on = (ev, fn) => H.on(ev, (_, d) => { if (!isStale(gen) && hlsObj === H) fn(d); });
+
+  on(Hls.Events.MANIFEST_PARSED, d => {
+    const levels = d?.levels || H.levels || [];
+    // 開播策略：手機遠端先壓一階，寧可畫質差一階也要快點開始播。
+    // 賭最高畫質、然後卡十幾秒是更差的體驗（規格第 3 節）。
+    const pol = PS.startupPolicy({
+      remote: !!info?.remote, mobile: mob,
+      effectiveType: navigator.connection?.effectiveType,
+      downlink: navigator.connection?.downlink,
+      saveData: !!navigator.connection?.saveData,
+    });
+    if (pol.capIndex >= 0 && levels.length > 1) {
+      // levels 是**碼率由低到高**排的（hls.js 保證），所以 index 就是階。
+      // 從最低往上數 capIndex 階：0 = 最低、1 = 倒數第二低。
+      const cap = Math.min(pol.capIndex, levels.length - 1);
+      try {
+        H.autoLevelCapping = cap;
+        metrics.cappedAt = Date.now();
+      } catch {}
+      if (debugPlayer) toast(`開播保守：${pol.reason}`);
+    }
+    updatePlaybackState({ levelCount: levels.length, lastSwitchReason: 'initial' });
+    v.play().catch(() => {});
+  });
+
+  // LEVEL_SWITCHING 是「決定要切了」，LEVEL_SWITCHED 是「切完了」。
+  // **右上角那一行只能吃 SWITCHED** —— SWITCHING 的時候畫面上放的還是舊那一階，
+  // 這時候就改文字等於又說了一次謊（只是方向相反）。
+  // 這裡只記「正在切」給 debug 疊圖看：手機卡頓時「決定切了但一直切不過去」
+  // 與「根本沒決定要切」是兩種不同的病，截圖時分得出來才有用。
+  on(Hls.Events.LEVEL_SWITCHING, d => {
+    const lv = H.levels?.[d?.level];
+    metrics.switchingTo = lv?.height ? lv.height + 'p' : null;
+    renderDebugOverlay();
+  });
+
+  on(Hls.Events.LEVEL_SWITCHED, d => {
+    const lv = H.levels?.[d.level];
+    metrics.switchingTo = null;          // 切完了，「正在切」要收掉
+    if (!lv) return;
+    const prev = playbackState.actualBitrate;
+    // 手動 = 我們或使用者指定了 currentLevel（不是 -1）。
+    const manual = H.autoLevelEnabled === false;
+    updatePlaybackState({
+      ...PS.levelToState(lv, d.level, H.levels.length),
+      lastSwitchReason: PS.switchReason(prev, lv.bitrate || 0, manual),
+    });
+  });
+
+  // 這一段開始下載了。**下載中的那一段也要算進「追不追得上」** ——
+  // 只看 FRAG_LOADED 的話，一段卡在下載中永遠不會回來時 lastFragLoadMs
+  // 停在上一段的好成績上，看門狗會以為一切正常（那正是最該降階的時候）。
+  on(Hls.Events.FRAG_LOADING, () => { metrics.fragLoadingSince = Date.now(); });
+
+  on(Hls.Events.FRAG_LOADED, d => {
+    ctl.resetRetry();
+    const st = d?.frag?.stats || d?.stats;
+    if (!st) { updatePlaybackState({}); return; }
+    const ms = Math.max(1, Math.round((st.loading?.end || 0) - (st.loading?.first || st.loading?.start || 0)));
+    const size = st.total || st.loaded || 0;
+    updatePlaybackState({
+      lastFragSize: size, lastFragLoadMs: ms,
+      lastFragThroughputKbps: size ? Math.round(size * 8 / ms) : 0,
+    });
+    metrics.lastFragLoadMs = ms;
+    metrics.fragLoadingSince = 0;        // 這一段回來了，不再算「還在等」
+    metrics.segmentSeconds = d?.frag?.duration || metrics.segmentSeconds || 6;
+  });
+
+  // watchdogTick() 自己會先刷新狀態，不必在這裡再刷一次
+  on(Hls.Events.FRAG_BUFFERED, () => watchdogTick());
+}
+
+/* ------------------------------------------------ 卡頓看門狗 ------------------------------------------------
+
+   **這一段最容易做壞的地方是「跟 hls.js 的 ABR 打架」。**
+   hls.js 本身就有 ABR，每一個 waiting 都手動切一次 level 的話，兩套會
+   互相覆蓋：它剛往上切、我們就往下壓，下一秒它又往上，畫質每幾秒震盪一次。
+
+   所以這裡的角色是**例外處理，不是第二套 ABR**：
+     * 只在 Auto 模式動（手動挑了上限的話，上限底下的階交給 hls.js）
+     * 要好幾個訊號同時指向「真的撐不住」才插手一次（shouldStepDown）
+     * 插手的方式是壓 autoLevelCapping，不是鎖 currentLevel ——
+       壓上限之後 ABR 仍然在上限底下正常運作
+     * 恢復穩定就把上限拿掉，交還控制權（shouldRelease），不永久鎖死  */
+
+function watchdogTick() {
+  if (mode !== 'hls' || !hlsObj) return;
+  const now = Date.now();
+  // **先把狀態刷新再判斷。**看門狗讀的 buffer／頻寬如果是上一個事件留下的
+  // 快照，判斷就會慢一拍 —— 而它插手的時機本來就只有幾秒的餘裕。
+  // updatePlaybackState({}) 會重新問 <video> 與 hls.js 拿現在的值。
+  updatePlaybackState({});
+  const st = playbackState;
+
+  // buffer 危險水位：要**持續**低才算，瞬間掉下去不算（下載中本來就會掉）
+  if (st.bufferSeconds < PS.WATCHDOG.lowBufferSec) {
+    if (!metrics.lowBufferSince) metrics.lowBufferSince = now;
+  } else metrics.lowBufferSince = 0;
+
+  const levels = hlsObj.levels || [];
+  const curIdx = hlsObj.currentLevel;
+  // **不要用 index === 0 判斷「在最低階」** —— 索引順序由 hls.js 內部決定。
+  // 直接比碼率（player.js 原本的 waiting handler 已經為這件事留過註解）。
+  const cur = levels[curIdx];
+  const atLowest = levels.length > 1 && cur
+    && cur.bitrate <= Math.min(...levels.map(x => x.bitrate));
+
+  // 「最近一段花了多久」取兩者的大值：已經下載完的那一段，以及**還在下載中**
+  // 的那一段到現在為止已經等了多久。少了後者的話，一段永遠回不來時
+  // lastFragLoadMs 會停在上一段的好成績上，看門狗以為一切正常。
+  const inflight = metrics.fragLoadingSince ? now - metrics.fragLoadingSince : 0;
+  const down = PS.shouldStepDown({
+    autoMode: cfg.quality === PS.QUALITY_AUTO,
+    levelCount: levels.length, atLowestLevel: !!atLowest,
+    stallTimes: metrics.stallTimes, lowBufferSince: metrics.lowBufferSince,
+    lastFragLoadMs: Math.max(metrics.lastFragLoadMs || 0, inflight),
+    segmentSeconds: metrics.segmentSeconds,
+    lastActionAt: metrics.lastActionAt,
+  }, now);
+
+  if (down.act) { stepDown(down.reason, now); return; }
+
+  const up = PS.shouldRelease({
+    capping: hlsObj.autoLevelCapping, cappedAt: metrics.cappedAt,
+    stallTimes: metrics.stallTimes, bufferSeconds: st.bufferSeconds,
+    bandwidthEstimate: st.bandwidthEstimate,
+    nextLevelBitrate: levels[Math.min(hlsObj.autoLevelCapping + 1, levels.length - 1)]?.bitrate || 0,
+  }, now);
+  if (up.act) releaseCap(up.reason, now);
+}
+
+/** 主動往下壓一階。壓的是 autoLevelCapping（上限），不是 currentLevel ——
+ *  鎖死 currentLevel 等於把 ABR 整個關掉，之後網路恢復也不會自己回來。 */
+function stepDown(reason, now) {
+  const levels = hlsObj.levels || [];
+  const curIdx = hlsObj.currentLevel >= 0 ? hlsObj.currentLevel : levels.length - 1;
+  const target = Math.max(0, Math.min(curIdx - 1,
+    hlsObj.autoLevelCapping >= 0 ? hlsObj.autoLevelCapping - 1 : curIdx - 1));
+  if (target === hlsObj.autoLevelCapping) return;
+  try { hlsObj.autoLevelCapping = target; } catch { return; }
+  metrics.cappedAt = now; metrics.lastActionAt = now;
+  metrics.lowBufferSince = 0;
+  updatePlaybackState({ lastSwitchReason: 'stall-down', capping: target });
+  const lab = levels[target]?.height ? levels[target].height + 'p' : '較低畫質';
+  toast(`網路不穩，已降到 ${lab}`);
+  if (debugPlayer) console.info('[watchdog] step down:', reason, '→ cap', target);
+}
+
+/** 把上限拿掉，讓 hls.js 的 Auto ABR 重新全權負責。 */
+function releaseCap(reason, now) {
+  try { hlsObj.autoLevelCapping = -1; } catch { return; }
+  metrics.cappedAt = 0; metrics.lastActionAt = now;
+  updatePlaybackState({ lastSwitchReason: 'recover', capping: -1 });
+  if (debugPlayer) console.info('[watchdog] release:', reason);
+}
+
+/** 記一次卡頓。direct 與 hls 共用同一個計數 —— 兩邊的處置不同，
+ *  但「卡了幾次」這件事本身是同一件事。 */
+function noteStall() {
+  const now = Date.now();
+  metrics.stallTimes.push(now);
+  // 只留最近 60 秒，不然清單會無限長（一部片兩小時）
+  metrics.stallTimes = metrics.stallTimes.filter(x => now - x <= 60000);
+  metrics.currentStallSince = now;
+  updatePlaybackState({ stallCount: playbackState.stallCount + 1 });
+  if (mode === 'direct') maybeFallbackFromDirect();
+  else watchdogTick();
+}
+
+function noteStallEnd() {
+  metrics.currentStallSince = 0;
+  metrics.currentStallMs = 0;
+}
+
+/* ------------------------------------------------ Direct → HLS 自動 fallback ------------------------------------------------
+
+   **direct 本質上是原始檔的 HTTP Range 串流，沒有第二階可選。**
+   所以「在 direct 裡面降到 480p」這件事不存在 —— 唯一正確的處置是換一條
+   有階梯的路。換過去時要**保留播放位置**：在 00:42:15 卡住就從 00:42:15
+   繼續，跳回開頭是比卡頓更糟的失效。                                        */
+
+function maybeFallbackFromDirect() {
+  const now = Date.now();
+  metrics.currentStallMs = metrics.currentStallSince ? now - metrics.currentStallSince : 0;
+  const r = PS.shouldFallbackFromDirect({
+    playMode: mode, fellBack: metrics.fellBack,
+    stallTimes: metrics.stallTimes, currentStallMs: metrics.currentStallMs,
+    directAdvised: info?.direct_advised,
+  }, now);
+  if (!r.act) return;
+  fallbackToHls(r.reason);
+}
+
+function fallbackToHls(reason) {
+  // **這道閘擋掉「舊的 direct 事件在切換之後又觸發第二次」**（規格 H 案）。
+  // fellBack 在 resetPlaybackState 之間是刻意保留的。
+  if (metrics.fellBack || mode !== 'direct') return;
+  metrics.fellBack = true;
+  const at = v.currentTime;          // 位置要留住，不能跳回開頭
+  if (debugPlayer) console.info('[direct] fallback:', reason, '@', at);
+  toast('網路速度不足，已從直接串流改用自動畫質');
+  play('hls', at);
+  updatePlaybackState({ lastSwitchReason: 'direct-fallback' });
+  buildPanel();
+}
+
 // hls.js 的 destroy() 會把內部參考清成 null，但它自己排隊中的 callback 還會再跑一次，
 // 於是主控台就噴 "Cannot read properties of null (reading 'trigger')"。
 // 先 stopLoad + detachMedia 讓那些 callback 這一輪收乾淨，下一個 tick 再 destroy。
@@ -626,14 +1019,39 @@ function teardownHls(h) {
 
 // 畫質與音軌都要重新跟伺服器要一次播放資訊，兩個參數得一起帶，
 // 不然切畫質會把選好的音軌洗掉，反過來也一樣。
-function playUrl({ height, audio }) {
+function playUrl({ height, audio, forceDirect }) {
   const q = new URLSearchParams();
   // 0 = 自動（依區網/遠端判定）、-1 = 原畫質不縮放、其餘 = 指定高度
   if (height > 0) q.set('h', height);
   else if (height === -1) q.set('h', 0);
   if (audio != null) q.set('a', audio);
+  // 使用者明確按了「試試直接播放」。**這個旗標只放寬伺服器的建議，
+  // 不關掉 fallback** —— 真的持續卡頓還是會自己切回 HLS（規格第 5 節）。
+  if (forceDirect) q.set('force_direct', '1');
   const qs = q.toString();
   return `/api/play/${fileId}${qs ? '?' + qs : ''}`;
+}
+
+/** 手動切換播放來源。跟自動 fallback 走不同的路：
+ *  使用者明確要求時要**尊重他的選擇**，所以要重新跟伺服器要一份帶
+ *  force_direct 的播放資訊（不然遠端大檔會被政策擋回 HLS，按了沒反應）。 */
+async function switchMode(which) {
+  const at = v.currentTime;
+  if (which === 'direct') {
+    busy('切換來源');
+    try {
+      info = await (await fetch(playUrl({ height: cfg.quality, audio: info.audio_index,
+                                          forceDirect: true }))).json();
+    } catch { busy(''); toast('切換來源失敗'); return; }
+    // 手動要求試 direct = 給它一次新的機會。之前自動切回來過也重新計次，
+    // 不然按了「試試直接播放」會因為 fellBack 還是 true 而立刻被切回去。
+    metrics.fellBack = false;
+    if (info.remote && info.direct_advised === false) {
+      toast('這個片源位元率偏高，遠端可能會卡；卡住會自動切回自動畫質');
+    }
+  }
+  play(which, at);
+  buildPanel();
 }
 
 async function switchAudio(index) {
@@ -652,6 +1070,7 @@ async function switchAudio(index) {
 }
 
 // 切換之後的提示要跟面板上寫的一致：級別 ＋ 實際解析度。
+// **指定高度時要講「上限」** —— 後端仍然會發比它低的階，講成固定值就是說謊。
 function qualityToast(height) {
   const q = info?.quality || {};
   const src = q.source;
@@ -660,7 +1079,8 @@ function qualityToast(height) {
     return src ? `畫質：原畫質 ${src.label}（${src.width}×${src.height}）` : '畫質：原畫質';
   }
   const lv = (q.levels || []).find(l => l.h === height);
-  return lv ? `畫質：${lv.label}（${lv.width}×${lv.height}）` : `畫質：${height}p`;
+  return lv ? `畫質上限：${lv.label}（${lv.width}×${lv.height}），網路不足仍會降階`
+            : `畫質上限：${height}p，網路不足仍會降階`;
 }
 
 
@@ -671,6 +1091,9 @@ async function switchQuality(height) {
   try {
     info = await (await fetch(playUrl({ height, audio: info.audio_index }))).json();
   } catch { busy(''); toast('切換畫質失敗'); return; }
+  // play() 會 resetPlaybackState()，把上一階的 curLevel／解析度整個清掉。
+  // **這正是「切了畫質，右上角還寫著舊的 720p」那個症狀的修法**：
+  // 新狀態一開始是空的，等 LEVEL_SWITCHED 進來才會有實際畫質。
   play(info.mode, at);
   toast(qualityToast(height));
   buildPanel();
@@ -932,10 +1355,17 @@ function mediaInfoRows() {
   const overall = info.bitrate ? fmtRate(info.bitrate / 1000) : '';
   if (overall) rows.push(['整體位元率', overall]);
 
-  // 現在正在送給瀏覽器的東西，跟原始檔可能不一樣
+  // **「現在在播什麼」不在這一區。**這一區從頭到尾講的是片源（這個檔案本身
+  // 長什麼樣），而正在播的那一份由 playbackState 提供、列在上面的「播放狀態」
+  // 區塊。原本把兩者混在一起，正是「顯示的畫質不是實際播放畫質」的來源之一。
+  //
+  // 這裡只留伺服器端的**上限設定**（它是「我們打算送什麼」，仍然屬於設定
+  // 而不是實測），並且明講它是上限。
   const q = info.quality || {};
-  rows.push(['目前播放', mode === 'direct' ? '直送原始檔，未轉碼'
-    : `轉碼 ${q.height || '?'}p` + (q.bitrate_kbps ? ` · 上限 ${fmtRate(q.bitrate_kbps)}` : ' · 位元率不限')]);
+  if (mode !== 'direct') {
+    rows.push(['伺服器上限', `${q.height ? q.height + 'p' : '不縮放'}`
+      + (q.bitrate_kbps ? ` · ${fmtRate(q.bitrate_kbps)}` : ' · 位元率不限')]);
+  }
   if (info.filename) rows.push(['檔名', info.filename]);
   return rows;
 }
@@ -944,7 +1374,19 @@ function renderTags() {
   const box = $('#tags');
   if (!box || !info) return;
   const t = [];
-  if (info.height) t.push(info.height >= 2000 ? '4K' : info.height + 'p');
+  // **這一顆是「現在真正在播的」，不是片源。**
+  // 原本這裡是 info.height（片源高度）—— 選了 1080p 上限、ABR 實際降到 480p 時
+  // 它照樣寫著片源的 720p，而使用者看到的就是那個數字。
+  // 片源資訊改放在面板的「片源」那一列，兩者刻意不混在一起。
+  const line = PS.statusLine(playbackState);
+  if (line) {
+    const tip = playbackState.playMode === 'direct'
+      ? '直接串流：原始檔直送，沒有畫質階梯'
+      : (cfg.quality === PS.QUALITY_AUTO
+         ? '自動調節：依目前網路速度選的畫質，會隨網路上下切'
+         : '你選的是「上限」，網路不足時仍會降到較低的階');
+    t.push(`<span class="tg live" title="${esc(tip)}">${esc(line)}</span>`);
+  }
   if (info.is_hdr) {
     const m = info.hdr_mode;
     t.push(!info.tonemap_available
@@ -953,13 +1395,6 @@ function renderTags() {
       : `<span class="tg hdr" title="${m === 'fast' ? '快速色域轉換：色彩正確，高光會削掉' : '標準 tonemap：畫質最好'}">HDR → SDR${m === 'fast' ? '（快速）' : ''}</span>`);
   }
   if (info.bit_depth && info.bit_depth > 8) t.push(info.bit_depth + '-bit');
-  // 自動模式下 ABR 會自己上下切，標出「現在實際在哪一階」。只在自動、
-  // 而且真的有第二階可切的時候顯示 —— 使用者鎖死某一階時它是固定的，
-  // 再標一次只是雜訊。
-  if (mode === 'hls' && cfg.quality === 0 && curLevel && (hlsObj?.levels?.length || 0) > 1) {
-    const lab = curLevel.height ? `${curLevel.height}p` : '';
-    if (lab) t.push(`<span class="tg" title="自動調節：依目前網路速度選的畫質">自動 · ${esc(lab)}</span>`);
-  }
   box.innerHTML = t.map(x => x.startsWith('<') ? x : `<span class="tg">${esc(x)}</span>`).join('');
 }
 
@@ -1039,7 +1474,15 @@ function buildPanel() {
     ${ladder.length ? `<div class="pi"><label>畫質${info.quality.auto_reason ? ' <small style="color:var(--dim)">'+esc(info.quality.auto_reason)+'</small>' : ''}</label></div>
       ${srcQ ? `<div class="pi"><small style="color:var(--dim)">片源 ${esc(srcQ.label)}・${esc(dim(srcQ))}</small></div>` : ''}
       ${seg('quality', [['0','自動'], ['-1', srcLabel],
-                        ...levels.map(l => [String(l.h), l.label + (dim(l) ? ` <small>${dim(l)}</small>` : '')])], cfg.quality)}
+                        ...levels.map(l => [String(l.h),
+                          // **「720p」與「720p 上限」是兩件不同的事。**
+                          // 後端 abr_ladder(auto=false) 仍然會發比它低的階，
+                          // 所以選它的語意是「最高 720p」而不是「固定 720p」。
+                          // 只寫「720p」的話，實際降到 360p 時使用者會以為介面壞了。
+                          l.label + ' 上限' + (dim(l) ? ` <small>${dim(l)}</small>` : '')])],
+           cfg.quality)}
+      <div class="hint">選一個數字是設「上限」不是鎖死 —— 網路不足時仍會自動降到更低的階，
+        右上角與上面的「播放狀態」會顯示目前實際在播的那一階。</div>
       ${info.is_hdr ? `<div class="pi"><label style="font-size:12px;color:var(--dim)">
         HDR 片源：${info.tonemap_available ? (info.hdr_mode === 'fast'
           ? '快速轉換中（色彩正確，高光削掉）。要最佳畫質可在 .env 設 HDR_TONEMAP=quality，但 4K 可能會卡'
@@ -1056,6 +1499,12 @@ function buildPanel() {
         <small>${mode === 'direct' ? '目前直送原始檔' : '目前即時轉碼'}</small></div>
       ${canDownload ? `<div class="opt" onclick="location.href='${info.download_url}'">
         <span class="tick"></span>下載原始檔 <small>${fmtSize(info.size)}</small></div>` : ''}` : ''}
+
+    <h4>播放狀態</h4>
+    <div class="hint">「片源」是這個檔案本身；「目前實際畫質」是瀏覽器這一秒真的在播的東西。
+      選了上限不代表每一秒都播得到那個上限 —— 網路不足時會自動降階。</div>
+    <div class="info" id="playbackRows">${PS.detailRows(playbackState).map(([k, val]) =>
+      `<div class="ir"><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('')}</div>
 
     <h4>片源資訊</h4>
     <div class="info">${mediaInfoRows().map(([k, val]) =>
@@ -1097,7 +1546,8 @@ function buildPanel() {
     switchAudio(+el.dataset.audio);
   });
   p.querySelector('[data-switchmode]')?.addEventListener('click', () => {
-    play(mode === 'direct' ? 'hls' : 'direct'); $('#panel').classList.remove('show'); });
+    switchMode(mode === 'direct' ? 'hls' : 'direct');
+    $('#panel').classList.remove('show'); });
   p.querySelector('[data-reset]').onclick = () => {
     Object.assign(cfg, { subSize: DEFAULTS.subSize, subColor: DEFAULTS.subColor, subBg: DEFAULTS.subBg,
       subEdge: DEFAULTS.subEdge, subPos: DEFAULTS.subPos, subOffset: DEFAULTS.subOffset,
@@ -1139,10 +1589,13 @@ document.addEventListener('pointerdown', e => {
 v.addEventListener('play', syncPlayBtn);
 v.addEventListener('pause', () => { syncPlayBtn(); wake(); });
 v.addEventListener('play', () => { userPaused = false; });
-v.addEventListener('playing', () => { center(''); busy(''); });
+v.addEventListener('playing', () => {
+  center(''); busy(''); noteStallEnd(); updatePlaybackState({});
+});
 // 卡住的原因有兩種，講錯會把人引導到錯的方向：伺服器還在轉碼（等一下就好），
 // 還是網路餵不動（那要等 ABR 降階）。已經在最低階還在等 = 網路問題。
 v.addEventListener('waiting', () => {
+  noteStall();
   if (mode !== 'hls') return busy('緩衝中');
   // **不能用 `currentLevel === 0` 判斷「在最低階」** —— level 的索引順序
   // 由 hls.js 內部決定，不保證跟 master 裡的順序或碼率高低一致。
@@ -1153,20 +1606,45 @@ v.addEventListener('waiting', () => {
     && cur.bitrate <= Math.min(...lv.map(x => x.bitrate));
   busy(lowest ? '網路較慢，已降到最低畫質' : '轉碼中');
 });
-v.addEventListener('canplay', () => { center(''); busy(''); });
+v.addEventListener('canplay', () => {
+  center(''); busy(''); noteStallEnd(); updatePlaybackState({});
+});
+// direct 與原生 HLS 沒有 level 事件，畫面尺寸變了就是「實際畫質變了」。
+// hls.js 那條路也掛著沒關係 —— 它只會確認一次已經從 level 拿到的答案。
+v.addEventListener('resize', () => {
+  if (mode === 'direct' || !hlsObj) syncNativeResolution();
+});
+v.addEventListener('loadeddata', () => {
+  if (mode === 'direct' || !hlsObj) syncNativeResolution();
+});
 v.addEventListener('volumechange', syncVol);
 v.addEventListener('timeupdate', () => {
   syncBar(); renderCues();
   clearTimeout(saveTimer); saveTimer = setTimeout(saveProgress, 5000);
 });
-v.addEventListener('progress', syncBar);
+v.addEventListener('progress', () => {
+  syncBar();
+  // buffer 水位是 direct 那條路唯一的健康訊號（它沒有 fragment 事件），
+  // 而 progress 是它唯一會固定送出來的事件。
+  updatePlaybackState({});
+  if (mode === 'direct') maybeFallbackFromDirect();
+});
 v.addEventListener('seeking', () => renderCues(true));
 v.addEventListener('loadedmetadata', () => { v.playbackRate = cfg.rate; syncBar(); });
 
-let fellBack = false;
 v.addEventListener('error', () => {
-  if (mode === 'direct' && !fellBack) { fellBack = true; toast('直接播放失敗，改用轉碼'); play('hls'); }
-  else if (mode === 'direct') center('這個檔案無法在瀏覽器播放，請下載後用本機播放器開啟', false);
+  if (mode !== 'direct') return;
+  // **fellBack 統一由 metrics 管**（不再另外一個區域變數）—— 兩個地方各記
+  // 一份「切過了沒」的話，錯誤與卡頓兩條路徑會各切一次。
+  if (metrics.fellBack) {
+    center('這個檔案無法在瀏覽器播放，請下載後用本機播放器開啟', false);
+    return;
+  }
+  metrics.fellBack = true;
+  const at = v.currentTime;          // 位置一樣要留住
+  toast('直接播放失敗，改用轉碼');
+  play('hls', at);
+  updatePlaybackState({ lastSwitchReason: 'direct-fallback' });
 });
 
 function saveProgress(finished = false) {
@@ -1256,4 +1734,25 @@ async function boot() {
   }
   wake();
 }
+
+/* 測試掛勾（tests/player_wiring_test.js）。
+
+   **為什麼需要它**：這個檔案是一個大 IIFE 式的 script，`info`／`mode`／
+   `playbackState` 都是 `let` 宣告的 module 區域變數，從外面碰不到。
+   而這次修正的重點正是「事件進來之後狀態有沒有真的被改」—— 只驗純函式
+   證明不了那件事（純函式全對但沒有人呼叫它們，是最容易留下的漏洞）。
+
+   這裡只掛讀寫幾個內部變數的存取器，不改任何行為，正式頁面上沒有人會用到它。
+   刻意不掛整個內部狀態 —— 掛得越多，測試就越容易在重構時無謂地壞掉。 */
+window.__playerTestHooks = {
+  setInfo(x) { info = x; },
+  get info() { return info; },
+  get mode() { return mode; },
+  set mode(x) { mode = x; },
+  get playbackState() { return playbackState; },
+  get metrics() { return metrics; },
+  get cfg() { return cfg; },
+  play, updatePlaybackState, watchdogTick, renderPlaybackStatus,
+};
+
 boot();

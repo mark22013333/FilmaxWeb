@@ -4,13 +4,14 @@ from __future__ import annotations
 import logging
 import posixpath
 import re
+import time
 from urllib.parse import quote
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 
-from .. import acl, auth, db, ftpclient, hls, keyframes, media, photo
+from .. import acl, auth, db, ftpclient, hls, keyframes, localfs, media, photo, streamstat
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 
 log = logging.getLogger("filmax.stream")
@@ -43,6 +44,16 @@ def stream_raw(file_id: int, request: Request, raw: int = 0):
     """支援 HTTP Range 的原始檔串流。瀏覽器直接播放、以及 ffmpeg 讀取來源都走這裡。"""
     f = _file_or_404(file_id, request)
     path = f["ftp_path"]
+
+    # 片庫在本機硬碟上時（J 第 −1 層）走檔案系統，不要繞 FTP loopback。
+    # **這是 direct 這條路上量得到的最大一項**：原本是
+    # 瀏覽器 → FastAPI → FTP（loopback，每個 Range 都重開一條連線 ＋ REST
+    # 到偏移量）→ 同一顆磁碟上的同一個檔案。走本機路徑之後是一次 open+seek。
+    # 對不到路徑（別台機器掛遠端 FTP）就回 None，照舊走下面那條 FTP 路徑。
+    local = localfs.resolve_local(path) if localfs.enabled() else None
+    if local is not None:
+        mime = MIME.get((f.get("ext") or "").lower(), "application/octet-stream")
+        return _ranged_file(local, mime, request, cache="no-store", stat="local")
 
     size = f.get("size") or 0
     if not size:
@@ -176,11 +187,20 @@ def hls_segment(file_id: int, index: int, request: Request, p: str = Query(defau
     f = _file_or_404(file_id, request)
     duration = _duration_or_404(f)
     profile = hls.normalize_profile(p)
+    # 「這一段有沒有現成的」要在 get_segment 之前問 —— 問完之後它就一定存在了，
+    # 而快取命中率正是分辨「ffmpeg 太慢」與「prefetch 沒跟上」的那個數字。
+    cached = hls.segment_cached(file_id, index, profile)
+    t0 = time.monotonic()
     try:
         path = hls.get_segment(file_id, index, profile, duration)
     except Exception as e:
         log.warning("分段失敗 %s/%s: %s", file_id, index, e)
         raise HTTPException(500, str(e))
+    try:
+        streamstat.record_segment(file_id, index, profile, time.monotonic() - t0,
+                                  path.stat().st_size, cached)
+    except OSError:
+        pass
     return FileResponse(path, media_type="video/mp2t",
                         headers={"Cache-Control": "public, max-age=86400"})
 
@@ -290,12 +310,17 @@ DOC_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _ranged_file(path, media_type: str, request: Request,
-                 filename: Optional[str] = None) -> Response:
+                 filename: Optional[str] = None,
+                 cache: str = "private, max-age=3600",
+                 stat: Optional[str] = None) -> Response:
     """支援 Range 的檔案回應。
 
     PDF.js 會發一堆小的 Range 請求（預設 64KB 一塊），有 Range 才能「開了就先
     看到第一頁」而不是等整份下載完。Starlette 各版本對 FileResponse 的 Range
     支援不一致，所以這裡自己處理 —— 邏輯跟上面影片那段一樣。
+
+    `stat` 有值時把這次搬運的吞吐記進 streamstat（跟 FTP 那條路用同一個
+    取樣點），才比得出「走本機」與「走 FTP」到底差多少。
     """
     size = path.stat().st_size
     start, end, partial = 0, size - 1, False
@@ -318,7 +343,7 @@ def _ranged_file(path, media_type: str, request: Request,
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Length": str(length),
-        "Cache-Control": "private, max-age=3600",
+        "Cache-Control": cache,
     }
     if filename:
         # inline：讓瀏覽器交給我們的閱讀器／內建檢視器，而不是直接下載
@@ -326,16 +351,24 @@ def _ranged_file(path, media_type: str, request: Request,
     if partial:
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
 
+    chunk = max(16, int(getattr(settings, "stream_chunk_kb", 256) or 256)) * 1024
+
     def chunks():
-        with open(path, "rb") as fh:
-            fh.seek(start)
-            left = length
-            while left > 0:
-                buf = fh.read(min(256 * 1024, left))
-                if not buf:
-                    break
-                left -= len(buf)
-                yield buf
+        sent, t0 = 0, time.monotonic()
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    buf = fh.read(min(chunk, left))
+                    if not buf:
+                        break
+                    left -= len(buf)
+                    sent += len(buf)
+                    yield buf
+        finally:
+            if stat:
+                streamstat.record_ftp(str(path), sent, time.monotonic() - t0, source=stat)
 
     return StreamingResponse(chunks(), status_code=206 if partial else 200,
                              media_type=media_type, headers=headers)

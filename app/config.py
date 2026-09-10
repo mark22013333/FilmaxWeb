@@ -92,6 +92,10 @@ class Settings:
     # 轉碼速度低於這個倍數就停止預轉，把 CPU 全留給使用者正在等的那一段
     hls_cache_max_mb: int = field(default_factory=lambda: _i("HLS_CACHE_MAX_MB", 4096))
 
+    # 串流量測（STREAM_DIAG）與搬運塊大小（STREAM_CHUNK_KB）是 _HOT_ATTRS 裡的
+    # property，不是 dataclass 欄位 —— 兩邊都寫的話 dataclass 的 __init__ 會去
+    # 指派那個 property，而 property 的 setter 是刻意會丟例外的。
+
     # ---- 登入驗證 ----
     auth_enabled: bool = field(default_factory=lambda: _b("AUTH_ENABLED", False))
     auth_password: str = field(default_factory=lambda: _s("AUTH_PASSWORD", ""))
@@ -405,6 +409,13 @@ _HOT_ATTRS = {
     # rungs_for() 只會回下階，也就是現在的行為。
     "hls_two_rung": "HLS_TWO_RUNG",
     "hls_prefetch": "HLS_PREFETCH_SEGMENTS",
+    # 量測開關與搬運塊大小要能在跑的時候調 —— 卡頓是在現場發生的，
+    # 重啟服務等於把要量的那個現場弄不見了。
+    "stream_diag": "STREAM_DIAG",
+    "stream_chunk_kb": "STREAM_CHUNK_KB",
+    # 遠端 direct 的安全上限（kbps）。片源比這個高就別讓遠端賭 direct ——
+    # direct 沒有階可降，賭輸的代價是整段播不動（見 hls.direct_ok_for_remote）。
+    "remote_direct_max_kbps": "REMOTE_DIRECT_MAX_KBPS",
     "prefetch_min_speed": "PREFETCH_MIN_SPEED",
     "audio_channels": "AUDIO_CHANNELS",
     "audio_bitrate_kbps": "AUDIO_BITRATE_KBPS",

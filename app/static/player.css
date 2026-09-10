@@ -195,7 +195,24 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 }
 .tg.hdr{background:rgba(245,197,24,.18);color:var(--accent)}
 .tg.warn{background:rgba(255,92,92,.18);color:#ff8f8f}
-@media(max-width:720px){.tags-row .tg:not(.hdr):not(.warn){display:none}}
+/* 「現在真正在播的畫質」。這一顆比其他標記顯眼一點 —— 它是會變的那一個，
+   而使用者要看的正是它變了沒。 */
+.tg.live{background:rgba(255,255,255,.2);color:#eef2f8}
+/* 手機上把片源標記收起來（螢幕窄，一排標籤會擠掉標題）。
+   **但 .live 一定要留** —— 手機遠端看片、網路變差自動降階，正是最需要
+   「右上角立刻看得到現在幾 p」的情境，把它一起藏掉等於把這次的修正藏掉。 */
+@media(max-width:720px){.tags-row .tg:not(.hdr):not(.warn):not(.live){display:none}}
+@media(max-width:480px){.tags-row .tg.live{max-width:46vw;overflow:hidden;text-overflow:ellipsis}}
+
+/* 播放診斷疊圖（?debugPlayer=1 才會出現）。正式模式下整排資訊不塞在畫面上。 */
+.dbg{
+  position:absolute;right:10px;top:10px;z-index:27;pointer-events:none;
+  padding:8px 10px;border-radius:8px;background:rgba(0,0,0,.78);backdrop-filter:blur(6px);
+  font:11px/1.5 ui-monospace,Consolas,monospace;color:#cfd7e4;max-width:min(320px,60vw);
+}
+.dbg>div{display:flex;gap:10px;justify-content:space-between}
+.dbg span{color:#8b95a7}
+.dbg b{color:#eef2f8;font-weight:600;text-align:right;word-break:break-all}
 
 /* 緩衝／轉碼中的小標示 —— 放角落，不遮畫面 */
 .busy{

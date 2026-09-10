@@ -283,6 +283,20 @@ _ALL: List[Param] = [
     _p("LAN_BITRATE_KBPS", HOT, type="int", default=0, apply=APPLY_HOT,
        section="遠端畫質", label="區網位元率上限（kbps）", minimum=0,
        help="0 = 不鎖"),
+    _p("STREAM_DIAG", HOT, type="bool", default=True, apply=APPLY_HOT,
+       section="遠端畫質", label="串流量測取樣",
+       help="把 FTP／本機搬運吞吐、HLS 分段命中率與 ffmpeg 速度記在記憶體裡"
+            "（固定筆數的環形緩衝，看 /api/diagnostics/stream）。"
+            "**沒有它的話「手機卡頓」只能用猜的。**成本是 KB 級的記憶體"),
+    _p("STREAM_CHUNK_KB", HOT, type="int", default=256, apply=APPLY_HOT,
+       section="遠端畫質", label="原始串流搬運塊大小（KiB）", minimum=16, maximum=8192,
+       help="direct／下載／相片／PDF 一次搬多少。**不要憑感覺調** ——"
+            "先看 /api/diagnostics/stream 的 ftp_mbps，確認瓶頸真的在搬運層再動"),
+    _p("REMOTE_DIRECT_MAX_KBPS", HOT, type="int", default=6000, apply=APPLY_HOT,
+       section="遠端畫質", label="遠端可以直接串流的片源上限（kbps）", minimum=0,
+       help="片源整體位元率超過這個值時，遠端不要走直接串流 —— **direct 沒有階可以降**，"
+            "鏈路不夠就只能整段卡住。超過就改走 HLS（有 remux 上階時畫質完全一樣；"
+            "沒有的話走轉碼，畫質有損但至少降得下去）。0 = 不檢查（回到舊行為）"),
 
     _p("MIN_FILE_MB", HOT, type="int", default=50, apply=APPLY_HOT, section="媒體庫",
        label="影片最小大小（MB）", minimum=0,

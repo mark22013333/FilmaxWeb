@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .. import (acl, audit, auth, db, ftpclient, geo, hls, media, mssql, params,
-                paramstore, purge, scanner, users)
+                paramstore, purge, scanner, streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -315,7 +315,8 @@ def _qs(**kw) -> str:
 
 @router.get("/play/{file_id}")
 def play_info(file_id: int, request: Request,
-              h: Optional[int] = None, a: Optional[int] = None):
+              h: Optional[int] = None, a: Optional[int] = None,
+              force_direct: int = 0):
     row = db.q1("""SELECT f.*, i.title AS item_title, i.kind, e.season, e.episode, e.title AS ep_title
                    FROM media_file f
                    LEFT JOIN media_item i ON i.id=f.item_id
@@ -386,15 +387,19 @@ def play_info(file_id: int, request: Request,
     # 這兩個坑的說明都在那個函式裡）。
     chosen_h, chosen_b = hls.quality_policy(remote, h)
 
-    # 遠端 + 這個檔案有上階可給 → **不要走 direct**。direct 沒有階梯可以降：
-    # 那 7 部走 direct 的 mp4 裡有 7.6 GB／4,661 kbps 與 4.8 GB／4,508 kbps
-    # 兩部大檔，鏈路不夠就只能卡在那裡。改走兩階 HLS 之後，上階的畫質
-    # 一樣是原檔（remux），而且不夠時客戶端可以自己降到下階。
+    # 遠端要不要走 direct，判斷集中在 hls.direct_ok_for_remote()。
     #
-    # **只有真的有上階時才改。**沒有上階的話，把遠端的 direct 改成 HLS
-    # 等於把「原檔直送」換成「一定重編」—— 那是退步，不是進步。
+    # **舊的條件（「有 remux 上階才改走 HLS」）是反的**，那個 bug 的形狀是：
+    # 一部 17 Mbps 的 mp4 在沒有邊界表時反而被判定「適合遠端 direct」——
+    # 正是最不適合的那一種。有沒有上階講的是「改走 HLS 會不會掉畫質」，
+    # 該不該離開 direct 講的是「這條鏈路餵不餵得動原始檔」。
     rungs = hls.rungs_for(file_id, float(f.get("duration") or 0))
-    if remote and mode == "direct" and hls.RUNG_REMUX in rungs:
+    has_remux = hls.RUNG_REMUX in rungs
+    direct_ok, direct_reason = (True, "") if not remote else \
+        hls.direct_ok_for_remote(f.get("bitrate"), has_remux)
+    # **使用者手動要求試直接播放時尊重他的選擇**（前端帶 force_direct=1）——
+    # 真的持續卡頓再由前端的 fallback 接手。這裡只管「預設要給哪一種」。
+    if remote and mode == "direct" and not direct_ok and not force_direct:
         mode = "hls"
 
     src_h = f.get("height") or 1080
@@ -422,7 +427,12 @@ def play_info(file_id: int, request: Request,
         # 這個檔案在這條鏈路上實際會拿到幾階。前端不必用它來決定行為
         # （master playlist 才是事實），但診斷時要看得到「為什麼沒有上階」。
         "rungs": len(rungs) if remote else min(len(rungs), 1),
-        "remux_available": hls.RUNG_REMUX in rungs,
+        "remux_available": has_remux,
+        # 前端的 direct → HLS fallback 要看得到「伺服器覺得這條鏈路撐不撐得住
+        # 原始檔」。它不是命令（使用者仍然可以手動要求 direct），是判斷依據 ——
+        # 遠端 ＋ 不建議 direct 的話，前端的 stall 門檻會收緊。
+        "direct_advised": bool(direct_ok),
+        "direct_advice": direct_reason,
         "duration": f.get("duration"),
         "width": f.get("width"), "height": f.get("height"),
         "video_codec": f.get("video_codec"), "audio_codec": f.get("audio_codec"),
@@ -1434,6 +1444,28 @@ def admin_problems(_: str = Depends(admin_only)):
             "FROM media_file f LEFT JOIN media_item i ON i.id=f.item_id "
             "WHERE f.kf_state='failed' ORDER BY f.id DESC LIMIT 200")],
     }
+
+
+@router.get("/diagnostics/stream")
+def diagnostics_stream(limit: int = Query(default=40, ge=0, le=200),
+                       _: str = Depends(admin_only)):
+    """串流量測（J 第 7 節）：搬運吞吐、分段命中率、ffmpeg 速度。
+
+    **這一支存在的理由是「不要憑感覺調參數」。**手機卡頓時要回答的是
+    「慢在 FTP、慢在 ffmpeg、還是慢在客戶端」，這三種的處方完全不同。
+    前端的 `?debugPlayer=1` 疊圖負責客戶端那一半，這一支負責伺服器這一半。
+    """
+    snap = streamstat.snapshot(limit=limit)
+    snap["transcode_speed_recent"] = hls.recent_speed()
+    snap["chunk_kb"] = int(getattr(settings, "stream_chunk_kb", 256) or 256)
+    return snap
+
+
+@router.post("/diagnostics/stream/reset")
+def diagnostics_stream_reset(_: str = Depends(admin_only)):
+    """把取樣清空，才量得到「從現在開始」的那一段。"""
+    streamstat.reset()
+    return {"ok": True}
 
 
 @router.get("/diagnostics")
