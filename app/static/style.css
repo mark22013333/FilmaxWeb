@@ -286,6 +286,42 @@ body.viewer #btnStats { display: none; }
 .fchip .fc-c{color:var(--dim);font-size:12px;flex:none}
 .fc-none{padding:8px 2px;color:var(--dim);font-size:12.5px}
 
+/* 行動版才會出現的抽屜開關。相片牆與文件牆用同一個斷點（900px）——
+   兩塊功能相似的導覽在不同寬度變形只會讓人以為壞了。 */
+.album-toggle{display:none}
+
+@media(max-width:900px){
+  /* 141 個相簿在 375px 下攤成 7,734px（9.5 個螢幕），相片要滑到
+     y≈7,909px 才開始 —— 標籤列比它導覽的內容還長就不是導覽了。
+     收成抽屜，選完自動關（跟文件牆的資料夾樹同一套）。 */
+  .album-toggle{
+    display:flex;align-items:center;gap:7px;width:100%;padding:10px 13px;margin-bottom:12px;
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    font-weight:600;font-size:13px;color:var(--muted);text-align:left;cursor:pointer;
+  }
+  .album-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* 相簿名最長 71 字，不截斷會把開關撐成三行 */
+  #albumToggleLabel{
+    flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .folder-bar{
+    max-height:min(55vh,380px);overflow-y:auto;
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:10px;margin-bottom:14px;
+  }
+  /* 全域的 [hidden]{display:none!important}（本檔第 28 行）已經涵蓋，
+     但 .tree-pane 當初也補了專用的一條 —— 保持一致，也防後人在這裡
+     再加 display 規則時踩到同一個坑。 */
+  .folder-bar[hidden]{display:none!important}
+  .fchip{max-width:none}   /* 抽屜裡寬度不是問題，長名字可以完整看一整列 */
+
+  /* 篩選框吃掉整列，排序與模式切換併成第二列 —— 三個各自換行才是
+     「模式切換掉到第三列、看起來像兩顆沒有標籤的藥丸」的原因。 */
+  .album-bar{gap:8px}
+  .album-bar input{flex:1 1 100%;max-width:none}
+  .pmode{margin-left:auto}   /* 靠右，跟排序分邊，視覺上是一組 */
+}
+
 /* 網格用固定列高 + object-fit，直式橫式混在一起才不會參差不齊 */
 .pgrid{
   display:grid;gap:10px;
@@ -328,8 +364,11 @@ body.viewer #btnStats { display: none; }
 .pgrid.flow .ph img{height:auto;object-fit:contain}
 @media(max-width:1400px){ .pgrid.flow{column-count:4} }
 @media(max-width:1000px){ .pgrid.flow{column-count:3} }
-@media(max-width:700px){  .pgrid.flow{column-count:2} }
-@media(max-width:420px){  .pgrid.flow{column-count:1} }
+/* 720 而不是 700：701～720px 這一段 main 已經換成窄版 padding（本檔第 243
+   行的斷點）卻還排 3 欄，兩個數字不一致造出一段 20px 的死區。
+   沒有再往下的斷點 —— 單欄的瀑布流就是方格的慢速版（原始比例、一張一張
+   往下疊），等於按了按鈕但功能不存在，所以 2 欄一路蓋到最窄。 */
+@media(max-width:720px){  .pgrid.flow{column-count:2} }
 
 /* 瀑布流底下那一行（載入中／載入更多／到底了） */
 .flow-end{
@@ -372,6 +411,11 @@ body.viewer #btnStats { display: none; }
   /* 手機上只留箭頭，文字佔掉的寬度比它提供的資訊值錢 */
   .to-top{bottom:16px;padding:11px;border-radius:50%}
   .to-top span{display:none}
+
+  /* 方格的欄寬一直沒有行動版覆寫：375px 減 padding 只排得下 2 欄，
+     而海報牆的 .grid 早在 720px 就降到 minmax(120px) 了。
+     104px 在 375px 下是 3 欄，第一屏從 6 張變 9 張。 */
+  .pgrid{grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px}
   .to-top.left{left:14px}
   .to-top.right{right:14px}
   /* 手機的掃描面板是滿版寬，右邊那顆一定會被蓋到 —— 直接收起來，
@@ -388,6 +432,22 @@ body.viewer #btnStats { display: none; }
 .pmode button + button{border-left:1px solid var(--line)}
 .pmode button:hover{background:var(--panel-2);color:var(--text)}
 .pmode button.on{background:var(--accent);color:#1a1a1a;font-weight:700}
+/* 桌機用文字，圖示藏起來。fill:currentColor 讓圖示跟著上面三個狀態的
+   文字色走，選中態自動變深色，不必再寫一組顏色規則。 */
+.pmode button svg{display:none;width:13px;height:13px;fill:currentColor}
+
+/* ≤560px 換成只留圖示：文字佔掉的寬度比它提供的資訊值錢（先例是同一個
+   斷點下的 .to-top）。中文藏起來之後由 aria-label 接手，報讀器讀到的
+   跟桌機一樣。
+
+   **這一段必須放在上面那條 display:none 之後**：兩者選擇器相同、權重相同，
+   分出勝負的只有出現順序。放到檔案下方那個 @media(max-width:560px) 區塊裡
+   會被這裡的 display:none 蓋掉，按鈕就變成兩顆空白方塊（實測踩過）。 */
+@media(max-width:560px){
+  .pmode button{display:flex;align-items:center;padding:0 13px}
+  .pmode button .pm-t{display:none}
+  .pmode button svg{display:block}
+}
 
 /* ---------------------------------------------------------- 燈箱 */
 /* ---------- 文件牆（PDF） ----------

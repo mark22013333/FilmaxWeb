@@ -273,10 +273,82 @@ async def main():
 
         # 相片牆的長相簿名在窄螢幕最容易撐破版面（限寬是 260px，螢幕才 375px）
         await pg2.click("nav button[data-kind='photo']")
-        await pg2.wait_for_selector("#folderBar .fchip", timeout=8000)
+        # 相簿標籤在窄螢幕也是抽屜（實測 141 個相簿平鋪成 7,734px，相片要滑到
+        # y≈7,909px 才開始），所以節點存在但不可見 —— 等 attached 而不是 visible
+        await pg2.wait_for_selector("#folderBar .fchip", state="attached", timeout=8000)
         pover = await pg2.evaluate(
             "document.documentElement.scrollWidth - document.documentElement.clientWidth")
         check(f"相片牆在 375px 不橫捲（溢出 {pover}px）", pover <= 1, pover)
+
+        check("窄螢幕出現相簿抽屜開關", await pg2.is_visible("#albumToggle"))
+        check("相簿抽屜預設收起來", not await pg2.is_visible("#folderBar"))
+        # 這是使用者回報的原始症狀：瀑布流那顆被 7,734px 的標籤推出視野
+        check("瀑布流切換看得到", await pg2.is_visible(".pmode [data-pmode='flow']"))
+        # 抽屜收起來之後開關是唯一的「我在看哪一本」—— 相片牆沒有麵包屑
+        lab = await pg2.text_content("#albumToggleLabel")
+        check(f"沒選相簿時開關說「所有相簿」（{lab}）", "所有相簿" in (lab or ""), lab)
+
+        await pg2.click("#albumToggle")
+        await pg2.wait_for_timeout(400)
+        check("相簿抽屜打得開", await pg2.is_visible("#folderBar"))
+        # 抽屜裡解除限寬（長名字看得完整），但不能因此把版面撐破
+        dover = await pg2.evaluate(
+            "document.documentElement.scrollWidth - document.documentElement.clientWidth")
+        check(f"抽屜打開後仍不橫捲（溢出 {dover}px）", dover <= 1, dover)
+
+        await pg2.click("#folderBar .fchip:has(.fc-n:text-is('旅行 / 外拍'))")
+        await pg2.wait_for_timeout(700)
+        check("選完之後相簿抽屜自己收起來", not await pg2.is_visible("#folderBar"))
+        lab = await pg2.text_content("#albumToggleLabel")
+        check(f"開關顯示目前相簿名與張數（{lab}）",
+              "外拍" in (lab or "") and "2" in (lab or ""), lab)
+
+        # 超長的相簿名要截斷，不能把開關撐成多行
+        await pg2.click("#albumToggle")
+        await pg2.wait_for_timeout(300)
+        await pg2.click("#folderBar .fchip:has-text('一個名字很長')")
+        await pg2.wait_for_timeout(700)
+        # 截斷成功的元素 scrollWidth 一定 > clientWidth（那正是「有東西被切掉」
+        # 的證據），所以不能拿那個當通過條件。要驗的是它有沒有守住邊界：
+        # 文字盒不超出開關、開關維持單行。
+        trunc = await pg2.eval_on_selector("#albumToggleLabel", """e => {
+            const cs = getComputedStyle(e);
+            return {clipped: e.scrollWidth > e.clientWidth,
+                    ellipsis: cs.textOverflow === 'ellipsis',
+                    nowrap: cs.whiteSpace === 'nowrap',
+                    inside: e.getBoundingClientRect().right
+                            <= e.parentElement.getBoundingClientRect().right + 1};
+        }""")
+        toggle_h = await pg2.eval_on_selector(
+            "#albumToggle", "e => e.getBoundingClientRect().height")
+        check(f"超長相簿名有截斷、開關維持單行（高 {toggle_h:.0f}px）",
+              trunc["clipped"] and trunc["ellipsis"] and trunc["nowrap"]
+              and trunc["inside"] and toggle_h < 60,
+              f"{trunc} h={toggle_h:.0f}")
+
+        # 搜尋是跨全庫的，會蓋掉選中的相簿 —— 這時開關不能還說「你在那一本」
+        await pg2.fill("#q", "p3")
+        await pg2.wait_for_timeout(900)
+        lab = await pg2.text_content("#albumToggleLabel")
+        check(f"全庫搜尋時開關不再宣稱在某一本相簿（{lab}）",
+              "搜尋" in (lab or "") and "外拍" not in (lab or ""), lab)
+        await pg2.fill("#q", "")
+        await pg2.wait_for_timeout(900)
+
+        # 1 欄的瀑布流就是方格的慢速版，等於按了按鈕但功能不存在
+        await pg2.click(".pmode [data-pmode='flow']")
+        await pg2.wait_for_timeout(800)
+        cols = await pg2.eval_on_selector("#pgrid", "e => getComputedStyle(e).columnCount")
+        check(f"瀑布流在 375px 是 2 欄（{cols}）", cols == "2", cols)
+        fover = await pg2.evaluate(
+            "document.documentElement.scrollWidth - document.documentElement.clientWidth")
+        check(f"瀑布流在 375px 不橫捲（溢出 {fover}px）", fover <= 1, fover)
+
+        # 窄轉寬一定要把 hidden 清掉，不然標籤列在桌機整個消失
+        await pg2.set_viewport_size({"width": 1280, "height": 900})
+        await pg2.wait_for_timeout(600)
+        check("轉回寬螢幕時相簿標籤自己回來", await pg2.is_visible("#folderBar"))
+        check("寬螢幕不顯示抽屜開關", not await pg2.is_visible("#albumToggle"))
         await pg2.close()
 
         real = [e for e in errs if "Failed to load resource" not in e and "ERR_" not in e]
