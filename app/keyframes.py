@@ -222,7 +222,29 @@ def derive_bounds(times: List[float], positions: List[int], seg_seconds: float,
                   total_size: Optional[int] = None) -> List[Tuple[float, float, int]]:
     """從 keyframe 表算分段邊界。回傳 [(起, 迄, 位元組), ...]。
 
-    規則：每段取「湊滿 >= seg_seconds 的最少 keyframe 數」。
+    規則：**第 i 段的結尾取離 `(i+1) * seg_seconds` 最近的 keyframe。**
+    也就是說邊界是「對齊到固定格線」，不是「從上一個邊界往後累加」。
+
+    **為什麼不是「湊滿 >= seg_seconds 的最少 keyframe 數」（原本的規則）。**
+    那條規則是相對的：每一段都從前一段的結尾往後量，於是誤差會**累加**。
+    實測（全庫 157 個有邊界表的檔案，149 個可 remux）：
+
+        file 297  seg-10  上階 = 106.02s，下階 = 60.00s   （差 46 秒）
+        file 297  seg-100 上階 = 1060.77s，下階 = 600.00s （差 461 秒）
+        file 297  seg-708 上階 = 7112.15s，下階 = 4248.00s（差 2864 秒）
+
+    而這兩階是**放在同一份遠端 ABR master 裡讓 hls.js 互相切換的**。
+    對 hls.js 來說 seg-100 就是 seg-100 —— 它照著 MEDIA-SEQUENCE 與 EXTINF
+    累加出來的時間軸挑下一段，切階之後拿到的卻是另一個 media time 的內容，
+    append 進 SourceBuffer 就是重疊或倒退：**畫面短暫跳回已經看過的地方，
+    hls.js 再把播放位置修回來**。使用者看到的正是這個。
+
+    對齊到格線之後誤差**不累加**：第 i 段的邊界永遠在 `i * seg_seconds`
+    的一個 keyframe 間距之內，不管播到第幾段。實測全庫 145/149 個檔案
+    從「錯位」變成「對齊」。
+
+    `-c:v copy` 仍然只能從 keyframe 起頭，所以邊界一定要**落在 keyframe 上**
+    —— 這裡只是換一個挑法（挑離格線最近的那一個），不是改成算出來的時間。
 
     **尾巴要補。**迴圈只能收在最後一個 keyframe，而片尾還有一段沒有 keyframe
     的內容 —— 漏掉它的話播放清單會短少那幾秒，而「最後幾秒播不到」是很難
@@ -240,16 +262,26 @@ def derive_bounds(times: List[float], positions: List[int], seg_seconds: float,
     I-frame 就是 times[0]，ffmpeg 本來就會從那裡開始）。
     """
     n = len(times)
-    if n < 2:
+    if n < 2 or seg_seconds <= 0:
         return []
     bounds: List[Tuple[float, float, int]] = []
     i = 0
+    k = 1                      # 這一段的結尾要對齊到第幾個格線
     while i < n - 1:
+        target = k * seg_seconds
+        # 往後走到第一個 >= 格線的 keyframe
         j = i + 1
-        while j < n - 1 and times[j] - times[i] < seg_seconds:
+        while j < n - 1 and times[j] < target:
             j += 1
+        # 前一個 keyframe 也可能離格線更近（格線落在兩個 keyframe 中間偏後時）。
+        # **取近的那一個**才是「對齊」，一律取後面那個會讓每一段都偏長。
+        if j - 1 > i and abs(times[j - 1] - target) < abs(times[j] - target):
+            j -= 1
         bounds.append((times[i], times[j], positions[j] - positions[i]))
         i = j
+        # 下一段的格線由**實際落點**往後推，不是 k+1 ——
+        # keyframe 稀疏到跨過好幾格時，k+1 會讓後面連著切出好幾個超短段。
+        k = max(k + 1, int(times[j] / seg_seconds) + 1)
     # 開頭補到 0：兩階的時間軸原點必須一致（見 docstring）。
     if bounds and bounds[0][0] > 0:
         _, e0, b0 = bounds[0]
