@@ -31,7 +31,80 @@ function emptyMetrics() {
     // 最近一段的下載耗時與段長（看門狗用來判斷「下載追不追得上播放」）
     lastFragLoadMs: 0, segmentSeconds: 0, fragLoadingSince: 0, switchingTo: null,
     fellBack: false,
+    // 實際「呈現出來」的畫格（見 startFrameMonitor）。**不是 currentTime** ——
+    // currentTime 沒往回，不代表螢幕上那張畫面沒有回頭。
+    lastPresentedMediaTime: -1, frameRegressions: 0, lastRegression: null,
+    presentedFrames: 0,
+    // 每分鐘切了幾次階：ABR 震盪只有用數字看得出來，肉眼看不出「切太多」。
+    switchTimes: [], switchedTimes: [], stepDownTimes: [], releaseTimes: [],
+    // 最近一段的 fragment 身分（切階時要對得出「舊的哪一段、新的哪一段」）
+    lastFrag: null,
   };
+}
+
+/* ---------------- 呈現畫格的監控（驗收條件的量測工具）----------------
+
+   驗收規則是「**沒有使用者 Seek 時，實際呈現的 frame mediaTime 不得突然
+   回退數秒**」。那件事 `video.currentTime` 量不到：它是播放頭的位置，
+   而畫面倒退是 decode／render 那一層的事 —— SourceBuffer 被 append 進
+   重疊或錯位的內容時，currentTime 可以一路往前，螢幕上卻閃回舊畫面。
+
+   `requestVideoFrameCallback` 給的 `metadata.mediaTime` 才是「這一張正在
+   顯示的畫面屬於影片的哪一秒」。所以倒退要用它來判定。
+
+   容許的抖動只有一格（decoder 對 B-frame 的呈現順序本來就會有微小誤差）；
+   數秒等級的回退一律記成 FRAME REGRESSION。                              */
+
+// 一格的容許量。24fps 時約 0.042 秒，抓寬一點到 0.25 秒 ——
+// 要抓的是「數秒」等級的回退，不是逐格的抖動。
+const FRAME_REGRESSION_TOLERANCE = 0.25;
+let frameMonitorGen = -1;
+
+function startFrameMonitor(gen) {
+  if (typeof v.requestVideoFrameCallback !== 'function') return;
+  if (frameMonitorGen === gen) return;        // 同一代不要掛兩份
+  frameMonitorGen = gen;
+  const step = (_now, meta) => {
+    if (isStale(gen)) return;                 // 換片／換模式，這一份監控退休
+    const t = meta?.mediaTime;
+    if (typeof t === 'number') {
+      metrics.presentedFrames = meta.presentedFrames || metrics.presentedFrames + 1;
+      const prev = metrics.lastPresentedMediaTime;
+      // 使用者自己 seek 的時候本來就會回退，那不是 bug —— 要排除掉。
+      const userSeeking = seekingByUs || seekingDrag || pendingSeekTarget != null;
+      if (prev >= 0 && !userSeeking && t < prev - FRAME_REGRESSION_TOLERANCE) {
+        metrics.frameRegressions++;
+        const rec = {
+          at: Date.now(), from: prev, to: t, delta: t - prev,
+          level: playbackState.actualLevelIndex,
+          levelLabel: PS.resolutionText(playbackState.actualResolution) || '?',
+          switchingTo: metrics.switchingTo,
+          frag: metrics.lastFrag, buffered: rangesText(v.buffered),
+          currentTime: v.currentTime,
+        };
+        metrics.lastRegression = rec;
+        // **一定要印出來**：這一類 bug 只在真的播了幾十分鐘之後才出現一次，
+        // 沒有這行 log 就只能靠使用者形容「好像跳了一下」。
+        console.warn('[FRAME REGRESSION] presented %.2f → %.2f (%.2fs) level=%s'
+          + ' switchingTo=%s frag=%o buffered=%s',
+          prev, t, rec.delta, rec.levelLabel, rec.switchingTo || '—',
+          rec.frag, rec.buffered);
+        renderDebugOverlay();
+      }
+      // 回退之後也要更新，不然一次倒退會讓後面每一格都被記成倒退
+      metrics.lastPresentedMediaTime = t;
+    }
+    try { v.requestVideoFrameCallback(step); } catch {}
+  };
+  try { v.requestVideoFrameCallback(step); } catch {}
+}
+
+/** 最近一分鐘發生幾次。ABR 震盪、看門狗過度插手都只有用頻率看得出來。 */
+function perMinute(times, now) {
+  const cutoff = (now || Date.now()) - 60000;
+  // 就地剪裁，不然一部兩小時的片會讓這幾個陣列無限長
+  while (times.length && times[0] < cutoff) times.shift();
+  return times.length;
 }
 
 // 每次換片源／換模式／換畫質就 +1。所有 hls.js 與 <video> 的非同步 callback
@@ -213,6 +286,32 @@ function renderDebugOverlay() {
     ['HLS level', st.actualLevelIndex >= 0 ? String(st.actualLevelIndex) : '—'],
     ['Buffered', rangesText(v.buffered)],
     ['Seekable', rangesText(v.seekable)],
+  );
+  /* 「播放會 lag」要能分成四類，否則只能瞎調參數（規格第十八節）：
+       A 網路餵不動 → Frag load > 段長
+       B 轉碼餵不動 → Frag load 大但 throughput 也不低（伺服器還在轉）
+       C 解碼/算繪跟不上 → Dropped 一直漲，buffer 卻是滿的
+       D 時間軸被修正 → buffer 與網路都正常，但 Frame regress 有數字
+     這四種的解法完全不同，混在一起看就會把 D 當成 A 去加 buffer。 */
+  const q = (() => {
+    try { return v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null; }
+    catch { return null; }
+  })();
+  const total = q?.totalVideoFrames || 0, dropped = q?.droppedVideoFrames || 0;
+  const now = Date.now();
+  rows.push(
+    ['Decoded frames', total ? String(total) : '—'],
+    ['Dropped frames', total ? `${dropped} (${(dropped / total * 100).toFixed(2)}%)` : '—'],
+    ['Frame mediaTime', m.lastPresentedMediaTime >= 0
+      ? m.lastPresentedMediaTime.toFixed(2) + 's' : '—'],
+    ['Frame regress', m.lastRegression
+      ? `${m.frameRegressions}× 最近 ${m.lastRegression.delta.toFixed(2)}s @ ${fmt(m.lastRegression.from)}`
+      : String(m.frameRegressions)],
+    ['Switches/min', `${perMinute(m.switchTimes, now)} 決定 / ${perMinute(m.switchedTimes, now)} 完成`],
+    ['Watchdog/min', `↓${perMinute(m.stepDownTimes, now)} ↑${perMinute(m.releaseTimes, now)}`],
+    ['Frag SN', m.lastFrag
+      ? `${m.lastFrag.sn} @ [${m.lastFrag.start.toFixed(1)}, ${m.lastFrag.end.toFixed(1)}]`
+      : '—'],
   );
   el.innerHTML = rows.map(([k, val]) =>
     `<div><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('');
@@ -703,6 +802,9 @@ function play(which, startAt) {
   const gen = resetPlaybackState(which);
   v.removeAttribute('src'); v.load();
   center('緩衝中…');
+  // 呈現畫格的監控跟著這一代走。**direct 也要掛** —— 「畫面倒退」要能分辨
+  // 是 HLS 的時間軸問題還是連 direct 都會發生（那就是別的原因）。
+  startFrameMonitor(gen);
 
   if (which === 'direct') {
     v.src = info.direct_url;
@@ -869,12 +971,27 @@ function attachHlsHandlers(gen, mob, ctl) {
   on(Hls.Events.LEVEL_SWITCHING, d => {
     const lv = H.levels?.[d?.level];
     metrics.switchingTo = lv?.height ? lv.height + 'p' : null;
+    metrics.switchTimes.push(Date.now());
+    /* **切階的當下要把兩邊的時間軸都記下來。**「畫面倒退」如果是 rendition
+       對不齊造成的，證據就在這裡：舊 fragment 的 SN 與 PTS 區間、新 level、
+       currentTime、以及 buffered。三者兜起來就看得出 append 進去的那一段
+       是不是落在已經播過的位置上。 */
+    if (debugPlayer) {
+      console.info('[LEVEL_SWITCHING] t=%.2f %s → level %s  lastFrag=%o buffered=%s',
+        v.currentTime, PS.resolutionText(playbackState.actualResolution) || '?',
+        d?.level, metrics.lastFrag, rangesText(v.buffered));
+    }
     renderDebugOverlay();
   });
 
   on(Hls.Events.LEVEL_SWITCHED, d => {
     const lv = H.levels?.[d.level];
     metrics.switchingTo = null;          // 切完了，「正在切」要收掉
+    metrics.switchedTimes.push(Date.now());
+    if (debugPlayer) {
+      console.info('[LEVEL_SWITCHED] t=%.2f → level %s (%sp) buffered=%s',
+        v.currentTime, d.level, lv?.height ?? '?', rangesText(v.buffered));
+    }
     if (!lv) return;
     const prev = playbackState.actualBitrate;
     // 手動 = 我們或使用者指定了 currentLevel（不是 -1）。
@@ -903,6 +1020,33 @@ function attachHlsHandlers(gen, mob, ctl) {
     metrics.lastFragLoadMs = ms;
     metrics.fragLoadingSince = 0;        // 這一段回來了，不再算「還在等」
     metrics.segmentSeconds = d?.frag?.duration || metrics.segmentSeconds || 6;
+    // 這一段的身分：倒退發生時要回答「當時在播哪一段、它宣稱涵蓋哪個區間」。
+    const f = d?.frag;
+    if (f) metrics.lastFrag = {
+      sn: f.sn, level: f.level, start: +(f.start || 0).toFixed(3),
+      duration: +(f.duration || 0).toFixed(3),
+      end: +((f.start || 0) + (f.duration || 0)).toFixed(3),
+    };
+  });
+
+  /* FRAG_CHANGED = 「播放頭現在真的在這一段裡了」。跟 FRAG_LOADED 分開記：
+     載入順序不等於播放順序，而**倒退要對的是正在播的那一段**。 */
+  on(Hls.Events.FRAG_CHANGED, d => {
+    const f = d?.frag;
+    if (!f) return;
+    metrics.lastFrag = {
+      sn: f.sn, level: f.level, start: +(f.start || 0).toFixed(3),
+      duration: +(f.duration || 0).toFixed(3),
+      end: +((f.start || 0) + (f.duration || 0)).toFixed(3),
+    };
+    if (debugPlayer) {
+      // **播放頭與 fragment 宣稱的區間對不上就是 rendition 錯位的直接證據。**
+      const t = v.currentTime, s = f.start || 0, e = s + (f.duration || 0);
+      if (t < s - 1 || t > e + 1)
+        console.warn('[FRAG MISMATCH] currentTime=%.2f 不在 SN=%s 宣稱的 [%.2f, %.2f] 內',
+          t, f.sn, s, e);
+    }
+    renderDebugOverlay();
   });
 
   // watchdogTick() 自己會先刷新狀態，不必在這裡再刷一次
@@ -979,6 +1123,7 @@ function stepDown(reason, now) {
   try { hlsObj.autoLevelCapping = target; } catch { return; }
   metrics.cappedAt = now; metrics.lastActionAt = now;
   metrics.lowBufferSince = 0;
+  metrics.stepDownTimes.push(now);
   updatePlaybackState({ lastSwitchReason: 'stall-down', capping: target });
   const lab = levels[target]?.height ? levels[target].height + 'p' : '較低畫質';
   toast(`網路不穩，已降到 ${lab}`);
@@ -989,6 +1134,7 @@ function stepDown(reason, now) {
 function releaseCap(reason, now) {
   try { hlsObj.autoLevelCapping = -1; } catch { return; }
   metrics.cappedAt = 0; metrics.lastActionAt = now;
+  metrics.releaseTimes.push(now);
   updatePlaybackState({ lastSwitchReason: 'recover', capping: -1 });
   if (debugPlayer) console.info('[watchdog] release:', reason);
 }
@@ -1913,9 +2059,38 @@ v.addEventListener('seeked', () => {
     pendingSeekTarget = null;
     clearTimeout(seekTimeoutTimer);
     busy('');
+    // **`seeked` 不等於「新畫面已經出現在螢幕上」。**它只說播放頭移好了；
+    // decoder 還可能再顯示幾張舊位置的畫格。真正的完成訊號是「第一張
+    // mediaTime 落在目標附近的畫格」—— 這裡量它，因為「seek 完看到舊畫面」
+    // 與「ABR 切階看到舊畫面」是兩種不同的病，要分得出來。
+    // **只量測、不重設 currentTime**：為了畫面好看而反覆 seek 會製造更多卡頓。
+    awaitSeekedFrame(want);
   }
   syncBar();
 });
+
+/* Seek 之後第一張「真的呈現出來」的畫格。只在 debugPlayer 記錄 ——
+   正式模式下不需要為它多掛一條 callback。 */
+function awaitSeekedFrame(want) {
+  if (!debugPlayer || typeof v.requestVideoFrameCallback !== 'function') return;
+  const t0 = performance.now();
+  const gen = generation;
+  const step = (_now, meta) => {
+    if (isStale(gen)) return;
+    const t = meta?.mediaTime;
+    if (typeof t !== 'number') return;
+    if (Math.abs(t - want) <= 1.0) {
+      console.info('[seek] 第一張新畫格 mediaTime=%.2f（目標 %.2f，落地耗時 %d ms）',
+        t, want, Math.round(performance.now() - t0));
+      return;                              // 到位了，這條 callback 收工
+    }
+    // 還在放舊位置的畫格 —— 這正是「seek 完短暫看到之前畫面」的證據
+    console.warn('[seek] 仍在呈現舊畫格 mediaTime=%.2f（目標 %.2f，差 %.2fs）',
+      t, want, t - want);
+    try { v.requestVideoFrameCallback(step); } catch {}
+  };
+  try { v.requestVideoFrameCallback(step); } catch {}
+}
 v.addEventListener('loadedmetadata', () => { v.playbackRate = cfg.rate; syncBar(); syncNextEp(); });
 
 v.addEventListener('error', () => {
@@ -2184,6 +2359,10 @@ window.__playerTestHooks = {
   // canonical 是多少」，否則只能從 DOM 反推，那會連「三個元素同一個來源」
   // 都驗不出來。
   syncBar, getCanonicalDuration, isValidDuration, clampSeekTarget, renderSeekPreview,
+  // ABR 切階的回歸測試要能拿到 hls.js 實例：它得自己強制切階（不能等 ABR
+  // 剛好決定要切），並且掛自己那一份 requestVideoFrameCallback 監控 ——
+  // **驗「畫面有沒有倒退」不能只相信被測程式自己的計數。**
+  hls() { return hlsObj; },
   get seekingDrag() { return seekingDrag; },
   get seekPreviewRatio() { return seekPreviewRatio; },
   get seekPreviewTime() { return seekPreviewTime; },

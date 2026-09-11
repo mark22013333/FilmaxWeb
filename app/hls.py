@@ -69,6 +69,26 @@ RUNG_TRANSCODE = 0
 RUNG_REMUX = 1
 
 
+# 這個版本號的語意是：**任何會讓既有 `.ts` 不再與目前程式相容的修改。**
+# 不只是 profile key 的字串形狀（那是它原本的名字 PROFILE_KEY_VERSION 的
+# 由來，而那個名字太窄了）。要升版的例子：
+#
+#   * 分段邊界規則（v3：上階改成對齊固定格線，見 keyframes.derive_bounds）
+#   * 時間戳策略（-output_ts_offset／-avoid_negative_ts）
+#   * 編碼器、音訊聲道／取樣率、mux 旗標
+#   * profile key 的形狀
+#
+# **為什麼漏掉會很嚴重。**`get_segment()` 看到 `seg-N.ts` 存在就直接回傳，
+# 不會去驗它的內容 —— 邊界規則改了以後，舊的 seg-N 仍然叫 seg-N，但它裝的
+# 是另一段影片。播放清單說 seg-100 是 600 秒，快取吐出來的卻是 1060 秒的
+# 內容：這正是「畫面跳回之前看過的地方」的另一條路徑，而且它跨越重新部署
+# 存活，比 ABR 那條更難查。
+HLS_CACHE_FORMAT_VERSION = 3    # 3 = 上階邊界改成對齊固定格線（ABR 才切得動）
+
+# 舊名字留著給還沒改的呼叫端；語意已經擴大，新的程式碼請用上面那個。
+PROFILE_KEY_VERSION = HLS_CACHE_FORMAT_VERSION
+
+
 def profile_key(height: Optional[int], audio_index: Optional[int],
                 bitrate_kbps: int = 0, rung: int = RUNG_TRANSCODE) -> str:
     # height=0 代表「不縮放」，是有意義的值；只有 None 才算沒指定。
@@ -96,7 +116,14 @@ def normalize_profile(profile: Optional[str]) -> str:
 
 
 def seg_dir(file_id: int, profile: str) -> Path:
-    d = CACHE_DIR / str(file_id) / normalize_profile(profile)
+    """這個 profile 的分段資料夾。**路徑本身帶格式版本**（`v3_h720_...`）。
+
+    版本只放在 KV 裡是不夠的：升級的瞬間會有一小段時間新舊 binary 同時在跑
+    （反向代理還沒切完、或 `migrate_cache()` 還沒跑到），而它們算出來的
+    `seg-N` 是不同的內容 —— 共用同一個資料夾就是互相餵錯誤的分段。
+    把版本寫進路徑，兩邊各自寫各自的，不可能混到。
+    """
+    d = CACHE_DIR / str(file_id) / f"v{HLS_CACHE_FORMAT_VERSION}_{normalize_profile(profile)}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -148,6 +175,46 @@ def rungs_for(file_id: int, duration: float) -> List[int]:
     if not bounds_for(file_id, duration):
         return rungs
     return [RUNG_REMUX, RUNG_TRANSCODE]
+
+
+# 上階要能進同一份 ABR master，它的第 i 段必須跟下階的 [i*seg, (i+1)*seg)
+# 對得起來。允許的偏差是**一個 keyframe 間距**：邊界只能落在 keyframe 上，
+# 所以再怎麼對齊也不可能比片源的 keyframe 密度更準。
+#
+# 實測（全庫 149 個可 remux 的檔案）：對齊規則改好之後 146 個的最大偏差
+# 在 4.4 秒以內，剩下 3 個（file 297／303／437）的 keyframe 間距是 4.67／
+# 4.00／5.51 秒 —— **除不盡 6 秒**，所以每段只能跨兩個 keyframe（約 10 秒），
+# 段數與下階差了一截，偏差一路累加到 1256 秒。那三個檔案的上階就不要進
+# ABR master（本身沒壞，只是跟下階拼不成同一條時間軸）。
+_ABR_ALIGN_TOLERANCE = 1.5      # 偏差超過這個倍數的分段長度就不併進 ABR
+
+
+def abr_alignable(file_id: int, duration: float) -> Tuple[bool, str]:
+    """上階能不能跟轉碼階梯放進同一份 ABR master。回 (可以嗎, 為什麼)。
+
+    **這跟「有沒有上階」是兩件事**，所以不併進 `rungs_for()`：
+    區網的單一 rendition、原畫質、使用者明確指定的那幾條路都只發一階，
+    沒有另一階可以切過去，對不對齊根本不影響它們。會出事的只有
+    「同一份 master 裡有好幾階、hls.js 可以互相切」這一種形狀。
+
+    對不齊的代價是使用者實際看到的那個症狀（畫面跳回已經看過的地方），
+    所以這裡的取捨很清楚：**寧可少一階畫質，也不要壞掉的時間軸。**
+    """
+    seg = settings.hls_segment_seconds
+    spans = bounds_for(file_id, duration)
+    if not spans:
+        return False, "沒有邊界表"
+    tol = max(seg * _ABR_ALIGN_TOLERANCE, 0.1)
+    worst = 0.0
+    worst_i = 0
+    for i, (start, _end, _b) in enumerate(spans):
+        drift = abs(start - i * seg)
+        if drift > worst:
+            worst, worst_i = drift, i
+    if worst > tol:
+        return False, (f"上階 seg-{worst_i} 與下階差 {worst:.1f} 秒"
+                       f"（容許 {tol:.1f}），不能放進同一份 ABR master")
+    return True, f"最大偏差 {worst:.1f} 秒，在容許範圍內"
 
 
 # ffprobe 的 profile 字串 → avc1.PPCCLL 的前四位（PP=profile_idc、CC=約束旗標）。
@@ -433,11 +500,20 @@ def build_master(file_id: int, profile: str, remote: bool = False,
 
     if upper and not remote:
         # 區網：只發上階。播放全程不會有任何 ffmpeg 被啟動。
+        # **這條路只有一個 rendition，所以不必問對齊** —— 沒有另一階可以
+        # 切過去，`abr_alignable()` 要擋的那種失效在這裡不存在。
         lines += [upper, f"index.m3u8?p={upper_profile}"]
         return "\n".join(lines) + "\n"
 
     if upper:
-        lines += [upper, f"index.m3u8?p={upper_profile}"]
+        # 遠端要把上階跟轉碼階梯放進同一份 master，hls.js 會在它們之間切 ——
+        # 所以這裡是唯一需要「兩階的 seg-N 是不是同一段」的地方。
+        ok, why = abr_alignable(file_id, duration)
+        if ok:
+            lines += [upper, f"index.m3u8?p={upper_profile}"]
+        else:
+            # 對不齊就不發。**畫質少一階，好過 ABR 一切就倒退畫面。**
+            log.info("file=%s 的上階不進遠端 ABR master：%s", file_id, why)
 
     # 遠端發整條階梯讓 ABR 有得降；區網（走到這裡代表沒有上階可給）維持單一階
     # —— 鏈路夠寬，多發幾階只是多養幾份轉碼快取，換不到東西。
@@ -693,25 +769,23 @@ def _enforce_cache_limit() -> None:
     log.info("HLS 快取清理完成，剩 %.0f MB", total / 1024 / 1024)
 
 
-# profile key 的形狀改過就要清一次快取。改的是**資料夾名稱**，舊分段不會被
-# 誤用（normalize 之後對不到那個名字），但它們會一直躺在那裡佔著上限，
-# 直到 LRU 把它們汰掉 —— 而在那之前，快取上限對真正在用的分段就變小了。
-# 版本號往上加一次就清一次；快取本來就是可重建的，清掉沒有風險。
-PROFILE_KEY_VERSION = 2         # 2 = 加了階別維度 m0／m1（J 章第 0 層）
-
-
 def migrate_cache() -> None:
-    """啟動時呼叫一次。profile key 換過形狀就把舊分段清掉。"""
+    """啟動時呼叫一次。快取格式換過版就把舊分段清掉。
+
+    **不要求使用者自己記得刪。**HLS 快取是衍生資料，重建的成本只是再跑一次
+    ffmpeg，而留著不相容的分段是會播出錯誤畫面的資料一致性 bug ——
+    兩邊的代價差了一個數量級，所以這裡一律清掉，不問。
+    """
     try:
         was = int(db.kv_get("hls_profile_key_version", 1) or 1)
     except Exception:
         was = 1
-    if was >= PROFILE_KEY_VERSION:
+    if was >= HLS_CACHE_FORMAT_VERSION:
         return
     clear_cache()
-    db.kv_set("hls_profile_key_version", PROFILE_KEY_VERSION)
-    log.info("profile key 從 v%s 換成 v%s，已清掉舊的 HLS 分段快取",
-             was, PROFILE_KEY_VERSION)
+    db.kv_set("hls_profile_key_version", HLS_CACHE_FORMAT_VERSION)
+    log.info("HLS 快取格式從 v%s 換成 v%s，已清掉舊的分段（衍生資料，會自動重建）",
+             was, HLS_CACHE_FORMAT_VERSION)
 
 
 def clear_cache(file_id: Optional[int] = None) -> None:

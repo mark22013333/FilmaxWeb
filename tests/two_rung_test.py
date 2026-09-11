@@ -314,17 +314,101 @@ hls._schedule_prefetch(fid, 0, upper, DUR)
 check("上階不排預轉", not list(d.glob("seg-*.ts")), list(d.glob("seg-*.ts")))
 
 # ============================================================ 快取版本
-head("[J 0] profile key 換形狀 → 舊快取要清一次")
+head("[J 0] 快取格式換版 → 舊分段要清一次")
 
 d = hls.seg_dir(fid, "h720_ad_b0_c2")      # 舊形狀（沒有 m）的資料夾
 (d / "seg-0.ts").write_bytes(b"x")
 db.kv_set("hls_profile_key_version", 1)
 hls.migrate_cache()
 check("舊分段被清掉（不然它們會一直佔著快取上限）", not (d / "seg-0.ts").exists())
-check("版本號記下來了", db.kv_get("hls_profile_key_version") == hls.PROFILE_KEY_VERSION)
+check("版本號記下來了",
+      db.kv_get("hls_profile_key_version") == hls.HLS_CACHE_FORMAT_VERSION)
 (d / "seg-1.ts").write_bytes(b"x")
 hls.migrate_cache()
 check("第二次啟動不會再清（不然每次重開都要重轉一遍）", (d / "seg-1.ts").exists())
+
+# **這一條是這次修正的回歸測試。**v2 的上階分段是用舊的邊界規則
+# （「湊滿 >= 6 秒的最少 keyframe」）切的，seg-N 代表的 media time 跟 v3
+# 不一樣。而 `get_segment()` 看到檔案存在就直接回傳、不驗內容 ——
+# 沒有這次清除的話，升級後舊 seg-N 會被當成新 seg-N 餵出去，
+# 播放清單說 600 秒、實際吐 1060 秒的內容。
+head("[J 0] v2 → v3：邊界規則改了，舊 .ts 一定要失效")
+
+import math
+from app.config import CACHE_DIR
+
+check("版本號有升上去（邊界規則改了就必須升）",
+      hls.HLS_CACHE_FORMAT_VERSION >= 3, hls.HLS_CACHE_FORMAT_VERSION)
+old_dir = CACHE_DIR / str(fid) / f"v2_{hls.profile_key(0, None, 0, hls.RUNG_REMUX)}"
+old_dir.mkdir(parents=True, exist_ok=True)
+(old_dir / "seg-100.ts").write_bytes(b"v2-content")
+new_dir = hls.seg_dir(fid, hls.profile_key(0, None, 0, hls.RUNG_REMUX))
+check("v3 的分段路徑帶版本（新舊 binary 短暫交錯也不會共用同一批 .ts）",
+      new_dir.name.startswith("v3_"), new_dir.name)
+check("v2 與 v3 不是同一個資料夾", old_dir.resolve() != new_dir.resolve())
+db.kv_set("hls_profile_key_version", 2)
+hls.migrate_cache()
+check("v2 的舊分段被清掉（不能讓它被當成 v3 的 seg-100 餵出去）",
+      not (old_dir / "seg-100.ts").exists())
+check("升級之後版本號是 v3",
+      db.kv_get("hls_profile_key_version") == hls.HLS_CACHE_FORMAT_VERSION)
+
+
+# ============================================================ ABR 對齊
+head("[J 1] 同一份 ABR master 裡各階的 seg-N 必須是同一段")
+
+# 3.625 秒一個 keyframe 的那個 fid：舊規則每段 7.25 秒，seg-N 會一路漂走；
+# 新規則對齊到 6 秒格線，偏差不累加。
+_seg = 6.0
+_spans = hls.bounds_for(fid, DUR)
+check("上階切得出分段", len(_spans) > 1, len(_spans))
+_worst = max(abs(s - i * _seg) for i, (s, _e, _b) in enumerate(_spans))
+check("上階第 i 段的起點貼著下階的 i*6（誤差不累加）",
+      _worst <= _seg * 1.5, (_worst, [round(s, 2) for s, _, _ in _spans]))
+# **最後一段是最嚴格的檢查**：誤差累加的話一定在這裡最大。
+_last_start = _spans[-1][0]
+check("最後一段也還貼著格線（舊規則在這裡會差好幾百秒）",
+      abs(_last_start - (len(_spans) - 1) * _seg) <= _seg * 1.5,
+      (_last_start, (len(_spans) - 1) * _seg))
+check("兩階的段數一致（段數差一截就代表時間軸長度不同）",
+      abs(len(_spans) - math.ceil(DUR / _seg)) <= 1,
+      (len(_spans), math.ceil(DUR / _seg)))
+check("兩階的總長度一致（EXTINF 總和就是 MediaSource 的 duration）",
+      abs(_spans[-1][1] - DUR) < 0.1, (_spans[-1][1], DUR))
+check("這個檔案可以進 ABR master", hls.abr_alignable(fid, DUR)[0],
+      hls.abr_alignable(fid, DUR))
+
+_m = hls.build_master(fid, lower, remote=True, duration=DUR)
+check("對得齊 → 遠端 master 裡有上階", "_m1" in _m, _m)
+
+# **片源的 keyframe 比分段長度還疏**就對不齊，而且不是理論上的：
+# 實測 file 297 的 `gap_med` 是 4.67 秒（看起來很安全），但那個中位數是被
+# 片頭那幾個密集的 keyframe 拉下來的 —— 正片的實際間距是 **10.39 秒**。
+# 間距比 6 秒大的時候，第 i 段再怎麼挑都不可能貼著 i*6，偏差只會一路累加
+# （實測到最後差了 1256 秒）。
+#
+# 這也是為什麼 `rungs_for()` 的 `gap_med > seg` 那道檢查擋不住它：
+# **中位數會說謊，要看的是實際切出來的邊界。**`abr_alignable()` 直接量
+# 邊界本身，所以擋得住。
+_odd = add_file(gap=4.67)
+_odd_times = [0.0, 4.09, 5.84, 8.18] + [round(8.18 + i * 10.39, 3) for i in range(1, 700)]
+db.execute("UPDATE media_keyframe SET times=?, positions=? WHERE file_id=?",
+           (json.dumps(_odd_times),
+            json.dumps([i * 1_000_000 for i in range(len(_odd_times))]), _odd))
+db.execute("UPDATE media_file SET duration=? WHERE id=?", (_odd_times[-1], _odd))
+_odd_dur = _odd_times[-1]
+_ok, _why = hls.abr_alignable(_odd, _odd_dur)
+check("keyframe 間距除不盡 → 不准進 ABR master", not _ok, (_ok, _why))
+check("而且要說得出原因（後台看得到為什麼少一階）", "秒" in _why, _why)
+_m2 = hls.build_master(_odd, lower, remote=True, duration=_odd_dur)
+check("對不齊 → 遠端 master 不發上階（寧可少一階，也不要壞掉的時間軸）",
+      "_m1" not in _m2, _m2)
+check("但轉碼階梯照發，播放不中斷", _m2.count("index.m3u8") >= 2, _m2)
+# **區網那條路不受影響**：它只發一個 rendition，沒有另一階可以切過去。
+_lan = hls.build_master(_odd, lower, remote=False, duration=_odd_dur)
+check("區網仍然發上階（單一 rendition，對不齊也切不到別階）",
+      "_m1" in _lan, _lan)
+check("而且區網只有那一階（零轉碼路徑）", _lan.count("index.m3u8") == 1, _lan)
 
 
 # ============================================================ remux 指令
@@ -433,8 +517,13 @@ else:
     subprocess.run([ff, "-hide_banner", "-loglevel", "error",
                     "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24",
                     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-                    "-t", "24", "-c:v", "libx264", "-preset", "veryfast",
-                    "-g", "48", "-pix_fmt", "yuv420p", "-profile:v", "high",
+                    # **keyframe 間距刻意選除不盡分段長度的值**（24fps ÷ 87
+                    # = 3.625 秒，而分段是 6 秒）。整除的間距（例如 2 秒）會
+                    # 讓兩階碰巧對齊，那樣這支測試就證明不了任何事 ——
+                    # 舊的邊界規則在整除的片源上也是對的。
+                    "-t", "60", "-c:v", "libx264", "-preset", "veryfast",
+                    "-g", "87", "-keyint_min", "87", "-sc_threshold", "0",
+                    "-pix_fmt", "yuv420p", "-profile:v", "high",
                     "-c:a", "aac", "-ac", "2", "-shortest",
                     "-y", str(real)], check=True)
     os.environ["LIBRARY_LOCAL_ROOTS"] = f"/={Path(TMP, 'ftproot')}"
@@ -506,6 +595,73 @@ else:
     check("播放清單的段數與邊界表一致", n == len(spans), (n, len(spans)))
     check("最後一段拿得到（片尾那幾秒是已知的坑）",
           hls.get_segment(rid, n - 1, up, real_dur).stat().st_size > 0)
+
+    # ------------------------------------------------------------------
+    # 真的產生兩種 rendition，比對 seg-N 各自代表哪一段 media time。
+    #
+    # **這一段抓得到的東西，前面那些指令字串的檢查抓不到。**
+    # 「兩邊都有 -output_ts_offset」只證明時間戳有被寫進去，不證明寫進去的
+    # 是同一個值 —— 而使用者看到的「畫面跳回之前」正是兩邊寫了不同的值。
+    # 所以這裡要問 ffprobe 實際的 PTS，不是問我們自己組的指令。
+    #
+    # 修正前的實測（3.48 秒一個 keyframe 的 120 秒片源）：
+    #     seg-15  上階 = 104.40s，720/480 = 90.00s   ← 差 14.4 秒
+    # 修正後：
+    #     seg-15  上階 =  90.48s，720/480 = 90.00s   ← 差 0.48 秒
+    head("[J 1] 各 rendition 的 seg-N 是不是同一段（實際產生、實際 ffprobe）")
+
+    def seg_pts(path):
+        """回傳 (video 第一個 PTS, video 最後一個 PTS, audio 第一個 PTS)。"""
+        def pts(stream):
+            out = subprocess.run(
+                [fp, "-v", "error", "-select_streams", stream, "-show_entries",
+                 "packet=pts_time", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True).stdout
+            vals = sorted(float(x) for x in out.replace(",", " ").split() if x)
+            return vals
+        vv, aa = pts("v:0"), pts("a:0")
+        return (vv[0] if vv else None, vv[-1] if vv else None, aa[0] if aa else None)
+
+    rend = [("m1", up),
+            ("720", hls.profile_key(720, None, 2800, hls.RUNG_TRANSCODE)),
+            ("480", hls.profile_key(480, None, 1260, hls.RUNG_TRANSCODE))]
+    # 取中段而不是第 0 段：偏差是累加出來的，第 0 段永遠是對的。
+    probe_idx = min(3, len(spans) - 1)
+    got = {}
+    for name, prof in rend:
+        p = hls.get_segment(rid, probe_idx, prof, real_dur)
+        got[name] = seg_pts(p)
+    check("三個 rendition 的 seg-%d 都產生得出來" % probe_idx,
+          all(g[0] is not None for g in got.values()), got)
+    starts = {k: g[0] for k, g in got.items()}
+    spread = max(starts.values()) - min(starts.values())
+    # 容許一個 keyframe 間距：邊界只能落在 keyframe 上，不可能比片源更準。
+    check("同一個 seg-%d 在各階代表同一段 media time（修正前差 14.4 秒）" % probe_idx,
+          spread <= 4.0, starts)
+    check("兩個轉碼階之間完全對齊（它們用的是同一條固定格線）",
+          abs(starts["720"] - starts["480"]) < 0.1, starts)
+
+    # 音訊的時間軸也要跟著視訊走。A/V 差太多的話播放器為了同步會等或丟格，
+    # 看起來也像 lag —— 而那跟時間軸倒退是兩種不同的病。
+    for name, (v0, _v1, a0) in got.items():
+        check(f"[{name}] 音訊與視訊的起點差在半秒內（不然 A/V 同步會拖慢播放）",
+              a0 is not None and abs(a0 - v0) < 0.5, (name, v0, a0))
+
+    # EXTINF 與實際封包長度的累積誤差：EXTINF 的總和就是 MediaSource 的
+    # duration，每段差一點的話幾百段之後就會差好幾秒。
+    pl_lines = hls.build_playlist(rid, real_dur, up).splitlines()
+    extinfs = [float(l[len("#EXTINF:"):].rstrip(",")) for l in pl_lines
+               if l.startswith("#EXTINF")]
+    check("上階的 EXTINF 總和等於片長（這就是播放器右下角那個總時間）",
+          abs(sum(extinfs) - real_dur) < 0.5, (sum(extinfs), real_dur))
+    tr_pl = hls.build_playlist(rid, real_dur, rend[1][1]).splitlines()
+    tr_ext = [float(l[len("#EXTINF:"):].rstrip(",")) for l in tr_pl
+              if l.startswith("#EXTINF")]
+    check("兩階的 EXTINF 總和一致（不然切階時 duration 會跳）",
+          abs(sum(extinfs) - sum(tr_ext)) < 0.5, (sum(extinfs), sum(tr_ext)))
+    check("兩階的段數一致（seg-N 要能一一對應）",
+          abs(len(extinfs) - len(tr_ext)) <= 1, (len(extinfs), len(tr_ext)))
+
     os.environ["LIBRARY_LOCAL_ROOTS"] = ""
 
 
