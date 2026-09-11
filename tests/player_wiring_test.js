@@ -10,9 +10,7 @@
    不開瀏覽器、不裝框架 —— player.js 只用到少數幾個 DOM API，
    stub 出來比拉一整套 jsdom 便宜得多，而且看得出它到底依賴了什麼。 */
 'use strict';
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
+const { load, start, Events } = require('./player_harness');
 
 let OK = 0, FAIL = 0;
 function check(name, cond, extra) {
@@ -21,203 +19,10 @@ function check(name, cond, extra) {
 }
 function head(t) { console.log('\n' + t); }
 
-const ROOT = path.join(__dirname, '..');
-
-// 這些 id 在 player.html 裡不存在，是 player.js 自己建的
-const DYNAMIC = new Set(['dbg']);
-
-/* ---------------------------------------------------------------- DOM stub */
-
-function makeEl(id) {
-  const el = {
-    id, _text: '', innerHTML: '', className: '', title: '',
-    style: { setProperty() {}, display: '' },
-    dataset: {}, children: [],
-    classList: {
-      _s: new Set(),
-      add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
-      toggle(c, on) { on === undefined ? (this._s.has(c) ? this._s.delete(c) : this._s.add(c))
-                                       : (on ? this._s.add(c) : this._s.delete(c)); },
-      contains(c) { return this._s.has(c); },
-    },
-    _handlers: {},
-    addEventListener(ev, fn) { (this._handlers[ev] ||= []).push(fn); },
-    removeEventListener() {},
-    dispatch(ev, d) { (this._handlers[ev] || []).forEach(fn => fn(d || {})); },
-    appendChild(c) { this.children.push(c); return c; },
-    // buildPanel() 會對面板裡的元素掛 onclick。回一個空殼比回 null 好 ——
-    // 回 null 的話測試會炸在「掛事件」而不是它真正要驗的那件事上。
-    querySelector() { return makeEl('stub'); }, querySelectorAll() { return []; },
-    getBoundingClientRect() { return { left: 0, width: 100, top: 0, bottom: 0 }; },
-    setPointerCapture() {}, releasePointerCapture() {},
-    focus() {}, click() {},
-  };
-  Object.defineProperty(el, 'textContent', {
-    get() { return this._text; }, set(v) { this._text = String(v); },
-  });
-  return el;
-}
-
-function buildEnv() {
-  // els 只放「HTML 裡本來就有的」那些。**沒有預先放的 id 要回 null** ——
-  // player.js 用 `if (!el) 建一個` 這種寫法來決定要不要建 debug 疊圖，
-  // 什麼 id 都回一個空殼的話那條路永遠不會被走到（測不到它）。
-  const els = {};
-  const get = id => (els[id] ||= makeEl(id));
-  const find = id => els[id] || null;
-
-  // <video> stub：只實作 player.js 真的會碰到的那些
-  const video = makeEl('v');
-  Object.assign(video, {
-    currentTime: 0, duration: 3600, paused: false, volume: 1, muted: false,
-    playbackRate: 1, videoWidth: 0, videoHeight: 0,
-    buffered: { length: 0, start: () => 0, end: () => 0 },
-    _src: null,
-    play: () => Promise.resolve(),
-    pause() { this.paused = true; },
-    load() {}, removeAttribute() { this._src = null; },
-    canPlayType: () => '',
-    requestPictureInPicture: () => Promise.resolve(),
-  });
-  Object.defineProperty(video, 'src', {
-    get() { return this._src; }, set(v) { this._src = v; },
-  });
-  els['v'] = video;
-
-  /** buffer 水位：讓測試可以直接指定「currentTime 往後還有幾秒」。 */
-  video.setBuffer = (ahead) => {
-    const t = video.currentTime;
-    video.buffered = { length: 1, start: () => Math.max(0, t - 1), end: () => t + ahead };
-  };
-
-  const document = {
-    _handlers: {},
-    _els: els,
-    querySelector(sel) {
-      if (!sel.startsWith('#')) return makeEl(sel);
-      const id = sel.slice(1);
-      // 動態建立的元素（目前只有 debug 疊圖）不預先給，讓 player.js 自己建
-      return DYNAMIC.has(id) ? find(id) : get(id);
-    },
-    querySelectorAll() { return []; },
-    // player.js 建好之後會 appendChild 到 #stage 並設 id —— 那時候才登記進 els，
-    // 下一次 $('#dbg') 才找得到它（真的 DOM 就是這個行為）。
-    createElement(tag) {
-      const el = makeEl(tag);
-      Object.defineProperty(el, 'id', {
-        get() { return el._id; },
-        set(v) { el._id = v; if (v) els[v] = el; },
-      });
-      return el;
-    },
-    addEventListener(ev, fn) { (this._handlers[ev] ||= []).push(fn); },
-    dispatch(ev, d) { (this._handlers[ev] || []).forEach(fn => fn(d || {})); },
-    body: makeEl('body'),
-    documentElement: makeEl('html'),
-    fullscreenElement: null, webkitFullscreenElement: null,
-    visibilityState: 'visible',
-    exitPictureInPicture() {}, pictureInPictureElement: null,
-    exitFullscreen() {},
-  };
-
-  const window = {
-    document, location: { search: '?file=1&debugPlayer=1', href: '' },
-    localStorage: { _d: {}, getItem(k) { return this._d[k] ?? null; },
-                    setItem(k, v) { this._d[k] = v; }, removeItem(k) { delete this._d[k]; } },
-    navigator: { connection: undefined, sendBeacon: () => true },
-    screen: { width: 1280, height: 800, orientation: { lock: () => Promise.resolve() } },
-    matchMedia: () => ({ matches: false }),
-    _handlers: {},
-    addEventListener(ev, fn) { (this._handlers[ev] ||= []).push(fn); },
-    dispatch(ev, d) { (this._handlers[ev] || []).forEach(fn => fn(d || {})); },
-    setTimeout, clearTimeout, setInterval, clearInterval,
-    fetch: () => Promise.reject(new Error('測試不打網路')),
-    URLSearchParams,
-  };
-  window.window = window;
-
-  return { window, document, video, els, get };
-}
-
-/* ---------------------------------------------------------------- 假的 hls.js */
-
-// 只要有 player.js 用到的那幾個事件名與屬性。刻意不模擬 hls.js 的內部行為 ——
-// 這一支要測的是「事件進來之後我們怎麼反應」，不是 hls.js 對不對。
-const Events = {
-  MANIFEST_PARSED: 'hlsManifestParsed', LEVEL_SWITCHING: 'hlsLevelSwitching',
-  LEVEL_SWITCHED: 'hlsLevelSwitched', FRAG_LOADING: 'hlsFragLoading',
-  FRAG_LOADED: 'hlsFragLoaded', FRAG_BUFFERED: 'hlsFragBuffered', ERROR: 'hlsError',
-};
-
-function makeFakeHls() {
-  const instances = [];
-  class FakeHls {
-    constructor(cfg) {
-      this.config = cfg;
-      this._h = {};
-      this.levels = [];
-      this.currentLevel = -1;
-      this.autoLevelCapping = -1;
-      this.autoLevelEnabled = true;
-      this.bandwidthEstimate = 0;
-      this.capLevelToPlayerSize = cfg.capLevelToPlayerSize;
-      this.destroyed = false;
-      instances.push(this);
-    }
-    on(ev, fn) { (this._h[ev] ||= []).push(fn); }
-    emit(ev, d) { (this._h[ev] || []).forEach(fn => fn(ev, d)); }
-    loadSource() {} attachMedia() {} startLoad() {} stopLoad() {} detachMedia() {}
-    destroy() { this.destroyed = true; }
-    recoverMediaError() {} swapAudioCodec() {}
-  }
-  FakeHls.isSupported = () => true;
-  FakeHls.Events = Events;
-  FakeHls.ErrorTypes = { NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError' };
-  return { FakeHls, instances };
-}
-
-/* ---------------------------------------------------------------- 載入 player.js */
-
-function load(opts) {
-  const env = buildEnv();
-  if (opts && opts.search) env.window.location.search = opts.search;
-  const { FakeHls, instances } = makeFakeHls();
-  env.window.Hls = FakeHls;
-
-  const sandbox = Object.assign(env.window, {
-    console: { log() {}, info() {}, warn() {}, error() {} },
-    globalThis: env.window,
-  });
-  vm.createContext(sandbox);
-
-  const psSrc = fs.readFileSync(path.join(ROOT, 'app/static/playback-state.js'), 'utf8');
-  vm.runInContext(psSrc, sandbox);
-
-  let pjSrc = fs.readFileSync(path.join(ROOT, 'app/static/player.js'), 'utf8');
-  // boot() 會打網路。測試要的是同步的接線，不是啟動流程 —— 把最後那一行拿掉，
-  // 需要的初始狀態由測試自己餵（比讓它去 fetch 一個假伺服器可靠得多）。
-  pjSrc = pjSrc.replace(/\nboot\(\);\s*$/, '\n');
-  vm.runInContext(pjSrc, sandbox);
-
-  const hooks = sandbox.__playerTestHooks;
-  if (!hooks) throw new Error('player.js 沒有掛上 __playerTestHooks');
-  return { sandbox, hooks, env, instances, video: env.video, get: env.get };
-}
-
-/** 餵一份 info 進去並開始播（相當於 boot() 拿到 /api/play 之後那一段）。 */
-function start(ctx, which, infoOver) {
-  ctx.hooks.setInfo(Object.assign({
-    file_id: 1, title: 't', mode: which, duration: 3600, resume: 0,
-    width: 1920, height: 804,
-    direct_url: '/api/stream/1', hls_url: '/api/hls/1/master.m3u8',
-    remote: true, direct_advised: true,
-    quality: { height: 720, bitrate_kbps: 2800,
-               source: { width: 1920, height: 804, label: '1080p' } },
-    audio_tracks: [], subtitles: [],
-  }, infoOver || {}));
-  ctx.hooks.play(which);
-  return ctx.instances[ctx.instances.length - 1];
-}
+// 非同步的驗證掛在這裡（goNextEpisode 要 await 進度寫入才跳頁）。
+// 檔案最後的 summary 會等它們跑完再印結果 —— 不等的話那些 check 會在
+// process.exit 之後才執行，永遠不會被算進去。
+const pending = [];
 
 const LEVELS = [
   { width: 640, height: 268, bitrate: 700_000 },
@@ -582,6 +387,159 @@ head('[J] buffer 水位要看「涵蓋 currentTime 的那一段」');
 }
 
 
-console.log('\n' + '='.repeat(50));
-console.log(`通過 ${OK}，失敗 ${FAIL}`);
-process.exit(FAIL ? 1 : 0);
+head('[下一集] 顯示／隱藏的接線，以及「切集前先把這一集標記完成」');
+{
+  const ctx = load();
+  start(ctx, 'direct', {
+    duration: 3600,
+    next_episode: { file_id: 42, item_id: 7, season: 2, episode: 3,
+                    title: '第三集', label: 'S02E03', url: '/player?file=42' },
+  });
+  const btn = ctx.get('nextEp');
+
+  ctx.video.currentTime = 100;
+  ctx.video.dispatch('timeupdate');
+  check('片中不顯示', btn.hidden === true, btn.hidden);
+
+  // 3600 秒的片，門檻夾到上限 90 秒
+  ctx.video.currentTime = 3600 - 40;
+  ctx.video.dispatch('timeupdate');
+  check('進入片尾門檻 → 顯示', btn.hidden === false, btn.hidden);
+  check('標籤寫得出是哪一集', /S02E03/.test(ctx.get('nextEpLabel').textContent),
+        ctx.get('nextEpLabel').textContent);
+  check('有 aria-label（報讀器念得出來）',
+        /S02E03/.test(btn._attrs['aria-label'] || ''), btn._attrs);
+
+  ctx.video.currentTime = 1000;
+  ctx.video.dispatch('timeupdate');
+  check('把進度拉回門檻以前 → 再次隱藏', btn.hidden === true, btn.hidden);
+
+  ctx.video.currentTime = 3595;
+  ctx.video.dispatch('timeupdate');
+  check('再拉到片尾 → 又出現', btn.hidden === false, btn.hidden);
+
+  ctx.video.ended = true;
+  ctx.video.dispatch('ended');
+  check('影片真的播完之後按鈕仍然可以按', btn.hidden === false, btn.hidden);
+}
+{
+  const ctx = load();
+  start(ctx, 'direct', { duration: 3600, next_episode: null });
+  ctx.video.currentTime = 3595;
+  ctx.video.dispatch('timeupdate');
+  check('電影／最後一集：片尾也不會冒出按鈕',
+        ctx.get('nextEp').hidden === true, ctx.get('nextEp').hidden);
+}
+{
+  // **這一項是第 5 點的核心**：按下「下一集」必須先把目前這一集寫成
+  // finished 再跳頁。順序顛倒的話導覽會把請求砍掉，這一集就以
+  // finished=false 留著，下一秒又出現在「繼續觀看」上。
+  const ctx = load();
+  const calls = [];
+  ctx.sandbox.fetch = (url, opt) => {
+    // 記下「呼叫的當下有沒有已經跳頁」—— 跳頁在前就是那個 race condition
+    calls.push({ url, body: opt && opt.body, keepalive: !!(opt && opt.keepalive),
+                 hrefWhenCalled: ctx.sandbox.location.href });
+    return Promise.resolve({ ok: true });
+  };
+  start(ctx, 'direct', {
+    duration: 3600,
+    next_episode: { file_id: 42, item_id: 7, season: 2, episode: 3,
+                    label: 'S02E03', url: '/player?file=42' },
+  });
+  ctx.video.currentTime = 3580;
+  ctx.video.dispatch('timeupdate');
+
+  // goNextEpisode 是 async（它要 await 進度寫入），所以這一段的驗證
+  // 掛在 pending 上，由檔案最後的 summary 等它跑完再印結果。
+  pending.push(ctx.hooks.goNextEpisode().then(() => {
+    const prog = calls.filter(c => c.url === '/api/progress');
+    check('有送出進度', prog.length >= 1, calls.map(c => c.url));
+    const body = JSON.parse(prog[0].body);
+    check('而且是 finished=true（不是只存位置）', body.finished === true, body);
+    check('帶的是目前這一集的 file_id', body.file_id === 1, body);
+    check('用 keepalive，跳頁之後請求才送得完', prog[0].keepalive === true, prog[0]);
+    check('**寫入發生在跳頁之前**（順序顛倒就是那個 race condition）',
+          prog[0].hrefWhenCalled === '', prog[0].hrefWhenCalled);
+    check('最後才跳到下一集', ctx.sandbox.location.href === '/player?file=42',
+          ctx.sandbox.location.href);
+  }));
+}
+
+head('[進度儲存] 連續播放期間真的會寫入（原本的 debounce 寫法永遠不會）');
+{
+  // **這一項是第 6 點的核心迴歸測試。**
+  // 原本是 `clearTimeout(saveTimer); setTimeout(saveProgress, 5000)` ——
+  // timeupdate 每 250ms 就來一次，所以那個 timer 永遠在被重設、永遠不會到期，
+  // 連續播放一小時一筆都沒寫進去。改成節流之後這裡才會有東西。
+  const ctx = load();
+  const sent = [];
+  ctx.sandbox.navigator.sendBeacon = (url, blob) => {
+    sent.push({ url, body: blob._text }); return true;
+  };
+  start(ctx, 'direct', { duration: 3600 });
+
+  // 模擬 60 秒的連續播放：每 250ms 一次 timeupdate（跟真的瀏覽器一樣）
+  // **時鐘要換掉 sandbox 裡的那一個。**vm context 有自己的 Date 內建物件，
+  // 改測試這一端的 Date.now 對 player.js 完全沒有作用 —— 那樣跑出來的結果
+  // 會是「60 秒只寫 1 次」，看起來像程式壞了，其實是測試沒有推進時間。
+  let clock = 1_000_000;
+  const realNow = ctx.sandbox.Date.now;
+  ctx.sandbox.Date.now = () => clock;
+  try {
+    for (let t = 0; t < 60; t += 0.25) {
+      ctx.video.currentTime = t;
+      clock += 250;
+      ctx.video.dispatch('timeupdate');
+    }
+  } finally { ctx.sandbox.Date.now = realNow; }
+
+  check('連續播放 60 秒有寫進度（原本的寫法是 0 次）', sent.length >= 1, sent.length);
+  // 節流是 8 秒一次，60 秒大約 7～8 次。上限放寬一點，重點是「不是每次都寫」。
+  check(`而且不是每個 timeupdate 都發 API（240 次事件 → ${sent.length} 次寫入）`,
+        sent.length <= 12, sent.length);
+  const last = JSON.parse(sent[sent.length - 1].body);
+  check('寫進去的是當下的播放位置', last.position > 40, last);
+  check('連續播放期間 finished 是 false', last.finished === false, last);
+}
+{
+  // 關鍵時機要補存 —— 節流一定會漏掉最後那幾秒。
+  const ctx = load();
+  const sent = [];
+  ctx.sandbox.navigator.sendBeacon = (url, blob) => { sent.push(blob._text); return true; };
+  start(ctx, 'direct', { duration: 3600 });
+  ctx.video.currentTime = 123;
+
+  const before = sent.length;
+  ctx.video.dispatch('pause');
+  check('暫停時補存一次', sent.length > before, sent.length);
+
+  ctx.video.currentTime = 456;
+  const b2 = sent.length;
+  ctx.sandbox.document.visibilityState = 'hidden';
+  ctx.sandbox.document.dispatch('visibilitychange');
+  check('切到背景（手機切 App／鎖螢幕）補存一次', sent.length > b2, sent.length);
+
+  ctx.video.currentTime = 789;
+  const b3 = sent.length;
+  ctx.sandbox.window.dispatch('pagehide');
+  check('pagehide 補存一次（iOS Safari 的 beforeunload 常常不觸發）',
+        sent.length > b3, sent.length);
+
+  ctx.video.currentTime = 1011;
+  const b4 = sent.length;
+  ctx.sandbox.window.dispatch('beforeunload');
+  check('beforeunload 補存一次（桌機關分頁）', sent.length > b4, sent.length);
+
+  const b5 = sent.length;
+  ctx.video.dispatch('ended');
+  check('播完存一次 finished=true', sent.length > b5
+        && JSON.parse(sent[sent.length - 1]).finished === true,
+        sent[sent.length - 1]);
+}
+
+Promise.all(pending).then(() => {
+  console.log('\n' + '='.repeat(50));
+  console.log(`通過 ${OK}，失敗 ${FAIL}`);
+  process.exit(FAIL ? 1 : 0);
+});

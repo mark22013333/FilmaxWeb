@@ -5,7 +5,7 @@ const params = new URLSearchParams(location.search);
 const fileId = params.get('file');
 const v = $('#v'), pl = $('#pl');
 
-let info = null, hlsObj = null, mode = null, saveTimer = null, seekingByUs = false;
+let info = null, hlsObj = null, mode = null, seekingByUs = false;
 
 /* ---------------- 播放執行期狀態（唯一的事實來源）----------------
 
@@ -145,11 +145,30 @@ function resetPlaybackState(which) {
   const keptFellBack = metrics.fellBack;
   metrics = emptyMetrics();
   metrics.fellBack = keptFellBack;
+  // 換模式／換畫質會重建 MediaSource，之前那一次 seek 的等待狀態不能留 ——
+  // 留著的話 syncBar() 會一直照舊的 pendingSeekTarget 畫，進度條就卡在
+  // 上一個位置不動了。拖曳狀態本身不清（使用者手指可能還按著）。
+  pendingSeekTarget = null;
+  clearTimeout(seekTimeoutTimer);
+  durationMismatchLogged = false;
   renderPlaybackStatus();
   return gen;
 }
 
 /* ---------------- debug 疊圖 ---------------- */
+/** TimeRanges → "0:00-12:34, 40:00-42:10"。
+ *  **seekable 只是「現在跳得到哪」，不是片長** —— 兩者並排顯示正是為了
+ *  讓人一眼看出不要把 seekable.end() 誤當成總長度。 */
+function rangesText(tr) {
+  try {
+    if (!tr || !tr.length) return '—';
+    const out = [];
+    for (let i = 0; i < tr.length && i < 4; i++)
+      out.push(`${fmt(tr.start(i))}-${fmt(tr.end(i))}`);
+    if (tr.length > 4) out.push(`…+${tr.length - 4}`);
+    return out.join(', ');
+  } catch { return '—'; }
+}
 function renderDebugOverlay() {
   if (!debugPlayer) return;
   let el = $('#dbg');
@@ -178,6 +197,23 @@ function renderDebugOverlay() {
     ['Mobile', st.mobile ? 'yes' : 'no'],
     ['Fell back', m.fellBack ? 'yes' : 'no'],
   ];
+  /* 這次修正加的那一組：**「總時間突然縮短」要看得出是哪一個 duration 在亂。**
+     canonical 是 UI 真正在用的那個，api 與 media 並排就看得出誰跟誰不合。 */
+  rows.push(
+    ['Duration canon', fmt(getCanonicalDuration())],
+    ['Duration api', isValidDuration(info?.duration) ? fmt(info.duration) : '—'],
+    ['Duration media', isValidDuration(v.duration) ? fmt(v.duration) : String(v.duration)],
+    ['Current', fmt(v.currentTime)],
+    ['Seek preview', seekPreviewTime != null ? fmt(seekPreviewTime) : '—'],
+    ['Dragging', seekingDrag ? 'true' : 'false'],
+    ['Seek pending', pendingSeekTarget != null ? fmt(pendingSeekTarget) : '—'],
+    ['Last seek', lastSeek
+      ? `${fmt(lastSeek.want)} → ${fmt(lastSeek.got)} (${lastSeek.delta >= 0 ? '+' : ''}${lastSeek.delta.toFixed(1)}s)`
+      : '—'],
+    ['HLS level', st.actualLevelIndex >= 0 ? String(st.actualLevelIndex) : '—'],
+    ['Buffered', rangesText(v.buffered)],
+    ['Seekable', rangesText(v.seekable)],
+  );
   el.innerHTML = rows.map(([k, val]) =>
     `<div><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('');
 }
@@ -1005,7 +1041,6 @@ function fallbackToHls(reason) {
   play('hls', at);
   updatePlaybackState({ lastSwitchReason: 'direct-fallback' });
   buildPanel();
-  syncNextEp();
 }
 
 // hls.js 的 destroy() 會把內部參考清成 null，但它自己排隊中的 callback 還會再跑一次，
@@ -1119,8 +1154,11 @@ $('#tap').addEventListener('pointerup', e => {
 });
 $('#tap').onclick = e => { if (e.pointerType === 'touch') return; togglePlay(); };
 $('#tap').ondblclick = () => toggleFull();
-$('#btnBack').onclick = () => { v.currentTime -= cfg.skip; toast(`◀ ${cfg.skip} 秒`); };
-$('#btnFwd').onclick = () => { v.currentTime += cfg.skip; toast(`${cfg.skip} 秒 ▶`); };
+// 跳秒數也要走 clamp —— 在片尾按「快轉 10 秒」不該把 currentTime 頂到
+// duration 而直接觸發 ended。
+const skipBy = n => { v.currentTime = clampSeekTarget(v.currentTime + n); };
+$('#btnBack').onclick = () => { skipBy(-cfg.skip); toast(`◀ ${cfg.skip} 秒`); };
+$('#btnFwd').onclick = () => { skipBy(cfg.skip); toast(`${cfg.skip} 秒 ▶`); };
 function syncSkipLabels() {
   $('#skipBack').textContent = cfg.skip;
   $('#skipFwd').textContent = cfg.skip;
@@ -1137,31 +1175,246 @@ function syncVol() {
     : '<path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 010 7"/>';
 }
 
+/* ---------------- 進度條：Scrubbing 與 Seek ----------------
+
+   **原本的寫法是壞的**，而且三個症狀其實是同一個根因的三種表現：
+
+     1. 拖到一半突然跳到片尾
+     2. 右下角的總時間從 2:30:00 變成 35:00
+     3. 圓點不跟手指走
+
+   根因是「拖曳過程中直接、連續地寫 v.currentTime，而且用 v.duration 當尺」。
+
+   · **連續寫 currentTime**：pointermove 一秒可以來幾十次，每一次對 HLS
+     來說都是一次真正的 seek —— 取消目前的 fragment、重選階、重建 buffer、
+     發新的 HTTP request，而下階是**隨選轉碼**的，等於叫 ffmpeg 去轉一堆
+     使用者根本不會看的段。手指還在動，播放器已經在追幾十個互相取消的
+     seek，這就是「拖起來很卡」。
+
+   · **拿 v.duration 當尺**：MediaSource 的 duration 是「目前 buffer 覆蓋到
+     哪裡」推出來的，在 seek／換階之後會暫時縮水。於是同一個手指位置，
+     50% 這一刻是 4500 秒、下一刻 v.duration 掉到 1800 就變成 900 秒 ——
+     UI 的總時間跟著縮短（症狀 2），而算出來的 target 也整個歪掉（症狀 1）。
+     拖到最右邊時還會剛好 currentTime === duration 而直接觸發 ended。
+
+   · **圓點靠 syncBar() 更新**：syncBar() 讀的是 v.currentTime，而拖曳期間
+     真正的 currentTime 不該動 —— timeupdate 一進來就把圓點拉回播放頭，
+     下一個 pointermove 又拉回手指，於是圓點在兩處之間抖（症狀 3）。
+
+   **新的架構**分成兩段，這是硬性要求（不是 debounce）：
+
+     pointermove  →  只更新畫面（seekPreviewRatio 這一個來源）
+     pointerup    →  才寫一次 v.currentTime
+
+   一整次拖曳**只會產生一次** currentTime 指派，不管手指移動了幾百次。 */
+
 const barWrap = $('#barWrap');
+
+/** 指標在進度條上的位置 → 0～1。
+ *  只吃 Pointer Events（不再混 touches）—— 兩套事件並存會讓手機上每個
+ *  動作跑兩次，那正是「明明只拖一次卻發出兩次 seek」的來源。 */
 const posOf = e => {
   const r = barWrap.getBoundingClientRect();
-  return clamp(((e.touches ? e.touches[0].clientX : e.clientX) - r.left) / r.width, 0, 1);
+  if (!r.width) return 0;
+  return clamp((e.clientX - r.left) / r.width, 0, 1);
 };
-let dragging = false;
+
+/* scrubbing 狀態。**這三個是拖曳期間 UI 的唯一事實來源** ——
+   barPlay／barKnob／barTip 都只能從 seekPreviewRatio 取值，各自算一份
+   正是原本會不同步的原因。 */
+let seekingDrag = false;        // 手指/滑鼠正按著進度條
+let seekPreviewRatio = null;    // 0～1，手指現在在哪
+let seekPreviewTime = null;     // 換算成秒（用 canonical duration 換的）
+let seekPointerId = null;
+let wasPlayingBeforeSeek = false;
+// 已經 commit 出去、但播放器還沒真的跳過去的目標。**在 seeked 之前不能讓
+// 圓點回到 currentTime** —— HLS 要等 fragment，那段期間 currentTime 還是舊值，
+// 圓點會先跳回原處再跳到新位置，看起來就像「放開之後自己亂跑」。
+let pendingSeekTarget = null;
+// 最後一次 seek 的「要的 / 拿到的 / 差多少」，只給 debug 疊圖看。
+let lastSeek = null;
+// seeked 沒來時的保險（見 commitScrub）。30 秒是刻意寬的 —— 下階是隨選
+// 轉碼，一段第一次被要的時候 ffmpeg 真的可能跑十幾秒，太短會在「其實還在
+// 轉」的時候就把 UI 放掉。
+const SEEK_TIMEOUT_MS = 30000;
+let seekTimeoutTimer = null;
+
+/** 影片的「真正總長度」。
+ *
+ *  **不能無條件相信 v.duration。**它在 HLS/MediaSource 底下是隨 buffer 變動的
+ *  推估值，seek 或換階之後會暫時變成幾百秒 —— 讓它當 canonical 的話，
+ *  UI 的總時間會從 2:32:03 跳成 37:21，而進度條的比例尺整個歪掉。
+ *
+ *  /api/play 給的 info.duration 是後端 ffprobe 出來的完整片長，對 VOD 而言
+ *  這才是穩定的答案，所以**它優先**。v.duration 只在沒有 API 值時才用
+ *  （例如 info 還沒回來的那幾百毫秒）。 */
+function isValidDuration(d) {
+  return typeof d === 'number' && isFinite(d) && !Number.isNaN(d) && d > 0;
+}
+
+// 兩邊差太多時只警告、不換尺。差異容忍：5 秒或 2%（取大的）——
+// 容器標示的片長跟實際解出來的長度本來就會差個一兩秒，那不算異常。
+const DURATION_TOLERANCE_S = 5;
+const DURATION_TOLERANCE_RATIO = 0.02;
+let durationMismatchLogged = false;
+
+function getCanonicalDuration() {
+  const api = info?.duration;
+  const media = v.duration;
+  if (isValidDuration(api)) {
+    // 對得起來就什麼都不用說；對不起來要留紀錄，但**還是用 API 那個**。
+    // 「最後收到的 duration 就是真的」是錯的策略：MediaSource 的值本來就
+    // 會在播放期間上下跳，跟著它走等於讓 UI 跟著抖。
+    if (isValidDuration(media)) {
+      const tol = Math.max(DURATION_TOLERANCE_S, api * DURATION_TOLERANCE_RATIO);
+      if (Math.abs(media - api) > tol && !durationMismatchLogged) {
+        durationMismatchLogged = true;
+        if (debugPlayer)
+          console.warn(`duration mismatch\nAPI: ${api}\nmedia: ${media}`);
+      }
+    }
+    return api;
+  }
+  return isValidDuration(media) ? media : 0;
+}
+
+/** Seek 目標一律 clamp 在 [0, duration - EPS]。
+ *  **不能讓 currentTime 剛好等於 duration** —— 那在多數瀏覽器會直接觸發
+ *  ended，使用者把手指拖到最右邊就變成「影片突然結束」。
+ *
+ *  **epsilon 要以「幾個 frame」為尺度，不是隨手取個小數。**先前用 0.05 秒，
+ *  而 24fps 的一格是 0.042 秒 —— 退不到兩格，播下去立刻又撞到結尾，實測
+ *  拖到 100% 仍然 ended。0.5 秒在最慢的 24fps 也有 12 格，足夠讓使用者
+ *  看到「跳到接近片尾」而不是「影片結束了」，而對兩小時的片來說，
+ *  0.5 秒在進度條上連半個像素都不到，看不出被截短。 */
+const SEEK_END_EPS = 0.5;
+function clampSeekTarget(t, d) {
+  const dur = isValidDuration(d) ? d : getCanonicalDuration();
+  if (!isValidDuration(dur)) return Math.max(0, t || 0);
+  return clamp(t, 0, Math.max(0, dur - SEEK_END_EPS));
+}
+
+/** 拖曳中的畫面：三個元素共用同一個 ratio。 */
+function renderSeekPreview(ratio) {
+  const d = getCanonicalDuration();
+  const p = clamp(ratio, 0, 1);
+  const t = p * d;
+  seekPreviewRatio = p;
+  seekPreviewTime = t;
+  const pct = (p * 100) + '%';
+  $('#barPlay').style.width = pct;
+  $('#barKnob').style.left = pct;
+  const tip = $('#barTip');
+  tip.style.left = pct;
+  tip.textContent = fmt(t);
+  // 目前時間也跟著走，使用者才知道「放開會跳到哪」而不必只盯 tooltip
+  $('#tCur').textContent = fmt(t);
+  $('#tDur').textContent = fmt(d);
+}
+
+function beginScrub(e) {
+  seekingDrag = true;
+  seekPointerId = e.pointerId;
+  // 暫停與否要原樣還回去 —— 拖進度條不該順手把播放狀態改掉
+  wasPlayingBeforeSeek = !v.paused;
+  barWrap.classList.add('dragging');
+  try { barWrap.setPointerCapture(e.pointerId); } catch {}
+  wake();
+  renderSeekPreview(posOf(e));
+}
+
+/** 放開：整次拖曳唯一一次真正的 Seek。
+ *
+ *  `e` 給的話**以它的座標為準**。pointerup 自己帶著一個位置，而它不保證
+ *  等於最後一次 pointermove —— 快速拖曳時瀏覽器可能合併掉中間幾個 move，
+ *  最後一個 move 與放開的位置就會差上一小段。以 move 為準的話，使用者
+ *  眼睛看到手指停在哪、實際跳到的卻是稍早的那個點。 */
+function commitScrub(e) {
+  const ratio = e ? posOf(e) : seekPreviewRatio;
+  if (e) renderSeekPreview(ratio);      // 畫面先對齊到真正要跳的位置
+  endScrub();
+  if (ratio == null) return;
+  const d = getCanonicalDuration();
+  if (!isValidDuration(d)) return;
+  const target = clampSeekTarget(ratio * d, d);
+  pendingSeekTarget = target;
+  if (debugPlayer) console.info('[seek] requested:', target.toFixed(2));
+  // **一定要有逾時放行。**seeked 是唯一會把 pendingSeekTarget 清掉的事件，
+  // 而它不保證一定來（fragment 抓不到、MediaSource 被重建、瀏覽器把這次
+  // seek 丟掉）。沒有這道保險的話，進度條會永遠停在使用者選的位置不動，
+  // 看起來像整個播放器當掉 —— 比 seek 失敗本身更糟。
+  clearTimeout(seekTimeoutTimer);
+  seekTimeoutTimer = setTimeout(() => {
+    if (pendingSeekTarget == null) return;
+    if (debugPlayer)
+      console.warn('[seek] 逾時未收到 seeked，放行 UI（目標 ' + target.toFixed(2) + '）');
+    pendingSeekTarget = null;
+    busy('');
+    syncBar();
+  }, SEEK_TIMEOUT_MS);
+  try { v.currentTime = target; } catch {}
+  // 原本在播就繼續播、原本暫停就維持暫停
+  if (wasPlayingBeforeSeek) v.play().catch(() => {});
+}
+
+/** 清掉拖曳狀態。pointerup／pointercancel／lostpointercapture 都要走這裡 ——
+ *  少一條路就會留下一個永遠為 true 的 dragging，之後所有 timeupdate 都被
+ *  當成「使用者還在拖」而不再更新畫面。 */
+function endScrub() {
+  if (!seekingDrag) return;
+  seekingDrag = false;
+  barWrap.classList.remove('dragging');
+  if (seekPointerId != null) {
+    try { barWrap.releasePointerCapture(seekPointerId); } catch {}
+  }
+  seekPointerId = null;
+  wake();
+}
+
 barWrap.addEventListener('pointerdown', e => {
-  dragging = true; barWrap.setPointerCapture(e.pointerId);
-  if (v.duration) v.currentTime = posOf(e) * v.duration;
+  // 只接主鍵/觸控，右鍵不要進入拖曳
+  if (e.button != null && e.button !== 0) return;
+  e.preventDefault();
+  beginScrub(e);
 });
+
 barWrap.addEventListener('pointermove', e => {
+  if (seekingDrag) {
+    if (seekPointerId != null && e.pointerId !== seekPointerId) return;
+    renderSeekPreview(posOf(e));
+    return;
+  }
+  // 沒在拖：滑鼠 hover 時仍然顯示「這裡是幾分幾秒」，但不碰圓點與播放色條
   const p = posOf(e);
   const tip = $('#barTip');
   tip.style.left = (p * 100) + '%';
-  tip.textContent = fmt(p * (v.duration || 0));
-  if (dragging && v.duration) v.currentTime = p * v.duration;
+  tip.textContent = fmt(p * getCanonicalDuration());
 });
-barWrap.addEventListener('pointerup', e => { dragging = false; try { barWrap.releasePointerCapture(e.pointerId); } catch {} });
+
+barWrap.addEventListener('pointerup', e => {
+  if (!seekingDrag) return;
+  if (seekPointerId != null && e.pointerId !== seekPointerId) return;
+  commitScrub(e);
+});
+// 手勢被瀏覽器中斷（滑出、轉向、來電、多指）—— 不 commit，狀態要清乾淨
+barWrap.addEventListener('pointercancel', () => endScrub());
+barWrap.addEventListener('lostpointercapture', () => endScrub());
 
 function syncBar() {
-  const d = v.duration || info?.duration || 0;
-  const p = d ? (v.currentTime / d) * 100 : 0;
+  // 拖曳中：畫面完全由 seekPreviewRatio 決定，不准 currentTime 搶回去。
+  // **這就是「手指 60% → timeupdate → 圓點跳回 20%」那個抖動的修法。**
+  if (seekingDrag) {
+    if (seekPreviewRatio != null) renderSeekPreview(seekPreviewRatio);
+    return;
+  }
+  const d = getCanonicalDuration();
+  // 已 commit 但還沒 seeked（HLS 在等 fragment）：圓點停在使用者選的位置。
+  // 讓它照 currentTime 畫的話會先跳回原處，看起來像「放開之後自己亂跑」。
+  const at = pendingSeekTarget != null ? pendingSeekTarget : v.currentTime;
+  const p = d ? clamp((at / d) * 100, 0, 100) : 0;
   $('#barPlay').style.width = p + '%';
   $('#barKnob').style.left = p + '%';
-  $('#tCur').textContent = fmt(v.currentTime);
+  $('#tCur').textContent = fmt(at);
   $('#tDur').textContent = fmt(d);
   if (v.buffered.length && d) {
     let end = 0;
@@ -1265,7 +1518,9 @@ function wake() {
     // 只要不是「使用者主動暫停」或滑鼠停在控制列上，就收起來。
     // 之前的條件是 !v.paused，結果緩衝/轉碼中 video 是 waiting 狀態，
     // 控制列那條漸層就一直蓋在畫面下緣不走。
-    if (userPaused || pointerOverCtl || $('#panel').classList.contains('show')) return;
+    // 正在拖進度條時把控制列藏掉 = 把使用者手上那根圓點藏掉。
+    if (userPaused || pointerOverCtl || seekingDrag ||
+        $('#panel').classList.contains('show')) return;
     pl.classList.add('idle');
   }, 2800);
 }
@@ -1621,7 +1876,9 @@ v.addEventListener('loadeddata', () => {
 v.addEventListener('volumechange', syncVol);
 v.addEventListener('timeupdate', () => {
   syncBar(); renderCues(); syncNextEp();
-  clearTimeout(saveTimer); saveTimer = setTimeout(saveProgress, 5000);
+  // 節流（不是 debounce）—— 原本的 clearTimeout + setTimeout 寫法在連續
+  // 播放時永遠不會到期，見 saveProgress 上方的說明。
+  saveProgress();
 });
 v.addEventListener('progress', () => {
   syncBar();
@@ -1630,7 +1887,35 @@ v.addEventListener('progress', () => {
   updatePlaybackState({});
   if (mode === 'direct') maybeFallbackFromDirect();
 });
-v.addEventListener('seeking', () => renderCues(true));
+v.addEventListener('seeking', () => {
+  renderCues(true);
+  // HLS 還在抓 fragment 的期間給一個明確的提示，但**圓點不動** ——
+  // 位置仍然停在使用者選的地方（見 syncBar 的 pendingSeekTarget）。
+  if (pendingSeekTarget != null) busy('跳轉中…');
+});
+
+/* Seek 落地：驗證「要的」跟「拿到的」差多少。
+   誤差大到離譜（例如選 4500 卻跑到 8990）代表 playlist 的時間軸與
+   MediaSource 對不起來，那是後端的問題，不是 UI 的 —— 所以要留紀錄，
+   不能默默接受。 */
+const SEEK_DELTA_WARN_S = 5;
+v.addEventListener('seeked', () => {
+  if (pendingSeekTarget != null) {
+    const want = pendingSeekTarget, got = v.currentTime;
+    const delta = got - want;
+    if (debugPlayer) {
+      const line = `[seek] requested: ${want.toFixed(2)}  actual: ${got.toFixed(2)}  ` +
+                   `delta: ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}`;
+      if (Math.abs(delta) > SEEK_DELTA_WARN_S) console.warn(line + '  ← 誤差異常');
+      else console.info(line);
+    }
+    lastSeek = { want, got, delta };
+    pendingSeekTarget = null;
+    clearTimeout(seekTimeoutTimer);
+    busy('');
+  }
+  syncBar();
+});
 v.addEventListener('loadedmetadata', () => { v.playbackRate = cfg.rate; syncBar(); syncNextEp(); });
 
 v.addEventListener('error', () => {
@@ -1681,6 +1966,11 @@ let lastSaveAt = 0, lastSavedPos = -1;
  *  keepalive fetch，不要靜靜地掉掉。 */
 function saveProgress(finished = false, { force = false } = {}) {
   if (!info) return;
+  // **拖曳期間絕對不能寫進度。**preview 只是「打算跳到哪」，真正的
+  // currentTime 還停在原處；而 seek 已經送出、還沒落地時 currentTime 也
+  // 仍是舊值。這兩種情形寫進去都是把錯的位置蓋到資料庫上 ——
+  // 使用者下次回來會從一個他沒看到的地方續播。
+  if (seekingDrag || pendingSeekTarget != null) return;
   const pos = v.currentTime;
   if (!pos && !finished) return;
   const now = Date.now();
@@ -1691,7 +1981,7 @@ function saveProgress(finished = false, { force = false } = {}) {
   }
   lastSaveAt = now; lastSavedPos = pos;
   const body = JSON.stringify({ file_id: +fileId, position: pos,
-    duration: v.duration || info.duration || 0, finished });
+    duration: getCanonicalDuration(), finished });
   const blob = new Blob([body], { type: 'application/json' });
   const sent = navigator.sendBeacon?.('/api/progress', blob);
   if (!sent) {
@@ -1713,7 +2003,7 @@ function saveProgress(finished = false, { force = false } = {}) {
 async function finishCurrentEpisode() {
   if (!info) return;
   const body = JSON.stringify({ file_id: +fileId, position: v.currentTime || 0,
-    duration: v.duration || info.duration || 0, finished: true });
+    duration: getCanonicalDuration(), finished: true });
   lastSaveAt = Date.now(); lastSavedPos = v.currentTime;
   try {
     await Promise.race([
@@ -1754,7 +2044,7 @@ function syncNextEp() {
   const n = nextEpInfo();
   const show = PS.nextEpisodeVisible({
     hasNext: !!n,
-    duration: v.duration || info?.duration || 0,
+    duration: getCanonicalDuration(),
     currentTime: v.currentTime,
     ended: v.ended,
   });
@@ -1856,6 +2146,7 @@ async function boot() {
   }
 
   buildPanel();
+  syncNextEp();
   play(forceHls ? 'hls' : info.mode);
   const saved = savedPick();
   if (saved !== undefined && (saved < 0 || info.subtitles[saved])) {
@@ -1889,6 +2180,15 @@ window.__playerTestHooks = {
   get cfg() { return cfg; },
   play, updatePlaybackState, watchdogTick, renderPlaybackStatus,
   saveProgress, syncNextEp, goNextEpisode,
+  // 進度條／Seek（這次修正）。測試要能看見「現在在拖嗎、preview 到哪、
+  // canonical 是多少」，否則只能從 DOM 反推，那會連「三個元素同一個來源」
+  // 都驗不出來。
+  syncBar, getCanonicalDuration, isValidDuration, clampSeekTarget, renderSeekPreview,
+  get seekingDrag() { return seekingDrag; },
+  get seekPreviewRatio() { return seekPreviewRatio; },
+  get seekPreviewTime() { return seekPreviewTime; },
+  get pendingSeekTarget() { return pendingSeekTarget; },
+  get wasPlayingBeforeSeek() { return wasPlayingBeforeSeek; },
 };
 
 boot();
