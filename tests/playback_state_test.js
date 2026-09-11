@@ -314,6 +314,53 @@ check('dpr 超過 3 就當 3（再高沒有實益，只會選過高的階）',
                            devicePixelRatio: 6 }) === 300);
 
 
+
+// ============================================================ 下一集的片尾門檻
+head('[下一集] 門檻 = clamp(片長 * 5%, 30, 90) 秒');
+
+check('22 分鐘的番劇 → 66 秒（固定 90 秒的話片尾曲還沒開始按鈕就擋在那）',
+      PS.nextEpisodeThreshold(22 * 60) === 66, PS.nextEpisodeThreshold(22 * 60));
+check('10 分鐘的短片 → 夾到下限 30 秒（5% 只有 30 秒，剛好在邊界）',
+      PS.nextEpisodeThreshold(600) === 30, PS.nextEpisodeThreshold(600));
+check('5 分鐘的片 → 下限 30 秒（5% 只有 15 秒，來不及反應）',
+      PS.nextEpisodeThreshold(300) === 30, PS.nextEpisodeThreshold(300));
+check('3 小時的電影 → 夾到上限 90 秒（5% 是 9 分鐘，太早）',
+      PS.nextEpisodeThreshold(10800) === 90, PS.nextEpisodeThreshold(10800));
+check('45 分鐘的影集 → 90 秒（2700 * 5% = 135，夾到上限）',
+      PS.nextEpisodeThreshold(2700) === 90);
+check('拿不到片長 → 0（先不要顯示，不是顯示在錯的時間）',
+      PS.nextEpisodeThreshold(0) === 0 && PS.nextEpisodeThreshold(NaN) === 0
+      && PS.nextEpisodeThreshold(Infinity) === 0);
+
+head('[下一集] 什麼時候顯示');
+const D = 3600;                       // 1 小時，門檻 90 秒
+check('沒有下一集（電影／最後一集）→ 永遠不顯示',
+      PS.nextEpisodeVisible({ hasNext: false, duration: D, currentTime: D - 5 }) === false);
+check('片中 → 不顯示',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: 1800 }) === false);
+check('剛好在門檻上 → 顯示',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: D - 90 }) === true);
+check('門檻前一秒 → 不顯示',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: D - 91 }) === false);
+check('片尾 → 顯示',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: D - 10 }) === true);
+// 這一項是需求裡明確指定的行為
+check('使用者把進度拉回門檻以前 → 再次隱藏（函式沒有狀態，所以自動成立）',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: 100 }) === false);
+check('再拉到片尾 → 又出現',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: D - 20 }) === true);
+check('影片真的播完之後按鈕仍然可用（ended 是獨立條件）',
+      PS.nextEpisodeVisible({ hasNext: true, duration: D, currentTime: D, ended: true }) === true);
+check('ended 但沒有下一集 → 還是不顯示',
+      PS.nextEpisodeVisible({ hasNext: false, ended: true }) === false);
+check('還沒拿到片長（HLS 剛開始載）→ 不顯示，不要在 0 秒就跳出來',
+      PS.nextEpisodeVisible({ hasNext: true, duration: 0, currentTime: 0 }) === false);
+
+// 門檻與後端的 finished 正規化必須是兩件事
+check('下一集門檻（最少 30 秒）遠大於後端視為看完的 15 秒 —— 兩者刻意不同',
+      PS.NEXT_EP.minSeconds > 15,
+      PS.NEXT_EP);
+
 console.log('\n' + '='.repeat(50));
 console.log(`通過 ${OK}，失敗 ${FAIL}`);
 process.exit(FAIL ? 1 : 0);

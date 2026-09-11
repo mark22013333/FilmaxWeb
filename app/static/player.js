@@ -1005,6 +1005,7 @@ function fallbackToHls(reason) {
   play('hls', at);
   updatePlaybackState({ lastSwitchReason: 'direct-fallback' });
   buildPanel();
+  syncNextEp();
 }
 
 // hls.js 的 destroy() 會把內部參考清成 null，但它自己排隊中的 callback 還會再跑一次，
@@ -1619,7 +1620,7 @@ v.addEventListener('loadeddata', () => {
 });
 v.addEventListener('volumechange', syncVol);
 v.addEventListener('timeupdate', () => {
-  syncBar(); renderCues();
+  syncBar(); renderCues(); syncNextEp();
   clearTimeout(saveTimer); saveTimer = setTimeout(saveProgress, 5000);
 });
 v.addEventListener('progress', () => {
@@ -1630,7 +1631,7 @@ v.addEventListener('progress', () => {
   if (mode === 'direct') maybeFallbackFromDirect();
 });
 v.addEventListener('seeking', () => renderCues(true));
-v.addEventListener('loadedmetadata', () => { v.playbackRate = cfg.rate; syncBar(); });
+v.addEventListener('loadedmetadata', () => { v.playbackRate = cfg.rate; syncBar(); syncNextEp(); });
 
 v.addEventListener('error', () => {
   if (mode !== 'direct') return;
@@ -1647,21 +1648,155 @@ v.addEventListener('error', () => {
   updatePlaybackState({ lastSwitchReason: 'direct-fallback' });
 });
 
-function saveProgress(finished = false) {
-  if (!info || !v.currentTime) return;
-  const body = JSON.stringify({ file_id: +fileId, position: v.currentTime,
+/* ---------------- 進度儲存 ----------------
+
+   **原本的寫法是壞的**：每次 timeupdate 都 `clearTimeout` 再
+   `setTimeout(saveProgress, 5000)`。timeupdate 在正常播放時每 250ms 左右
+   就發一次，所以那個 timer **永遠在被重設，永遠不會到期** —— 連續播放
+   一小時，一筆進度都沒有寫進去。它只在「暫停或卡住超過 5 秒」時才會真的
+   存，而那剛好是最不需要它的時候（那些時機另外有事件可以掛）。
+
+   這是 debounce 與 throttle 用錯的典型：debounce 的語意是「等事件停下來
+   再做」，而播放期間事件本來就不會停。
+
+   改成真正的節流：距離上次寫入超過 SAVE_EVERY_MS 才寫，其餘直接忽略。
+   一小時的片子從「0 次」變成「每 8 秒一次」，DB 寫入量仍然很小
+   （一筆 upsert，WAL 底下一次 fsync）。
+
+   另外在關鍵時機補存，因為節流一定會漏掉最後那幾秒：
+     pause / seeked      使用者主動停下來或跳位置
+     visibilitychange    切 App、鎖螢幕 —— 手機上最重要的一個
+     pagehide            iOS Safari 的 beforeunload 常常不觸發
+     beforeunload        桌機關分頁
+     ended               真的播完
+   visibilitychange 與 pagehide 都要掛：iOS 上切 App 只會觸發前者，
+   而回到 Safari 再關分頁只會觸發後者。 */
+const SAVE_EVERY_MS = 8000;
+let lastSaveAt = 0, lastSavedPos = -1;
+
+/** 寫進度。force = 不管節流一定寫（離開頁面、暫停、播完）。
+ *
+ *  sendBeacon 才是離開頁面時唯一可靠的送法（fetch 會被取消），
+ *  但它在部分瀏覽器有佇列上限、也可能回 false —— 回 false 時退回
+ *  keepalive fetch，不要靜靜地掉掉。 */
+function saveProgress(finished = false, { force = false } = {}) {
+  if (!info) return;
+  const pos = v.currentTime;
+  if (!pos && !finished) return;
+  const now = Date.now();
+  if (!force && !finished) {
+    if (now - lastSaveAt < SAVE_EVERY_MS) return;
+    // 位置沒動就不必再寫一次（暫停後 timeupdate 仍可能零星進來）
+    if (Math.abs(pos - lastSavedPos) < 1) return;
+  }
+  lastSaveAt = now; lastSavedPos = pos;
+  const body = JSON.stringify({ file_id: +fileId, position: pos,
     duration: v.duration || info.duration || 0, finished });
-  navigator.sendBeacon?.('/api/progress', new Blob([body], { type: 'application/json' }));
+  const blob = new Blob([body], { type: 'application/json' });
+  const sent = navigator.sendBeacon?.('/api/progress', blob);
+  if (!sent) {
+    // keepalive 讓請求在頁面關掉之後仍然送得完
+    fetch('/api/progress', { method: 'POST', body,
+      headers: { 'Content-Type': 'application/json' }, keepalive: true }).catch(() => {});
+  }
 }
-v.addEventListener('ended', () => saveProgress(true));
-window.addEventListener('beforeunload', () => saveProgress());
+
+/** 確實把目前這一集標記完成，並等到真的送出去為止。
+ *
+ *  **為什麼需要一個會 await 的版本**：切下一集時如果只發 sendBeacon 再
+ *  立刻 `location.href = ...`，導覽會把還沒送出的請求砍掉 ——
+ *  於是這一集留在 finished=0，下一秒又出現在「繼續觀看」上。
+ *  這正是「按了下一集，結果舊的那一集自己跑回來」的根因。
+ *
+ *  所以這裡用會回 Promise 的 fetch + keepalive，並在跳頁前 await 它。
+ *  逾時也要放行 —— 網路卡住不該把使用者困在這一頁。 */
+async function finishCurrentEpisode() {
+  if (!info) return;
+  const body = JSON.stringify({ file_id: +fileId, position: v.currentTime || 0,
+    duration: v.duration || info.duration || 0, finished: true });
+  lastSaveAt = Date.now(); lastSavedPos = v.currentTime;
+  try {
+    await Promise.race([
+      fetch('/api/progress', { method: 'POST', body,
+        headers: { 'Content-Type': 'application/json' }, keepalive: true }),
+      new Promise(r => setTimeout(r, 1500)),
+    ]);
+  } catch {
+    // 送不出去至少留一個 beacon，總比完全沒有好
+    navigator.sendBeacon?.('/api/progress', new Blob([body], { type: 'application/json' }));
+  }
+}
+
+v.addEventListener('ended', () => { saveProgress(true, { force: true }); syncNextEp(); });
+v.addEventListener('pause', () => saveProgress(false, { force: true }));
+v.addEventListener('seeked', () => saveProgress(false, { force: true }));
+window.addEventListener('beforeunload', () => saveProgress(false, { force: true }));
+// 手機切 App / 鎖螢幕：beforeunload 不會來，這兩個才是可靠的時機。
+window.addEventListener('pagehide', () => saveProgress(false, { force: true }));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveProgress(false, { force: true });
+});
+
+/* ---------------- 下一集（Netflix 式）----------------
+
+   只有影集、而且後端真的算出 next_episode 時才會有這顆按鈕 ——
+   「有沒有下一集」「是哪一集」都由後端決定（app/episodes.py），
+   前端不自己猜，否則兩邊的排序規則遲早會分岔。
+
+   出現時機的門檻在 playback-state.js 的 nextEpisodeVisible()（純函式，
+   測得到）。刻意**不做倒數自動跳台** —— 這個專案原本沒有自動播放設定，
+   突然讓它自己跳到下一集是會嚇到人的行為改變。 */
+function nextEpInfo() { return info?.next_episode || null; }
+
+function syncNextEp() {
+  const box = $('#nextEp');
+  if (!box) return;
+  const n = nextEpInfo();
+  const show = PS.nextEpisodeVisible({
+    hasNext: !!n,
+    duration: v.duration || info?.duration || 0,
+    currentTime: v.currentTime,
+    ended: v.ended,
+  });
+  box.hidden = !show;
+  if (show && box.dataset.for !== String(n.file_id)) {
+    box.dataset.for = String(n.file_id);
+    const label = [n.label, n.title].filter(Boolean).join(' ');
+    $('#nextEpLabel').textContent = '下一集' + (label ? ' ' + label : '');
+    box.setAttribute('aria-label', '播放下一集' + (label ? ' ' + label : ''));
+  }
+}
+
+/** 按下「下一集」：先確實完成這一集，再跳頁。
+ *
+ *  順序不能顛倒（見 finishCurrentEpisode 的說明）—— 先跳頁的話，
+ *  這一集的 finished 寫不進去，它會重新出現在「繼續觀看」上。 */
+async function goNextEpisode() {
+  const n = nextEpInfo();
+  if (!n) return;
+  const btn = $('#nextEp');
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+  try { v.pause(); } catch {}
+  await finishCurrentEpisode();
+  location.href = n.url || ('/player?file=' + n.file_id);
+}
+
+// 點按與鍵盤都要能用。button 元素本來就吃 Enter/Space 的原生 click，
+// 所以這裡只掛 click 一個就夠 —— 另外自己攔 keydown 反而會在
+// Space 時觸發兩次（一次原生 click、一次自己的）。
+// 按鈕本身不能吃掉 .tapzone 的點擊：它是 .stage 的子元素而且在上層，
+// 所以要擋住冒泡，否則按下去會同時暫停影片。
+$('#nextEp')?.addEventListener('click', e => { e.stopPropagation(); goNextEpisode(); });
 
 document.addEventListener('keydown', e => {
   if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
+  // 焦點在按鈕上時，Space / Enter 是「按下這顆按鈕」而不是全域快捷鍵。
+  // 不讓開的話「下一集」用鍵盤永遠按不到 —— Space 會被這裡攔去暫停影片。
+  if (e.target.tagName === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
   const k = e.key.toLowerCase();
   if (k === ' ' || k === 'k') { e.preventDefault(); togglePlay(); }
-  else if (e.key === 'ArrowRight') { const n = e.shiftKey ? 60 : cfg.skip; v.currentTime += n; toast(n + ' 秒 ▶'); }
-  else if (e.key === 'ArrowLeft') { const n = e.shiftKey ? 60 : cfg.skip; v.currentTime -= n; toast('◀ ' + n + ' 秒'); }
+  else if (e.key === 'ArrowRight') { const n = e.shiftKey ? 60 : cfg.skip; skipBy(n); toast(n + ' 秒 ▶'); }
+  else if (e.key === 'ArrowLeft') { const n = e.shiftKey ? 60 : cfg.skip; skipBy(-n); toast('◀ ' + n + ' 秒'); }
   else if (e.key === 'ArrowUp') { v.volume = clamp(v.volume + .1, 0, 1); toast('音量 ' + Math.round(v.volume*100) + '%'); }
   else if (e.key === 'ArrowDown') { v.volume = clamp(v.volume - .1, 0, 1); toast('音量 ' + Math.round(v.volume*100) + '%'); }
   else if (k === 'f') toggleFull();
@@ -1753,6 +1888,7 @@ window.__playerTestHooks = {
   get metrics() { return metrics; },
   get cfg() { return cfg; },
   play, updatePlaybackState, watchdogTick, renderPlaybackStatus,
+  saveProgress, syncNextEp, goNextEpisode,
 };
 
 boot();

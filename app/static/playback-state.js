@@ -321,6 +321,63 @@
     return { capIndex: 1, reason: '手機遠端，保守開播' };
   }
 
+  /* ---------------- 片尾／下一集 ----------------
+
+     「下一集」按鈕什麼時候浮出來。門檻集中在這裡的理由跟畫質標籤一樣：
+     散成 magic number 的話，按鈕出現的時機、隱藏的時機、與「算不算看完」
+     三個地方會各自漂移，而那是使用者唯一看得出來的部分。
+
+     **算法：threshold = clamp(duration * 5%, 30, 90) 秒。**
+
+     為什麼是比例再夾住上下限，而不是固定秒數：22 分鐘的動畫與 3 小時的
+     電影用同一個固定值一定有一邊是錯的 —— 固定 90 秒對 22 分鐘的番劇來說
+     是最後 7%（片尾曲還沒開始按鈕就擋在那裡），固定 30 秒對 3 小時的片子
+     又太晚（片尾名單跑了兩分鐘才出現）。
+
+     為什麼要夾住：
+       · 下限 30 秒 —— 再短使用者來不及看到並決定要不要按。
+       · 上限 90 秒 —— 再長就會在「劇情還沒演完」時把按鈕推到畫面上。
+     duration 拿不到（還在載入、HLS 尚未知道總長）時回 0，代表「先不要顯示」。
+
+     **這個門檻刻意跟後端 _near_end() 的 finished 正規化分開。**
+     剩 60 秒不等於看完（片尾彩蛋），把兩者混用會讓影集在使用者還沒看完時
+     就從「繼續觀看」上消失。 */
+  const NEXT_EP = {
+    ratio: 0.05,     // 片長的最後 5%
+    minSeconds: 30,
+    maxSeconds: 90,
+  };
+
+  /** 距離片尾多少秒開始顯示「下一集」。0 = 資訊不足，先不要顯示。 */
+  function nextEpisodeThreshold(duration) {
+    const d = +duration;
+    if (!isFinite(d) || d <= 0) return 0;
+    const raw = d * NEXT_EP.ratio;
+    return Math.min(NEXT_EP.maxSeconds, Math.max(NEXT_EP.minSeconds, raw));
+  }
+
+  /** 現在該不該顯示「下一集」按鈕。
+   *
+   *  hasNext 為假（電影、最後一集、下一集不可播放）時永遠是 false ——
+   *  後端已經算過一次，前端不再自己猜。
+   *
+   *  **ended 要獨立成一個條件**：真的播完之後 currentTime 可能等於
+   *  duration，也可能因為浮點誤差差個零點幾秒，而影片結束後按鈕一定要
+   *  還能按（使用者可能正好在那一刻伸手）。
+   *
+   *  使用者把進度拉回門檻以前 → 回 false（按鈕要再次隱藏）；
+   *  再拉到片尾 → 又回 true。這個函式沒有狀態，所以那件事自動成立。 */
+  function nextEpisodeVisible(o) {
+    const x = o || {};
+    if (!x.hasNext) return false;
+    if (x.ended) return true;
+    const d = +x.duration, t = +x.currentTime;
+    if (!isFinite(d) || d <= 0 || !isFinite(t)) return false;
+    const th = nextEpisodeThreshold(d);
+    if (!th) return false;
+    return d - t <= th;
+  }
+
   /** 螢幕真的放得下的最大高度。手機 390px 寬去選 4K 是純浪費 ——
    *  hls.js 的 capLevelToPlayerSize 會處理這件事，這個函式是給
    *  「它不支援 / 被關掉」時的說明文字與測試用。
@@ -338,6 +395,7 @@
     statusLine, detailRows, switchReason, switchReasonText, fmtKbps, levelToState,
     shouldStepDown, shouldRelease, shouldFallbackFromDirect,
     startupPolicy, screenCapHeight,
+    NEXT_EP, nextEpisodeThreshold, nextEpisodeVisible,
   };
 
   if (typeof module === 'object' && module.exports) module.exports = api;
