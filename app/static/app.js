@@ -321,13 +321,17 @@ function fileRow(f, label = '') {
   const info = [f.height ? f.height + 'p' : '', (f.video_codec || '').toUpperCase(),
     (f.audio_codec || '').toUpperCase(), gb(f.size), hhmm(f.duration)].filter(Boolean).join(' · ');
   const pct = f.position && f.watched_duration ? Math.round(100 * f.position / f.watched_duration) : 0;
+  // 按鈕包在 .acts 裡：手機上放不下時整組一起換行，而不是有一顆被推出容器
+  // （style.css 的 .file-row 說明了為什麼要這樣分組）。
   return `<div class="file-row">
     <div class="n"><b>${label ? esc(label) + ' — ' : ''}${esc(f.filename)}</b>
       <small>${info}${pct ? ` · 已看 ${pct}%` : ''}</small></div>
     ${pill}
-    <button class="btn primary" onclick="location.href='/player?file=${f.id}'">播放</button>
-    ${me.is_admin ? `<a class="btn" href="/api/download/${f.id}" download>下載</a>` : ''}
-    ${me.is_admin ? `<button class="btn" onclick="reprobe(${f.id})" title="時長、字幕軌、解析度不對的時候用">重新分析</button>` : ''}
+    <div class="acts">
+      <button class="btn primary" onclick="location.href='/player?file=${f.id}'">播放</button>
+      ${me.is_admin ? `<a class="btn" href="/api/download/${f.id}" download>下載</a>` : ''}
+      ${me.is_admin ? `<button class="btn" onclick="reprobe(${f.id})" title="時長、字幕軌、解析度不對的時候用">重新分析</button>` : ''}
+    </div>
   </div>`;
 }
 
