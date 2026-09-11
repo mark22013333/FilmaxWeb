@@ -292,11 +292,14 @@ _ALL: List[Param] = [
        section="遠端畫質", label="原始串流搬運塊大小（KiB）", minimum=16, maximum=8192,
        help="direct／下載／相片／PDF 一次搬多少。**不要憑感覺調** ——"
             "先看 /api/diagnostics/stream 的 ftp_mbps，確認瓶頸真的在搬運層再動"),
-    _p("REMOTE_DIRECT_MAX_KBPS", HOT, type="int", default=6000, apply=APPLY_HOT,
+    _p("REMOTE_DIRECT_MAX_KBPS", HOT, type="int", default=4000, apply=APPLY_HOT,
        section="遠端畫質", label="遠端可以直接串流的片源上限（kbps）", minimum=0,
        help="片源整體位元率超過這個值時，遠端不要走直接串流 —— **direct 沒有階可以降**，"
             "鏈路不夠就只能整段卡住。超過就改走 HLS（有 remux 上階時畫質完全一樣；"
-            "沒有的話走轉碼，畫質有損但至少降得下去）。0 = 不檢查（回到舊行為）"),
+            "沒有的話走轉碼，畫質有損但至少降得下去）。0 = 不檢查（回到舊行為）。"
+            "**照「單條連線」的實測填，不是照對外總頻寬**：實測這台機器上傳到 "
+            "Cloudflare 邊緣有 220-310 Mbps，但經對外網址的單條連線只有 7.3 Mbps"
+            "（並行 12 條才 42 Mbps）—— 而播放器抓一段影片就是一條連線"),
 
     _p("MIN_FILE_MB", HOT, type="int", default=50, apply=APPLY_HOT, section="媒體庫",
        label="影片最小大小（MB）", minimum=0,

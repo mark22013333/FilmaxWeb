@@ -587,6 +587,19 @@ check("剛好等於上限 → 還在安全範圍內（邊界是含的）",
       hls.direct_ok_for_remote(6_000_000, has_remux=False)[0] is True)
 check("超過一點點就不行", hls.direct_ok_for_remote(6_001_000, has_remux=False)[0] is False)
 
+# 預設值是量出來的，不是猜的（2026-09-11：經對外網址的**單條連線**只有
+# 7.3 Mbps，而對外總頻寬有 220-310 Mbps —— 播放器抓一段就是一條連線，
+# 所以照總頻寬設這個值等於讓每部大檔去賭一條餵不動的線）。
+# 這裡釘住它，改的時候要連同 .env.example 那段量測紀錄一起更新。
+del os.environ["REMOTE_DIRECT_MAX_KBPS"]
+from app import params as _params
+_default = _params.REGISTRY["REMOTE_DIRECT_MAX_KBPS"].default
+check("預設 4000 = 單條實測 7.3 Mbps 的一半多一點（留餘裕給訊號差的手機）",
+      _default == 4000, _default)
+check("而且一部 10 Mbps 的片在預設值下不會被放行走遠端 direct",
+      hls.direct_ok_for_remote(10_000_000, has_remux=True)[0] is False)
+os.environ["REMOTE_DIRECT_MAX_KBPS"] = "6000"
+
 # L：區網不能被這條政策動到 —— 那裡 direct/remux 一直是最佳解
 _src = _insp.getsource(_api.play_info)
 check("[L] 這條政策只在 remote 時套用（區網的零轉碼路徑不能被破壞）",
