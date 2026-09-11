@@ -19,9 +19,32 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
   padding:14px 18px;background:linear-gradient(180deg,rgba(0,0,0,.85),transparent);
   transition:opacity .25s, transform .25s;
 }
-.pl-top .ti{flex:1;min-width:0}
+/* 標題區。**`.ti` 的 flex 基準不能留成預設的 auto** —— 那會讓它的
+   收縮下限跟著內容走，於是右邊那排標記（.tags-row 是 flex-wrap，會自己
+   長高長寬）一擠，標題就被壓到只剩幾十 px，而 small 沒有 nowrap，
+   於是檔名一個字一行地往下長，整條標題列變成一面字牆。
+   這跟 style.css 裡 `.file-row` 壞掉的形狀是同一個（flex row 沒有 wrap，
+   可收縮的那一項被壓扁）。
+   `flex:1 1 0` 讓它從 0 開始分配剩餘空間，再配上 small 的截斷。 */
+.pl-top .ti{flex:1 1 0;min-width:0}
 .pl-top .ti b{display:block;font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pl-top .ti small{color:#9aa3b6;font-size:12px}
+/* 原本沒有任何約束：長檔名（Reacher.S01E01.1080p.AMZN.WEB-DL…）會換行，
+   在手機上把整個頂列撐成半個畫面高。 */
+.pl-top .ti small{
+  display:block;color:#9aa3b6;font-size:12px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+/* 手機：標記列會跟標題搶寬度，而「現在幾 p」那顆（.tg.live）已經有自己的
+   max-width。這裡再給整排一個上限，標題才一定留得住一半以上的寬度。 */
+@media(max-width:640px){
+  .pl-top{gap:8px;padding:12px 12px;
+    padding-top:max(12px, env(safe-area-inset-top));
+    padding-left:max(12px, env(safe-area-inset-left));
+    padding-right:max(12px, env(safe-area-inset-right));
+  }
+  .pl-top .tags-row{max-width:40%;justify-content:flex-end}
+  .pl-top .ti b{font-size:14px}
+}
 
 /* 影片區 */
 .stage{position:relative;flex:1;min-height:0;background:#000;overflow:hidden}
@@ -72,8 +95,19 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 .pl.idle .pl-top{opacity:0;transform:translateY(-12px);pointer-events:none}
 .pl.idle .stage{cursor:none}
 
-/* 進度條 */
-.bar-wrap{position:relative;height:20px;display:flex;align-items:center;cursor:pointer;margin-bottom:4px}
+/* 進度條 ——
+
+   **`touch-action:none` 是這裡的關鍵，不是裝飾。**沒有它的話，手機上水平
+   拖進度條會被瀏覽器當成頁面手勢（捲動／左右滑動返回）而把 pointermove
+   整串吞掉，接著直接發 pointercancel —— 症狀就是「拖到一半圓點不動了」。
+   刻意只下在 .bar-wrap 上：播放器其他地方（點擊播放、雙擊全螢幕）仍然要
+   保留瀏覽器的預設手勢。 */
+.bar-wrap{
+  position:relative;height:20px;display:flex;align-items:center;cursor:pointer;margin-bottom:4px;
+  touch-action:none;
+  /* 拖到進度條外面時不要把時間文字整段反白選起來 */
+  user-select:none;-webkit-user-select:none;
+}
 .bar-bg{position:relative;width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.22);transition:height .12s}
 .bar-wrap:hover .bar-bg{height:8px}
 .bar-buf{position:absolute;left:0;top:0;bottom:0;background:rgba(255,255,255,.32);border-radius:3px}
@@ -89,6 +123,16 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
   pointer-events:none;opacity:0;transition:opacity .12s;white-space:nowrap;
 }
 .bar-wrap:hover .bar-tip{opacity:1}
+
+/* 拖曳中（.dragging 由 player.js 在 pointerdown 掛上、pointerup/cancel 拿掉）。
+
+   **只靠 :hover 在手機上是不成立的** —— 觸控裝置沒有真正的 hover，
+   於是整個拖曳過程圓點是 scale(0)（看不見）、tooltip 是 opacity:0。
+   使用者按住螢幕拖了兩小時的片，卻完全看不到自己拖到哪 —— 這正是
+   「圓點沒有跟著手指」最直接的那一半原因。 */
+.bar-wrap.dragging .bar-bg{height:8px}
+.bar-wrap.dragging .bar-knob{transform:translate(-50%,-50%) scale(1)}
+.bar-wrap.dragging .bar-tip{opacity:1}
 
 .row{display:flex;align-items:center;gap:6px}
 .ib{
@@ -180,6 +224,10 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 .pl-toast.show{opacity:1}
 
 @media(max-width:640px){
+  /* 手指的觸控目標比滑鼠游標大得多：把可按高度加大，但 .bar-bg 的視覺
+     厚度維持不變 —— 加高的是 hit area，不是那條線。 */
+  .bar-wrap{height:26px}
+  .bar-wrap.dragging .bar-knob{transform:translate(-50%,-50%) scale(1.25)}
   .ib{width:34px;height:34px}
   .time{font-size:11.5px;padding:0 2px}
   .vol{display:none}
@@ -195,7 +243,24 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 }
 .tg.hdr{background:rgba(245,197,24,.18);color:var(--accent)}
 .tg.warn{background:rgba(255,92,92,.18);color:#ff8f8f}
-@media(max-width:720px){.tags-row .tg:not(.hdr):not(.warn){display:none}}
+/* 「現在真正在播的畫質」。這一顆比其他標記顯眼一點 —— 它是會變的那一個，
+   而使用者要看的正是它變了沒。 */
+.tg.live{background:rgba(255,255,255,.2);color:#eef2f8}
+/* 手機上把片源標記收起來（螢幕窄，一排標籤會擠掉標題）。
+   **但 .live 一定要留** —— 手機遠端看片、網路變差自動降階，正是最需要
+   「右上角立刻看得到現在幾 p」的情境，把它一起藏掉等於把這次的修正藏掉。 */
+@media(max-width:720px){.tags-row .tg:not(.hdr):not(.warn):not(.live){display:none}}
+@media(max-width:480px){.tags-row .tg.live{max-width:46vw;overflow:hidden;text-overflow:ellipsis}}
+
+/* 播放診斷疊圖（?debugPlayer=1 才會出現）。正式模式下整排資訊不塞在畫面上。 */
+.dbg{
+  position:absolute;right:10px;top:10px;z-index:27;pointer-events:none;
+  padding:8px 10px;border-radius:8px;background:rgba(0,0,0,.78);backdrop-filter:blur(6px);
+  font:11px/1.5 ui-monospace,Consolas,monospace;color:#cfd7e4;max-width:min(320px,60vw);
+}
+.dbg>div{display:flex;gap:10px;justify-content:space-between}
+.dbg span{color:#8b95a7}
+.dbg b{color:#eef2f8;font-weight:600;text-align:right;word-break:break-all}
 
 /* 緩衝／轉碼中的小標示 —— 放角落，不遮畫面 */
 .busy{
@@ -226,3 +291,66 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 /* 設定面板裡的說明文字 */
 .panel .hint{font-size:11.5px;line-height:1.55;color:var(--dim,#8b93a7);
   padding:6px 2px 2px;margin:0}
+
+/* ---------------- 下一集 ----------------
+
+   位置：桌機右下、手機底部靠右。兩者都要**避開三樣東西** ——
+     · 控制列（.ctl 大約 86px 高，含進度條與那一排按鈕）
+     · 自繪字幕（.subs.bottom 預設落在 bottom:10%）
+     · iPhone 的底部 home indicator（env(safe-area-inset-bottom)）
+
+   所以 bottom 用 `calc(控制列高度 + safe-area)`，而不是一個固定值 ——
+   固定值在有瀏海的機器上會被 home indicator 壓到，在沒有的機器上又浮太高。
+
+   字幕的部分刻意**不去閃避**：字幕置中、按鈕靠右，兩者水平上本來就錯開，
+   而把按鈕再往上推只會讓它跑進畫面中央。真的重疊時字幕仍然讀得到
+   （按鈕有自己的底色，不是透明疊在字上）。
+
+   控制列隱藏（.pl.idle）時按鈕跟著往下移一點，但**不跟著淡出** ——
+   它是使用者現在唯一想按的東西，讓它跟著控制列一起消失等於把功能藏起來。 */
+.next-ep{
+  position:absolute;z-index:27;
+  right:max(18px, env(safe-area-inset-right));
+  bottom:calc(96px + env(safe-area-inset-bottom));
+  display:inline-flex;align-items:center;gap:8px;
+  /* 觸控目標至少 44px 高（WCAG 2.5.5 / iOS HIG），padding 撐不到就靠 min-height */
+  min-height:44px;padding:10px 18px 10px 14px;border-radius:10px;
+  background:rgba(255,255,255,.94);color:#141414;
+  font-size:14px;font-weight:700;line-height:1.2;
+  box-shadow:0 4px 18px rgba(0,0,0,.5);
+  transition:transform .18s ease, opacity .18s ease, background .15s;
+  max-width:min(300px, calc(100vw - 36px));
+}
+.next-ep:hover{background:#fff;transform:translateY(-1px)}
+.next-ep:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+.next-ep:disabled{opacity:.6;cursor:progress}
+.next-ep svg{
+  width:18px;height:18px;flex:none;fill:currentColor;stroke:currentColor;
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
+}
+/* 集名可能很長（「第八集 一個非常長的集數標題」），一行放不下就截斷 ——
+   換行會把按鈕撐成兩三行高，在手機上蓋掉半個畫面。 */
+.next-ep span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+
+/* 控制列收起來時往下移（那塊空間空出來了），但不淡出 —— 見上方說明 */
+.pl.idle .next-ep{bottom:calc(28px + env(safe-area-inset-bottom))}
+
+@media(max-width:640px){
+  .next-ep{
+    right:max(10px, env(safe-area-inset-right));
+    bottom:calc(88px + env(safe-area-inset-bottom));
+    font-size:13.5px;padding:10px 15px 10px 12px;
+    max-width:min(240px, calc(100vw - 20px));
+  }
+  .pl.idle .next-ep{bottom:calc(24px + env(safe-area-inset-bottom))}
+}
+/* 手機橫向：可視高度只剩 3xx px，控制列與按鈕會擠在一起。
+   把按鈕收得更貼近底部，並縮小內距。 */
+@media(max-height:450px) and (orientation:landscape){
+  .next-ep{bottom:calc(74px + env(safe-area-inset-bottom));min-height:40px;padding:8px 14px}
+  .pl.idle .next-ep{bottom:calc(18px + env(safe-area-inset-bottom))}
+}
+@media(prefers-reduced-motion:reduce){
+  .next-ep{transition:none}
+  .next-ep:hover{transform:none}
+}

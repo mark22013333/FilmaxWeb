@@ -26,6 +26,13 @@
       <div class="spin" id="spin"></div><div id="centerText">準備中…</div>
     </div></div>
     <div class="busy" id="busy"></div>
+    <!-- 「下一集」：只有影集且後端算得出 next_episode 時才會被顯示出來。
+         放在 .stage 裡（不是控制列裡）才能浮在畫面上而不佔控制列的位置；
+         位置與 safe-area 的處理在 player.css 的 .next-ep。 -->
+    <button class="next-ep" id="nextEp" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4l10 8-10 8z"/><path d="M19 5v14"/></svg>
+      <span id="nextEpLabel">下一集</span>
+    </button>
     <div class="pl-toast" id="toast"></div>
   </div>
 
@@ -73,6 +80,8 @@
 </div>
 
 <script src="/static/hls.min.js"></script>
+<!-- 播放狀態的推導（純函式，沒有 DOM）。player.js 依賴它，所以要排在前面。 -->
+<script src="/static/playback-state.js"></script>
 <script src="/static/player.js"></script>
 </body>
 </html>

@@ -1464,10 +1464,25 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
     放到輸出端 seek 的話 ffmpeg 會從 0 開始解，然後丟掉前面 —— 慢，而且
     每一段都要從頭掃一次。
 
-    **`-avoid_negative_ts make_zero` 是給非單調 DTS 的片源的。**mkv 有一整類
-    片源的 DTS 不單調（量測工具在那部 4K DV 上就吃過三行警告），
-    在 copy 模式下 mpegts muxer 會直接吐錯。make_zero 讓 muxer 把時間軸
-    平移到零而不是拒收，再由 `-output_ts_offset` 放回這一段該有的位置。
+    **`-avoid_negative_ts` 一定要是 `disabled`，不可以是 `make_zero`。**
+    這兩個選項會互相抵銷：`make_zero` 的語意是「把這一段的時間軸平移到 0」，
+    而它是在 `-output_ts_offset` **之後**才套用的 —— 於是 offset 寫進去的
+    絕對位置被整個抹掉，每一段都從 0 開始。
+
+    實測後果（file 433，2:33:55 的片）：1540 段每段宣告 6 秒、實際各自從 0
+    起算，hls.js 只好把它們一段接一段地串起來，於是 MediaSource 的 duration
+    變成 1540 × 4.816 = 7416 秒 —— **播放器右下角的總時間就從 2:33:55 縮成
+    2:03:36**，而且 seek 到 95% 會直接落在「它以為的片尾」而觸發 ended。
+    這正是「總時間突然變短、拖到後面就跳片尾」的後端根因。
+
+    更嚴重的是下階（transcode）**沒有**這個旗標，它的時間戳是對的 ——
+    所以兩階的時間軸原本是不一致的：切一次畫質，currentTime 就會對到
+    另一條軸上。
+
+    `disabled` 明確要求 muxer 不要改時間戳。非單調 DTS 的片源仍然靠
+    `-ss`（輸入端 seek，從 keyframe 起頭）與 mpegts 本身的容忍度處理；
+    真的整段 muxer 吐錯時 `_produce()` 會把該檔案的上階下線，那是既有的
+    退路，不需要用「把時間軸弄壞」來換。
     """
     pre = [resolve_tool("ffmpeg"), "-v", "error", "-nostdin", "-y",
            "-ss", f"{start:.3f}",
@@ -1484,7 +1499,7 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
                 "-ar", "48000"]
         if settings.audio_channels > 0:
             pre += ["-ac", str(settings.audio_channels)]
-    pre += ["-avoid_negative_ts", "make_zero",
+    pre += ["-avoid_negative_ts", "disabled",
             "-muxdelay", "0", "-muxpreload", "0",
             "-output_ts_offset", f"{start:.3f}",
             "-f", "mpegts", "pipe:1"]

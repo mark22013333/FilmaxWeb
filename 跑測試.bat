@@ -71,6 +71,34 @@ for %%T in (tests\*_test.py) do (
   )
 )
 
+REM The player state machine is JavaScript, so it needs node - the pure
+REM derivation (what the status line should say) and the wiring (does an
+REM hls.js event actually change the UI). Both are plain scripts with the same
+REM PASS/FAIL shape as the python ones; no test framework is involved.
+REM
+REM No node installed is reported, not skipped silently: a green run that
+REM quietly did not check the player is worse than a red one.
+where node >nul 2>&1
+if errorlevel 1 (
+  echo   SKIP  tests\*_test.js  ^(node not found - player tests did NOT run^)
+  echo # node not found, tests\*_test.js were skipped >> "%OUT%"
+) else (
+  for %%T in (tests\*_test.js) do (
+    set /a TOTAL+=1
+    echo ---------------------------------------------------------- >> "%OUT%"
+    echo # %%T >> "%OUT%"
+    echo ---------------------------------------------------------- >> "%OUT%"
+    node "%%T" >> "%OUT%" 2>&1
+    if errorlevel 1 (
+      echo   FAIL  %%T
+      set /a BAD+=1
+      set FAILED=!FAILED! %%T
+    ) else (
+      echo   ok    %%T
+    )
+  )
+)
+
 echo.
 echo ------------------------------------------------------------
 if !BAD! GTR 0 (

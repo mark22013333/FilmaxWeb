@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from . import db, keyframes, media
+from . import db, keyframes, media, streamstat
 from .config import CACHE_DIR, settings
 
 log = logging.getLogger("filmax.hls")
@@ -341,6 +341,40 @@ def quality_policy(remote: bool, h: Optional[int]) -> Tuple[int, int]:
     return chosen_h, chosen_b
 
 
+def direct_ok_for_remote(src_bitrate_bps: Optional[int], has_remux: bool) -> Tuple[bool, str]:
+    """遠端這個檔案該不該走 direct。回 (可以嗎, 為什麼)。
+
+    **原本的條件是「有 remux 上階才改走 HLS」，那個條件是反的。**
+    有沒有 remux 上階講的是「改走 HLS 之後畫質會不會掉」，
+    而該不該離開 direct 講的是「這條鏈路餵不餵得動原始檔」—— 兩件事。
+
+    direct 的性質是：**沒有第二階可選。**鏈路不夠時它不會變模糊，
+    它會停住。所以判斷只能看片源位元率對不對得起遠端的安全頻寬：
+
+      * 片源夠小（≤ REMOTE_DIRECT_MAX_KBPS）→ direct 最省、畫質最好，繼續走。
+      * 片源太大 ＋ 有 remux 上階 → 走 HLS。畫質**一模一樣**（上階就是原檔
+        照抄），而且不夠時降得下去。這是純賺。
+      * 片源太大 ＋ 沒有 remux 上階 → 還是走 HLS。這一步有代價（要重編、
+        畫質有損），但代價是「畫質降一階」，而留在 direct 的代價是「播不動」。
+        規格 J 的取捨一路都是**順暢播放優先**，這裡照同一條。
+
+    區網不走這個函式 —— 鏈路夠寬，direct 一直都是那裡的最佳解。
+    """
+    cap = int(getattr(settings, "remote_direct_max_kbps", 0) or 0)
+    if cap <= 0:
+        return True, "未設定遠端 direct 上限，照舊"
+    kbps = int((src_bitrate_bps or 0) / 1000)
+    if kbps <= 0:
+        # 位元率不明（沒 probe 過、或 probe 沒抓到）。**不要賭。**
+        # 這裡猜錯的方向不對稱：誤判成「可以 direct」的代價是整段播不動，
+        # 誤判成「不能」的代價只是多走一次 remux（有上階時畫質還一樣）。
+        return (not has_remux), "片源位元率不明"
+    if kbps <= cap:
+        return True, f"片源 {kbps} kbps 在遠端安全範圍內（上限 {cap}）"
+    return False, (f"片源 {kbps} kbps 超過遠端上限 {cap}，direct 無階可降"
+                   + ("，改走 remux 上階（畫質相同）" if has_remux else "，改走轉碼 HLS"))
+
+
 def build_master(file_id: int, profile: str, remote: bool = False,
                  duration: float = 0.0, auto: bool = True) -> str:
     """master playlist。**區網發一階、遠端發 remux 上階 ＋ 一條轉碼階梯。**
@@ -442,6 +476,15 @@ def _parse_profile(profile: str) -> Tuple[Optional[int], Optional[int], int, int
     return height, audio, bitrate, rung
 
 
+def segment_cached(file_id: int, index: int, profile: str) -> bool:
+    """這一段現在就拿得到嗎（沒有要產生它）。只給量測用，不影響播放路徑。"""
+    try:
+        p = seg_dir(file_id, profile) / f"seg-{index}.ts"
+        return p.exists() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def get_segment(file_id: int, index: int, profile: str, duration: float) -> Path:
     d = seg_dir(file_id, profile)
     path = d / f"seg-{index}.ts"
@@ -521,8 +564,10 @@ def _produce(file_id: int, index: int, profile: str, duration: float, path: Path
                 take_remux_offline(file_id, err)
                 raise RuntimeError(f"上階 remux 失敗 seg {index}: {err}")
             tmp.replace(path)
+            el = time.time() - t0
+            streamstat.record_produce(file_id, index, rung, length, el, background)
             log.info("remux file=%s seg=%s (%.1fs 影片 / %.2fs 耗時)",
-                     file_id, index, length, time.time() - t0)
+                     file_id, index, length, el)
             return
         hw = media.resolve_hwaccel()
         err = run(force_software=False)
@@ -542,6 +587,10 @@ def _produce(file_id: int, index: int, profile: str, duration: float, path: Path
         elapsed = time.time() - t0
         if should_record_speed(rung, background):
             record_speed(length, elapsed)
+        # 診斷的取樣**不套 should_record_speed 的過濾**：那個過濾是為了不要污染
+        # 預轉的決策，而診斷要看的正是「上階多快、預轉佔掉多少」——
+        # 把它們濾掉的話診斷頁就看不到預轉在跟前景搶 CPU。
+        streamstat.record_produce(file_id, index, rung, length, elapsed, background)
         log.info("轉碼 file=%s seg=%s (%.1fs 影片 / %.1fs 耗時 = %.2fx)%s",
                  file_id, index, length, elapsed, length / elapsed if elapsed else 0,
                  " [預轉]" if background else "")

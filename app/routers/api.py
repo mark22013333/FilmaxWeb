@@ -11,8 +11,8 @@ from fastapi import Depends, APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from .. import (acl, audit, auth, db, ftpclient, geo, hls, media, mssql, params,
-                paramstore, purge, scanner, users)
+from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, media, mssql,
+                params, paramstore, purge, scanner, streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -315,7 +315,8 @@ def _qs(**kw) -> str:
 
 @router.get("/play/{file_id}")
 def play_info(file_id: int, request: Request,
-              h: Optional[int] = None, a: Optional[int] = None):
+              h: Optional[int] = None, a: Optional[int] = None,
+              force_direct: int = 0):
     row = db.q1("""SELECT f.*, i.title AS item_title, i.kind, e.season, e.episode, e.title AS ep_title
                    FROM media_file f
                    LEFT JOIN media_item i ON i.id=f.item_id
@@ -386,15 +387,19 @@ def play_info(file_id: int, request: Request,
     # 這兩個坑的說明都在那個函式裡）。
     chosen_h, chosen_b = hls.quality_policy(remote, h)
 
-    # 遠端 + 這個檔案有上階可給 → **不要走 direct**。direct 沒有階梯可以降：
-    # 那 7 部走 direct 的 mp4 裡有 7.6 GB／4,661 kbps 與 4.8 GB／4,508 kbps
-    # 兩部大檔，鏈路不夠就只能卡在那裡。改走兩階 HLS 之後，上階的畫質
-    # 一樣是原檔（remux），而且不夠時客戶端可以自己降到下階。
+    # 遠端要不要走 direct，判斷集中在 hls.direct_ok_for_remote()。
     #
-    # **只有真的有上階時才改。**沒有上階的話，把遠端的 direct 改成 HLS
-    # 等於把「原檔直送」換成「一定重編」—— 那是退步，不是進步。
+    # **舊的條件（「有 remux 上階才改走 HLS」）是反的**，那個 bug 的形狀是：
+    # 一部 17 Mbps 的 mp4 在沒有邊界表時反而被判定「適合遠端 direct」——
+    # 正是最不適合的那一種。有沒有上階講的是「改走 HLS 會不會掉畫質」，
+    # 該不該離開 direct 講的是「這條鏈路餵不餵得動原始檔」。
     rungs = hls.rungs_for(file_id, float(f.get("duration") or 0))
-    if remote and mode == "direct" and hls.RUNG_REMUX in rungs:
+    has_remux = hls.RUNG_REMUX in rungs
+    direct_ok, direct_reason = (True, "") if not remote else \
+        hls.direct_ok_for_remote(f.get("bitrate"), has_remux)
+    # **使用者手動要求試直接播放時尊重他的選擇**（前端帶 force_direct=1）——
+    # 真的持續卡頓再由前端的 fallback 接手。這裡只管「預設要給哪一種」。
+    if remote and mode == "direct" and not direct_ok and not force_direct:
         mode = "hls"
 
     src_h = f.get("height") or 1080
@@ -412,6 +417,27 @@ def play_info(file_id: int, request: Request,
                        "label": media.quality_class(w2, h2)})
     source_q = {"width": src_w, "height": src_h,
                 "label": media.quality_class(src_w, src_h)}
+
+    # 「下一集」（影集才有；電影與最後一集是 None）。
+    #
+    # ACL 用的是**跟這個端點開頭同一份**條件（acl.filter_sql on f.ftp_path）：
+    # 使用者看不到的那一集連候選名單都進不去，所以 next_episode 裡的
+    # title／season／file_id／still 不可能比 /api/play 本身更寬鬆 ——
+    # 否則這個欄位就變成一條繞過目錄權限的側門（規格 L 的「安靜外洩」）。
+    #
+    # 判斷規則（跨季、跳過沒有可播放檔案的集數、同一集多檔案挑哪一個）
+    # 全部在 app/episodes.py，前端與之後的自動播放都問同一份答案。
+    next_ep = None
+    if f.get("kind") == "tv" and f.get("item_id"):
+        nff, nfa = acl.filter_sql(request, "f.ftp_path")
+        next_ep = episodes.next_episode(f["item_id"], f.get("season"), f.get("episode"),
+                                        nff, nfa)
+        if next_ep:
+            still = next_ep.pop("still", None)
+            next_ep["still_url"] = f"/api/image/{still}" if still else None
+            next_ep["label"] = (f"S{next_ep['season']:02d}E{next_ep['episode']:02d}"
+                                if next_ep.get("season") is not None else "")
+            next_ep["url"] = f"/player?file={next_ep['file_id']}"
     return {
         "file_id": file_id,
         "title": f.get("item_title") or f.get("filename"),
@@ -422,7 +448,12 @@ def play_info(file_id: int, request: Request,
         # 這個檔案在這條鏈路上實際會拿到幾階。前端不必用它來決定行為
         # （master playlist 才是事實），但診斷時要看得到「為什麼沒有上階」。
         "rungs": len(rungs) if remote else min(len(rungs), 1),
-        "remux_available": hls.RUNG_REMUX in rungs,
+        "remux_available": has_remux,
+        # 前端的 direct → HLS fallback 要看得到「伺服器覺得這條鏈路撐不撐得住
+        # 原始檔」。它不是命令（使用者仍然可以手動要求 direct），是判斷依據 ——
+        # 遠端 ＋ 不建議 direct 的話，前端的 stall 門檻會收緊。
+        "direct_advised": bool(direct_ok),
+        "direct_advice": direct_reason,
         "duration": f.get("duration"),
         "width": f.get("width"), "height": f.get("height"),
         "video_codec": f.get("video_codec"), "audio_codec": f.get("audio_codec"),
@@ -469,6 +500,8 @@ def play_info(file_id: int, request: Request,
         "download_url": f"/api/download/{file_id}",
         "subtitles": tracks,
         "resume": _resume_at(state, f.get("duration")),
+        # 影集才有；電影與最後一集是 null。前端的「下一集」按鈕只看這個欄位。
+        "next_episode": next_ep,
         "probe_state": f.get("probe_state"),
         "probe_error": f.get("probe_error"),
     }
@@ -536,15 +569,41 @@ class Progress(BaseModel):
     finished: bool = False
 
 
+# 「幾乎等於看完」的正規化門檻。
+#
+# **這跟播放器的「下一集按鈕門檻」是兩個不同的概念，刻意用兩個常數**：
+# 按鈕要在剩 30～90 秒時就浮出來（使用者要有時間看到它、決定要不要按），
+# 但剩 60 秒絕對不等於看完 —— 片尾曲之後還有片尾彩蛋的片子很多。
+# 把按鈕門檻拿來當 finished 判斷的話，所有影集都會在剩一分鐘時從
+# 「繼續觀看」消失，而使用者根本還沒看完。
+#
+# 這裡要解的是另一個問題：使用者在最後幾秒直接關掉分頁／切走 App，
+# `ended` 沒有觸發，於是 play_state 留著 finished=0 而 position 幾乎等於
+# 片長。那一筆進不了續播（`_resume_at()` 會把它視為從頭播），卻會永遠
+# 留在「繼續觀看」上 —— 一筆點下去會從頭開始播的「繼續觀看」。
+_NEAR_END_SECONDS = 15      # 剩這麼少秒數
+_NEAR_END_RATIO = 0.99      # 或已經播到這個比例
+
+
+def _near_end(position: float, duration: float) -> bool:
+    """已經到了「不正規化成 finished 就會變成殘留紀錄」的程度。"""
+    if duration <= 0:
+        return False
+    return position >= duration - _NEAR_END_SECONDS or position / duration >= _NEAR_END_RATIO
+
+
 @router.post("/progress")
 def save_progress(p: Progress):
+    # 見 _near_end 的說明：非常接近真正結束的進度一律當成看完，
+    # 否則它會以「點下去從頭播」的形式永遠留在繼續觀看上。
+    finished = p.finished or _near_end(p.position, p.duration)
     db.execute(
         """INSERT INTO play_state(file_id, position, duration, finished, updated_at)
            VALUES(?,?,?,?,?)
            ON CONFLICT(file_id) DO UPDATE SET position=excluded.position,
                duration=excluded.duration, finished=excluded.finished,
                updated_at=excluded.updated_at""",
-        (p.file_id, p.position, p.duration, 1 if p.finished else 0, db.now_i()),
+        (p.file_id, p.position, p.duration, 1 if finished else 0, db.now_i()),
     )
     return {"ok": True}
 
@@ -554,18 +613,49 @@ def continue_watching(request: Request, limit: int = 20):
     # play_state 目前不分使用者，所以管理員看過的受限片子會出現在每個人的
     # 「繼續看」裡 —— 這一排是最容易漏掉的洩漏點，因為它不走 /library。
     ff, fa = acl.filter_sql(request, "f.ftp_path")
+    # 影集去重：同一個 media_item 最多一筆。
+    #
+    # **為什麼在 SQL 裡用 window function，而不是先撈 20 筆再用 Python 分組**：
+    # 先 LIMIT 再去重的話，同一部影集的 12 筆續播紀錄會把 20 個名額吃掉 11 個，
+    # 使用者的「繼續觀看」就只剩兩三部片 —— 那正是這一排最沒用的狀態。
+    # LIMIT 一定要作用在去重之後。
+    #
+    # **留哪一集**：ROW_NUMBER 的排序就是「最近實際看過的那一集」——
+    # `p.updated_at DESC`，不是 season／episode 數字最大的那一集。使用者回頭
+    # 看舊集是正常行為（補進度、重看某一集），而他要繼續的是他剛剛在看的那集。
+    # tie-break 用 p.file_id DESC：updated_at 是秒級整數，同一秒寫進兩筆
+    # （快速切集）並非不可能，沒有 tie-break 的話兩次查詢會回不同的答案。
+    #
+    # **分組鍵要用 CASE 而不是直接 f.item_id**：只有 kind='tv' 去重，電影與
+    # 沒有 item_id 的孤兒檔案各自獨立。`'f' || p.file_id` 讓每一個非影集的
+    # 檔案自己一組，所以它的 ROW_NUMBER 永遠是 1，一筆都不會被去掉。
+    #
+    # ACL 的條件留在 CTE 的 WHERE 裡（不是查完再濾）：受限的那幾集連
+    # 候選名單都進不去，所以它們不會佔掉某部影集的那個唯一名額 ——
+    # 濾在外面的話，「最近看的一集剛好受限」會讓整部影集從清單上消失，
+    # 而那本身就是一則情報。
     rows = db.q(
-        f"""SELECT p.file_id, p.position, p.duration, f.filename, f.item_id, f.episode_id,
-                  i.title, i.poster, i.kind, e.season, e.episode
-           FROM play_state p
-           JOIN media_file f ON f.id=p.file_id
-           LEFT JOIN media_item i ON i.id=f.item_id
-           LEFT JOIN episode e ON e.id=f.episode_id
-           WHERE p.finished=0 AND p.position > 30{(' AND ' + ff) if ff else ''}
-           ORDER BY p.updated_at DESC LIMIT ?""", fa + [limit])
+        f"""WITH pending AS (
+              SELECT p.file_id, p.position, p.duration, p.updated_at,
+                     f.filename, f.item_id, f.episode_id,
+                     i.title, i.poster, i.kind, e.season, e.episode,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY CASE WHEN i.kind='tv' AND f.item_id IS NOT NULL
+                                         THEN 'i' || f.item_id
+                                         ELSE 'f' || p.file_id END
+                       ORDER BY p.updated_at DESC, p.file_id DESC) AS rn
+              FROM play_state p
+              JOIN media_file f ON f.id=p.file_id
+              LEFT JOIN media_item i ON i.id=f.item_id
+              LEFT JOIN episode e ON e.id=f.episode_id
+              WHERE p.finished=0 AND p.position > 30{(' AND ' + ff) if ff else ''}
+            )
+            SELECT * FROM pending WHERE rn=1
+            ORDER BY updated_at DESC, file_id DESC LIMIT ?""", fa + [limit])
     out = []
     for r in rows:
         d = dict(r)
+        d.pop("rn", None)
         d["poster_url"] = f"/api/image/{d['poster']}" if d.get("poster") else None
         d["percent"] = round(100 * d["position"] / d["duration"], 1) if d.get("duration") else 0
         out.append(d)
@@ -1434,6 +1524,28 @@ def admin_problems(_: str = Depends(admin_only)):
             "FROM media_file f LEFT JOIN media_item i ON i.id=f.item_id "
             "WHERE f.kf_state='failed' ORDER BY f.id DESC LIMIT 200")],
     }
+
+
+@router.get("/diagnostics/stream")
+def diagnostics_stream(limit: int = Query(default=40, ge=0, le=200),
+                       _: str = Depends(admin_only)):
+    """串流量測（J 第 7 節）：搬運吞吐、分段命中率、ffmpeg 速度。
+
+    **這一支存在的理由是「不要憑感覺調參數」。**手機卡頓時要回答的是
+    「慢在 FTP、慢在 ffmpeg、還是慢在客戶端」，這三種的處方完全不同。
+    前端的 `?debugPlayer=1` 疊圖負責客戶端那一半，這一支負責伺服器這一半。
+    """
+    snap = streamstat.snapshot(limit=limit)
+    snap["transcode_speed_recent"] = hls.recent_speed()
+    snap["chunk_kb"] = int(getattr(settings, "stream_chunk_kb", 256) or 256)
+    return snap
+
+
+@router.post("/diagnostics/stream/reset")
+def diagnostics_stream_reset(_: str = Depends(admin_only)):
+    """把取樣清空，才量得到「從現在開始」的那一段。"""
+    streamstat.reset()
+    return {"ok": True}
 
 
 @router.get("/diagnostics")

@@ -97,6 +97,18 @@ b2 = keyframes.derive_bounds(T, P, 6, duration=13.0, total_size=5000)
 check("太短的尾巴併進前一段", len(b2) == 2 and b2[-1][1] == 13.0, b2)
 check("併進去之後段數不變", all(x[1] - x[0] > 1.0 for x in b2), b2)
 
+# 第一個 keyframe 不在 0 的片源：**上階的時間軸原點必須仍然是 0**。
+# 不補的話上階的 EXTINF 總和會比下階短那 0.5 秒，兩階就變成兩條長度不同的
+# 時間軸 —— 切畫質時 currentTime 會對到另一條軸上，播放位置與 duration 都跳。
+T_LATE = [0.5, 3.7, 6.9, 10.1, 13.3]
+b_late = keyframes.derive_bounds(T_LATE, P, 6, duration=16.0, total_size=5000)
+check("第一個 keyframe 在 0.5 時，第一段仍然從 0 起算",
+      b_late[0][0] == 0.0, b_late)
+check("而且總長仍然等於片長（跟下階的時間軸對得起來）",
+      abs(sum(x[1] - x[0] for x in b_late) - 16.0) < 1e-6, b_late)
+check("兩階的起點與終點一致",
+      (b_late[0][0], b_late[-1][1]) == (0.0, 16.0), b_late)
+
 check("keyframe 不足回空清單", keyframes.derive_bounds([1.0], [0], 6) == [])
 check("沒給 duration 就不補尾巴",
       keyframes.derive_bounds(T, P, 6)[-1][1] == 12.8)

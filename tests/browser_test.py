@@ -52,6 +52,27 @@ for i in range(1, 130):
 # 後台要有東西可看
 db.execute("INSERT INTO media_item(kind,title,sort_title,guess_key,scrape_state,added_at,updated_at)"
            " VALUES('tv','刮不到的片','x','tv::x::0','failed',?,?)", (now, now))
+
+# 影集詳情的版面要有東西可測：兩季各三集，檔名刻意用真實世界那種長度
+# （Reacher.S01E01.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv），
+# 短檔名測不出「長檔名把版面撐破」那一類問題。
+_tv = db.execute(
+    "INSERT INTO media_item(kind,title,sort_title,year,guess_key,scrape_state,overview,"
+    "added_at,updated_at) VALUES('tv','測試影集','ceshi',2022,'tv::ceshi::2022','ok',?,?,?)",
+    ("一段用來把簡介區塞滿的敘述，長度接近真實的 TMDB 簡介。", now, now)).lastrowid
+TV_ITEM = _tv
+for _s in (1, 2):
+    for _e in range(1, 4):
+        _ep = db.execute("INSERT INTO episode(item_id,season,episode,title) VALUES(?,?,?,?)",
+                         (_tv, _s, _e, f"第{_e}集 一個相當長的集數標題用來測試截斷")).lastrowid
+        db.execute(
+            "INSERT INTO media_file(item_id,episode_id,ftp_path,filename,ext,size,duration,"
+            "width,height,video_codec,audio_codec,bitrate,probe_state,play_mode,seen_at,added_at)"
+            " VALUES(?,?,?,?,'mkv',3704000000,3240,1920,1080,'h264','eac3',4000000,"
+            "'ok','hls',?,?)",
+            (_tv, _ep, f"/tv/S{_s:02d}E{_e:02d}.mkv",
+             f"TestShow.S{_s:02d}E{_e:02d}.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv",
+             now, now))
 db.execute("INSERT INTO login_audit(at,event,role,ip) VALUES(?,'success','admin','10.0.0.1')",
            (now,))
 
@@ -234,16 +255,81 @@ async def main():
               r4)
 
         # ---------------- 手機視窗 ----------------
-        print("\n[版面] 375px 寬不能橫捲")
+        # 只測 375px 是不夠的。實測（修正前）有三個寬度會溢出而 375 剛好沒事：
+        # 320px（nav 的七顆分類排不下）、768px 與 1024px（brand + nav +
+        # 250px 搜尋框 + 四顆按鈕合計約 1053px，「管理後台」整顆在畫面外）。
+        # 768／1024 正是 iPad 直向與小筆電，而在那裡被推出去的剛好是管理入口。
+        print("\n[版面] 各種寬度都不能橫捲")
+        WIDTHS = (320, 375, 390, 414, 430, 560, 768, 1024)
         for path in ("/", "/player?file=1"):
             p2 = await ctx.new_page()
             await p2.goto(BASE + path, wait_until="domcontentloaded")
-            await p2.set_viewport_size({"width": 375, "height": 780})
             await p2.wait_for_timeout(800)
+            for w in WIDTHS:
+                await p2.set_viewport_size({"width": w, "height": 780})
+                await p2.wait_for_timeout(220)
+                over = await p2.evaluate(
+                    "() => document.documentElement.scrollWidth"
+                    " - document.documentElement.clientWidth")
+                check(f"{path} @{w}px 沒有橫向捲動（溢出 {over}px）", over <= 1, over)
+            # 手機橫向：可視高度只剩 3xx px
+            await p2.set_viewport_size({"width": 780, "height": 380})
+            await p2.wait_for_timeout(220)
             over = await p2.evaluate(
-                "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
-            check(f"{path} 沒有橫向捲動（溢出 {over}px）", over <= 1, over)
+                "() => document.documentElement.scrollWidth"
+                " - document.documentElement.clientWidth")
+            check(f"{path} 橫向 780x380 沒有橫向捲動（溢出 {over}px）", over <= 1, over)
             await p2.close()
+
+        # ---------------- 影集詳情彈窗 ----------------
+        # 這是使用者在手機上待最久、也最容易跑版的畫面：
+        # season → episodes → files → fileRow()，每一列有檔名、資訊、pill
+        # 與三顆按鈕。原本 .file-row 是一個沒有 flex-wrap 的 flex row，
+        # 於是 375px 以下 `.n` 被壓到幾乎沒有寬度、資訊一個字一行地往下長，
+        # 而「重新分析」那顆按鈕的右緣會跑到容器外面（實測 320px：327 > 320）。
+        print("\n[版面] 影集詳情彈窗（fileRow）在手機上不能跑版")
+        p3 = await ctx.new_page()
+        await p3.goto(BASE + "/", wait_until="domcontentloaded")
+        await p3.wait_for_timeout(800)
+        PROBE = """
+        () => {
+          const doc = document.documentElement;
+          const out = { overflow: doc.scrollWidth - doc.clientWidth,
+                        rows: 0, tall: [], escaped: [], small: [] };
+          for (const r of document.querySelectorAll('.file-row')) {
+            const rb = r.getBoundingClientRect();
+            out.rows++;
+            // 一列超過 200px 高 = 文字被壓成一個字一行（原本的壞法）
+            if (rb.height > 200) out.tall.push(Math.round(rb.height));
+            for (const b of r.querySelectorAll('.btn')) {
+              const bb = b.getBoundingClientRect();
+              if (bb.right > rb.right + 1 || bb.left < rb.left - 1)
+                out.escaped.push(b.textContent.trim());
+              // 手機上的觸控目標要夠大
+              if (window.innerWidth <= 560 && bb.height < 38)
+                out.small.push(Math.round(bb.height));
+            }
+          }
+          return out;
+        }
+        """
+        for w in (320, 375, 390, 414, 430, 560, 768):
+            await p3.set_viewport_size({"width": w, "height": 780})
+            await p3.wait_for_timeout(200)
+            await p3.evaluate(f"() => openItem({TV_ITEM})")
+            await p3.wait_for_timeout(400)
+            r = await p3.evaluate(PROBE)
+            check(f"詳情 @{w}px 有畫出集數列（{r['rows']} 列）", r["rows"] > 0, r)
+            check(f"詳情 @{w}px 沒有橫向捲動（溢出 {r['overflow']}px）",
+                  r["overflow"] <= 1, r)
+            check(f"詳情 @{w}px 按鈕沒有跑出容器", not r["escaped"], r["escaped"])
+            check(f"詳情 @{w}px 沒有被壓成一個字一行的列", not r["tall"], r["tall"])
+            if w <= 560:
+                check(f"詳情 @{w}px 按鈕的觸控目標夠大（≥38px）",
+                      not r["small"], r["small"])
+            await p3.evaluate("() => closeModal()")
+            await p3.wait_for_timeout(120)
+        await p3.close()
 
         # ---------------- 管理後台 ----------------
         print("\n[G] 管理後台")

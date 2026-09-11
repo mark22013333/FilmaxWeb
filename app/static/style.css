@@ -201,15 +201,71 @@ body.modal-open{overflow:hidden}
   background:rgba(0,0,0,.55);display:grid;place-items:center;font-size:18px;color:#fff}
 .close:hover{background:rgba(0,0,0,.8)}
 
+/* ---------- 檔案列 ----------
+
+   `.file-row` 是整個介面重用最多的一個結構：影集的每一集、電影的每一個
+   檔案、統計頁的每一項、硬體資訊、TMDB 手動比對的候選、後台的 FTP 目錄。
+   所以這裡的版面問題會**同時出現在六個地方**，也因此只能在這裡修一次。
+
+   ## 原本在手機上壞掉的原因
+
+   它是一個沒有 flex-wrap 的 flex row：名稱 ＋ pill ＋ 播放 ＋ 下載 ＋
+   重新分析。桌機放得下，手機放不下 —— 而 flex 的預設行為是把**能縮的
+   縮到不能再縮**：`.n` 有 min-width:0 所以它一路被壓到幾乎沒有寬度，
+   而 `.n small`（畫質 · 編碼 · 容量 · 時長）沒有 nowrap，於是一個字
+   一行地往下長，把那一列撐成十幾行高，按鈕則擠成一團互相蓋住。
+
+   ## 這次的作法
+
+   1. `flex-wrap:wrap` ＋ `.n{flex:1 1 100%}`：放不下時檔名自己佔一整行，
+      按鈕整組掉到下一行 —— 不是把檔名壓扁。
+   2. `.n small` 補上 `min-width:0` 與可換行的 flex 排版，長檔名截斷而不是
+      把容器撐破。
+   3. 按鈕組包在 `.acts` 裡（HTML 端配合），它自己是一個會換行的 flex，
+      這樣三顆按鈕不會有一顆被推出容器外。
+   4. 觸控目標：手機上按鈕 min-height 提到 40px（原本 33px 左右）。
+
+   刻意**不用 @media 切成兩套版面**：真正的原因是空間不夠，而不是「螢幕
+   小於某個數字」—— 用 wrap 的話，同一列在窄的 modal 裡、在橫向手機上、
+   在桌機縮小視窗時全都自動正確，不必去猜斷點。320px 到 430px 之間也就
+   不會有某個寬度剛好壞掉。 */
 .file-row{
-  display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:10px;
+  display:flex;align-items:center;gap:10px 12px;flex-wrap:wrap;
+  padding:10px 12px;border-radius:10px;
   border:1px solid var(--line);background:var(--panel);margin-bottom:8px;transition:.15s;
 }
 .file-row:hover{border-color:#39415a;background:var(--panel-2)}
-.file-row .n{flex:1;min-width:0}
+/* 名稱區：有空間時吃掉剩餘寬度，不夠時自己佔滿一行。
+   flex-basis 用 min(100%, 15rem)：桌機上它只是「至少這麼寬」，
+   手機上 100% 勝出，於是按鈕整組換行。 */
+.file-row .n{flex:1 1 min(100%, 15rem);min-width:0}
 .file-row .n b{display:block;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.file-row .n small{color:var(--dim);font-size:11.5px}
-.pill{padding:2px 7px;border-radius:5px;font-size:11px;font-weight:700;background:#243049;color:var(--blue)}
+/* small 原本沒有任何約束，長資訊會一個字一行地撐開整列。
+   改成可換行的 flex：資訊之間斷得開，但每一段自己不會被拆散。 */
+.file-row .n small{
+  display:block;color:var(--dim);font-size:11.5px;
+  min-width:0;overflow-wrap:anywhere;
+}
+/* 按鈕組。跟名稱同一行時靠右，換行後靠左（跟檔名對齊，看起來才是一組）。 */
+.file-row .acts{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  margin-left:auto;min-width:0;
+}
+/* 換行之後 margin-left:auto 會把它推到右邊、跟檔名不對齊 —— 改回靠左。
+   用 :has() 判斷不了「有沒有換行」，所以改用容器查詢式的作法：
+   窄到一定程度時就一定換行了，那時取消 auto。 */
+@media(max-width:560px){
+  .file-row .acts{margin-left:0;width:100%}
+  /* 手機上按鈕平分寬度，觸控目標才夠大（三顆按鈕各約 1/3 列寬）。
+     min-height 40px 是觸控的下限，原本的 padding 只做得到約 33px。 */
+  .file-row .acts .btn{flex:1 1 auto;min-height:40px;display:inline-flex;
+    align-items:center;justify-content:center}
+  .file-row{padding:11px 12px}
+}
+.pill{
+  padding:2px 7px;border-radius:5px;font-size:11px;font-weight:700;
+  background:#243049;color:var(--blue);flex:none;white-space:nowrap;
+}
 .pill.direct{background:#173a2c;color:var(--green)}
 .pill.warn{background:#3a2a17;color:#ffb648}
 .season-h{margin:18px 0 10px;font-size:14px;font-weight:800;color:var(--accent)}
@@ -632,3 +688,108 @@ body.viewer #btnStats { display: none; }
 .st.approved{background:#14211a;color:var(--green,#4caf7d)}
 .st.rejected,.st.disabled{background:#241618;color:#e08a8a}
 .st.owner{background:#1b2740;color:#7fa8e8}
+
+/* ---------- 手機版的 Modal 與檔案列 ----------
+
+   這一段補的是原本完全沒有行動版覆寫的幾個地方。`@media(max-width:720px)`
+   已經處理了 header／grid／hero，但 **modal 的內外距、overlay 的留白、
+   長標題與 safe-area 沒有人管** —— 而詳情彈窗正是影集使用者待最久的畫面。
+
+   為什麼把 overlay 的 padding 收掉：桌機的 `padding:40px 20px` 在 375px 的
+   手機上等於左右各吃掉 20px、上下各 40px，modal 只剩 335px 寬，裡面的
+   `.modal-body{padding:22px 26px}` 再吃 52px —— 檔案列只剩 283px，
+   三顆按鈕加 pill 無論怎麼排都放不下。改成幾乎滿版，內容才有呼吸空間。
+
+   safe-area：overlay 是 position:fixed，在有瀏海的手機上橫向時左右會被
+   圓角與相機挖掉一塊，底部直向時會被 home indicator 壓到。 */
+@media(max-width:720px){
+  .overlay{
+    padding:12px max(8px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-bottom))
+            max(8px, env(safe-area-inset-right));
+  }
+  .modal{border-radius:14px}
+  .modal-body{padding:16px 14px 22px}
+  .hero-in h2{font-size:21px}
+  /* 長片名要能換行（原本沒有限制，英文長標題會撐破 hero） */
+  .hero-in h2,.hero-in .sub{overflow-wrap:anywhere}
+  .close{
+    /* 觸控目標放大到 40px，並避開瀏海 */
+    width:40px;height:40px;top:max(10px, env(safe-area-inset-top));right:12px;font-size:20px;
+  }
+  /* 季標題在手機上要更明顯 —— 它是使用者用來定位「現在看到第幾季」的唯一
+     線索，而集數列表很長。順便黏在捲動頂端。 */
+  .season-h{
+    position:sticky;top:0;z-index:2;margin:16px 0 8px;padding:6px 0;
+    background:var(--bg-2);font-size:13.5px;
+  }
+}
+/* 更窄的機器（320～375px）：pill 換到檔名下面自己一行，
+   不要跟檔名爭那條線上的寬度。 */
+@media(max-width:400px){
+  .file-row{gap:8px 10px}
+  .file-row .n{flex:1 1 100%}
+  .file-row .pill{order:3}
+  .file-row .acts{order:4}
+  .modal-body{padding:14px 11px 20px}
+}
+/* 手機橫向：可視高度很矮，modal 要能整個捲得到，
+   而 hero 的 min-height:260px 會把內容整個推出畫面外。 */
+@media(max-height:480px) and (orientation:landscape){
+  .overlay{padding:8px}
+  .hero{min-height:0}
+  .hero-in{flex-direction:row;padding:14px}
+  .hero-in .p{width:78px}
+  .plot{max-height:88px;overflow-y:auto}
+}
+
+/* ---------- 頂部工具列的響應式 ----------
+
+   原本只有 `@media(max-width:720px)` 一段，而它只調了 padding 與搜尋框寬度。
+   實測（Chromium）下有三個寬度會橫向溢出，**這是本來就有的問題**，
+   不是這次改檔案列造成的：
+
+     320px   nav 的七顆分類按鈕排不下，最後一顆「文件」跑到 335px（畫面才 320）
+     768px   還沒進 720 斷點，但 brand + nav + 250px 搜尋框 + 四顆按鈕
+             合計約 1053px，右邊三顆整個在畫面外 —— 平板直向完全按不到「管理後台」
+     1024px  同上，只差「管理後台」那一顆
+
+   768 與 1024 特別值得修：那是 iPad 直向與小筆電的寬度，而在那裡溢出的
+   剛好是管理入口 —— 使用者會以為功能不見了。
+
+   作法跟 .file-row 一樣是「讓它自己換行」，不是再多切幾個斷點：
+     · header 一律 flex-wrap:wrap（原本只有 ≤720px 才 wrap）
+     · nav 自己也 wrap，並且在窄螢幕可橫向捲（七個分類在 320px 排不成一行）
+     · 搜尋框從固定 250px 改成可伸縮，最小 120px
+   這樣 320～1440 之間任何寬度都不會溢出，不必去猜使用者的機型。 */
+header{flex-wrap:wrap}
+nav{flex-wrap:wrap;min-width:0}
+/* 搜尋框：有空間時維持原本的寬度，不夠時縮，再不夠就整個換行。
+   桌機的視覺沒有改變（1440px 下它仍然是 250px / focus 320px）。 */
+.search{flex:0 1 auto;min-width:0}
+.search input{width:250px;max-width:100%}
+.search input:focus{width:320px;max-width:100%}
+
+@media(max-width:1100px){
+  /* 平板與小筆電：按鈕列自己成一行，不要把 nav 擠出畫面 */
+  header{gap:10px 12px}
+  .spacer{flex:1 1 auto}
+  .search input{width:190px}
+  .search input:focus{width:230px}
+}
+@media(max-width:560px){
+  /* 手機：七個分類排不成一行也不要換成兩行（會把內容推下去太多），
+     改成可橫向捲的一列 —— 捲的是 nav 自己，不是整個頁面。 */
+  nav{
+    flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;
+    flex:1 1 100%;-webkit-overflow-scrolling:touch;
+  }
+  nav::-webkit-scrollbar{display:none}
+  nav button{flex:none;padding:7px 11px}
+  .search{flex:1 1 100%}
+  .search input,.search input:focus{width:100%}
+  /* 瀏海與圓角：header 是 sticky，橫向時左右會被挖掉一塊 */
+  header{
+    padding-left:max(14px, env(safe-area-inset-left));
+    padding-right:max(14px, env(safe-area-inset-right));
+  }
+}

@@ -13,6 +13,7 @@ import queue
 import re
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterator, List, Optional, Tuple
@@ -317,8 +318,18 @@ class FtpReadStream:
     def read(self, n: int) -> bytes:
         return self._sock.recv(n)
 
-    def iter_chunks(self, chunk_size: int = 256 * 1024, limit: Optional[int] = None) -> Iterator[bytes]:
+    def iter_chunks(self, chunk_size: Optional[int] = None,
+                    limit: Optional[int] = None) -> Iterator[bytes]:
+        """一塊一塊搬。`chunk_size` 不給就用 STREAM_CHUNK_KB（預設 256 KiB）。
+
+        **預設值刻意沒有改。**規格 J 第 7 節寫得很明白：看到 256 KiB 就改成
+        4 MiB 然後宣稱效能修好了，那是把運氣當證據。這裡做的是讓它「可以被調」
+        並且「被量到」—— 調成多少要看 /api/diagnostics/stream 的 ftp_mbps。
+        """
+        if chunk_size is None:
+            chunk_size = max(16, int(getattr(settings, "stream_chunk_kb", 256) or 256)) * 1024
         sent = 0
+        t0 = time.monotonic()
         try:
             while True:
                 want = chunk_size if limit is None else min(chunk_size, limit - sent)
@@ -330,6 +341,13 @@ class FtpReadStream:
                 sent += len(data)
                 yield data
         finally:
+            # 取樣寫在 finally：中途被瀏覽器切斷（拖進度條、換畫質）也要留下
+            # 那一段的吞吐 —— 那正是最需要看的情境。
+            try:
+                from . import streamstat
+                streamstat.record_ftp(self.path, sent, time.monotonic() - t0)
+            except Exception:
+                pass
             self.close()
 
     def close(self) -> None:
