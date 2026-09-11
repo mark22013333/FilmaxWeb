@@ -228,6 +228,16 @@ def derive_bounds(times: List[float], positions: List[int], seg_seconds: float,
     的內容 —— 漏掉它的話播放清單會短少那幾秒，而「最後幾秒播不到」是很難
     察覺的失效。太短的尾巴（不到半個分段）併進前一段，不要在清單裡留一個
     0.x 秒的分段。
+
+    **開頭同理，而且後果更嚴重。**第一個 keyframe 不保證落在 0（有些片源
+    第一張 I-frame 在 0.3～1 秒之後）。照原樣切的話上階的第一段從 0.5 開始，
+    整份播放清單的 EXTINF 總和就比下階少了那 0.5 秒 —— 於是**同一部片在
+    兩階有兩條長度不同的時間軸**：hls.js 在切階時會把 currentTime 對到另一
+    條軸上，播放位置與 duration 都會跳，而 seek 到 50% 也會落在兩個不同的
+    地方。這正是「切了畫質之後進度亂掉」那一類問題最難查的來源。
+
+    所以第一段一律從 0 起算（`-ss 0` 對 copy 模式也成立 —— 0 之後的第一張
+    I-frame 就是 times[0]，ffmpeg 本來就會從那裡開始）。
     """
     n = len(times)
     if n < 2:
@@ -240,6 +250,10 @@ def derive_bounds(times: List[float], positions: List[int], seg_seconds: float,
             j += 1
         bounds.append((times[i], times[j], positions[j] - positions[i]))
         i = j
+    # 開頭補到 0：兩階的時間軸原點必須一致（見 docstring）。
+    if bounds and bounds[0][0] > 0:
+        _, e0, b0 = bounds[0]
+        bounds[0] = (0.0, e0, b0)
     tail_start = times[-1]
     tail_bytes = max((total_size or positions[-1]) - positions[-1], 0)
     if duration and duration - tail_start > 0.1:

@@ -343,10 +343,22 @@ check("ac3 要轉 AAC（瀏覽器不吃 ac3）",
 check("-ss 在 -i 前面（輸入端 seek；copy 只能從 keyframe 起頭）",
       cmd.index("-ss") < cmd.index("-i"), cmd)
 check("-ss 就是邊界表給的時間", cmd[cmd.index("-ss") + 1] == "7.250")
-check("非單調 DTS 的片源要能過（make_zero 而不是拒收）",
-      cmd[cmd.index("-avoid_negative_ts") + 1] == "make_zero", cmd)
+# **這一條是回歸測試，不是風格偏好。**原本寫的是 make_zero，而 make_zero
+# 是在 -output_ts_offset 之後才套用的 —— 它會把 offset 剛寫進去的絕對時間戳
+# 整個抹成 0。實測（file 433，2:33:55）：1540 段每段都從 0 起算，hls.js 只好
+# 一段接一段串起來，MediaSource 的 duration 變成 1540 × 4.816 = 7416 秒，
+# 播放器右下角就從 2:33:55 變成 2:03:36，seek 到 95% 還會直接 ended。
+# 而下階 transcode 沒有這個旗標 —— 所以兩階的時間軸原本是對不起來的。
+check("上階不可以用 make_zero（它會抹掉 output_ts_offset 的絕對時間戳）",
+      cmd[cmd.index("-avoid_negative_ts") + 1] == "disabled", cmd)
 check("時間軸放回這一段該有的位置",
       cmd[cmd.index("-output_ts_offset") + 1] == "7.250")
+# 兩階必須用同一種時間戳策略，否則切畫質時 currentTime 會對到另一條軸上
+_tr = media.build_transcode_cmd(fid, 7.25, 7.25, 720, None)
+check("兩階都把時間軸放回絕對位置（切畫質才不會跳）",
+      _tr[_tr.index("-output_ts_offset") + 1] == "7.250", _tr)
+check("下階本來就沒有 avoid_negative_ts，上階也不該再靠它平移",
+      "make_zero" not in cmd and "make_zero" not in _tr, (cmd, _tr))
 for flag in ("-vf", "-crf", "-cq", "-preset", "-force_key_frames", "-sc_threshold",
              "-profile:v", "-b:v", "-maxrate"):
     check(f"remux 不能出現 {flag}（出現就不是零損失了）", flag not in cmd, cmd)
