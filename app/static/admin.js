@@ -419,18 +419,31 @@ function wireAcl(el, ac) {
    那個屬性只有 Firefox 認（見 wireAcl 裡那段註解）。 */
 
 /** 一列的主行文字。純函式，測試與渲染共用。 */
-function fpLabel(it) {
+/** 拆成三份而不是一串字：標題、集數、技術規格。
+ *
+ *  **為什麼要拆。**原本全部串成「沙丘：第二部 · 2024 · 4K · 166 分」一行等寬
+ *  同色的字，掃起來是一團灰 —— 眼睛要找的是片名，卻得先讀過年份與規格。
+ *  拆開之後片名可以用正常字重與 --text，規格降成小字 chip，一眼就分得出
+ *  「哪一列是我要的片」與「這一列是哪個版本」。 */
+function fpParts(it) {
   const pad2 = n => String(n).padStart(2, '0');
-  const seg = [];
-  // 沒刮到的孤兒檔沒有 title，退回檔名去掉副檔名 —— 主行空著比什麼都糟。
-  seg.push(it.title || (it.filename || '').replace(/\.[^.]+$/, '') || `#${it.id}`);
-  if (it.season != null && it.episode != null) seg.push(`S${pad2(it.season)}E${pad2(it.episode)}`);
-  if (it.kind === 'movie' && it.year) seg.push(String(it.year));
-  if (it.height) seg.push(it.height >= 2160 ? '4K' : it.height + 'p');
+  // 沒刮到的孤兒檔沒有 title，退回檔名去掉副檔名 —— 標題空著比什麼都糟。
+  const title = it.title || (it.filename || '').replace(/\.[^.]+$/, '') || `#${it.id}`;
+  const ep = (it.season != null && it.episode != null)
+    ? `S${pad2(it.season)}E${pad2(it.episode)}` : '';
+  const meta = [];
+  if (it.kind === 'movie' && it.year) meta.push(String(it.year));
+  if (it.height) meta.push(it.height >= 2160 ? '4K' : it.height + 'p');
   // 片長一律用「N 分」而不是 dur()：dur() 超過一小時會變成「1 小時 55 分」，
   // 選單裡長度不一很難掃。選單是拿來比對的，數字比句子好用。
-  if (it.duration) seg.push(Math.round(it.duration / 60) + ' 分');
-  return seg.join(' · ');
+  if (it.duration) meta.push(Math.round(it.duration / 60) + ' 分');
+  return { title, ep, meta };
+}
+
+/** 已選之後顯示在輸入框裡的那一行（只有這裡需要串成一串）。 */
+function fpLabel(it) {
+  const p = fpParts(it);
+  return [p.title, p.ep, ...p.meta].filter(Boolean).join(' · ');
 }
 
 /** 檔名太長時**從中間**省略。
@@ -519,21 +532,25 @@ function wireFilePick(el, { id, onPick = null, initial = null }) {
     }
     let prev = '';
     list.innerHTML = rows.map((it, n) => {
-      const main = fpLabel(it);
-      const dup = main === prev;     // 跟上一列主行一樣 → 檔名是唯一的區別
-      prev = main;
+      const p = fpParts(it);
+      const dup = p.title === prev;   // 跟上一列同一部片 → 檔名是唯一的區別
+      prev = p.title;
       const kind = FP_KIND[it.kind];
       return `<div class="fpick-opt${dup ? ' dup' : ''}" role="option"
                    id="${esc(id)}-o${n}" data-n="${n}" aria-selected="false">
         <div class="fpick-main">
+          <span class="fpick-title">${esc(p.title)}</span>
+          ${p.ep ? `<span class="fpick-ep">${esc(p.ep)}</span>` : ''}
           ${kind ? `<span class="fpick-kind">${esc(kind)}</span>` : ''}
-          <span class="fpick-name">${esc(main)}</span>
           ${it.probe_state && it.probe_state !== 'ok'
             ? '<span class="fpick-warn">未分析</span>' : ''}
+        </div>
+        <div class="fpick-sub">
+          <span class="fpick-file" title="${esc(it.filename || '')}">${
+            esc(fpShortName(it.filename))}</span>
+          ${p.meta.map(m => `<span class="fpick-tag">${esc(m)}</span>`).join('')}
           <span class="fpick-id">#${it.id}</span>
         </div>
-        <div class="fpick-file" title="${esc(it.filename || '')}">${
-          esc(fpShortName(it.filename))}</div>
       </div>`;
     }).join('') + (more
       ? '<div class="fpick-more">還有更多，再打幾個字縮小範圍</div>' : '');
