@@ -443,7 +443,7 @@ function fpShortName(name) {
 
 const FP_KIND = { home: '家庭', jav: 'JAV' };
 
-function filePick({ id, placeholder = '搜尋片名或檔名…', value = null }) {
+function filePick({ id, placeholder = '選擇影片（可直接打字搜尋）…', value = null }) {
   const v = value ? fpLabel(value) : '';
   return `
   <div class="fpick" id="${esc(id)}">
@@ -455,6 +455,11 @@ function filePick({ id, placeholder = '搜尋片名或檔名…', value = null }
              value="${esc(v)}">
       <button type="button" class="fpick-x" id="${esc(id)}-x" tabindex="-1"
               aria-label="清除已選的檔案"${value ? '' : ' hidden'}>✕</button>
+      <!-- 這個箭頭不只是裝飾：它是「這是一個下拉選單，點了會有東西掉下來」
+           的唯一視覺線索。沒有它，一個空的框就只是一個要你自己打字的輸入框
+           —— 而那正是這整件事要取代的東西。 -->
+      <button type="button" class="fpick-caret" id="${esc(id)}-caret" tabindex="-1"
+              aria-label="展開清單">▾</button>
     </div>
     <div class="fpick-pop" id="${esc(id)}-pop" hidden>
       <div class="fpick-list" id="${esc(id)}-list" role="listbox" aria-label="搜尋結果"></div>
@@ -474,6 +479,7 @@ function wireFilePick(el, { id, onPick = null, initial = null }) {
   const pop = root.querySelector('.fpick-pop');
   const list = root.querySelector('.fpick-list');
   const xbtn = root.querySelector('.fpick-x');
+  const caret = root.querySelector('.fpick-caret');
   const picked = root.querySelector('.fpick-picked');
   const live = root.querySelector('.fpick-live');
 
@@ -491,6 +497,7 @@ function wireFilePick(el, { id, onPick = null, initial = null }) {
   const setOpen = v => {
     open = v;
     pop.hidden = !v;
+    root.dataset.open = v ? '1' : '0';      // 箭頭靠這個轉方向
     input.setAttribute('aria-expanded', v ? 'true' : 'false');
     if (!v) { cur = -1; input.removeAttribute('aria-activedescendant'); }
   };
@@ -501,8 +508,12 @@ function wireFilePick(el, { id, onPick = null, initial = null }) {
   const paint = (rows, more) => {
     items = rows;
     if (!rows.length) {
-      paintMsg(`沒有符合「<b>${esc(input.value.trim())}</b>」的檔案。
-        <div class="fpick-hint">片名、原文片名、檔名都會找。試試少打幾個字。</div>`);
+      const q = input.value.trim();
+      // 沒打字卻什麼都沒有 = 片庫是空的，不要說「沒有符合『』的檔案」。
+      paintMsg(q && !sel
+        ? `沒有符合「<b>${esc(q)}</b>」的檔案。
+           <div class="fpick-hint">片名、原文片名、檔名都會找。試試少打幾個字。</div>`
+        : '片庫裡還沒有任何檔案。<div class="fpick-hint">掃描完成後這裡就會有東西。</div>');
       say('沒有符合的檔案');
       return;
     }
@@ -612,7 +623,24 @@ function wireFilePick(el, { id, onPick = null, initial = null }) {
     ask(input.value.trim());
   };
 
-  input.onfocus = () => { if (items.length) setOpen(true); };
+  /* **點一下就要有清單掉下來。**這是「下拉選單」與「搜尋框」的差別，
+     也是這個元件存在的理由 —— 一個點了沒反應的空框，跟原本那個要你自己
+     去別的頁面抄 id 回來貼的輸入框，對使用者來說是同一個東西。
+
+     所以 focus／click／箭頭三條路都走同一個 openList()：已經有結果就直接
+     開，沒有就先去要一批回來（q 空白 = 最近加入的 30 筆）。 */
+  const openList = () => {
+    if (open) return;
+    // **已經選好了又點開 = 他想換一個。**這時候清單要回到完整的那一份，
+    // 不是上一次搜尋剩下的那三筆 —— 選單裡只剩自己，看起來像「沒有別的可選」。
+    if (sel) { lastQ = null; items = []; ask('', true); return; }
+    if (items.length) { setOpen(true); return; }
+    ask(input.value.trim(), true);
+  };
+
+  input.onfocus = openList;
+  input.onclick = openList;
+  caret.onclick = () => { if (open) setOpen(false); else { input.focus(); openList(); } };
 
   input.onkeydown = e => {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -1056,7 +1084,7 @@ TABS.playback = async el => {
         同一段影片跑好幾種設定並計時，用來找出是哪一個設定拖慢的。
         倍速低於 1 就代表播放會卡。</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        ${filePick({ id: 'benchPick', placeholder: '搜尋要實測的影片…' })}
+        ${filePick({ id: 'benchPick', placeholder: '選擇要實測的影片…' })}
         <button class="btn" id="bBench" disabled>開始實測</button>
       </div>
       <div id="benchOut" style="margin-top:12px"></div>
@@ -1210,7 +1238,7 @@ async function renderCache() {
     <!-- 這一列的選擇器是給**表格外**的檔案用的：下面的表格只列最大的 N 個，
          被截斷的那些原本完全沒有入口（預備要打 id、清除根本沒有）。 -->
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
-      ${filePick({ id: 'warmPickSel', placeholder: '搜尋任何一支影片…', value: warmSel })}
+      ${filePick({ id: 'warmPickSel', placeholder: '選擇影片…', value: warmSel })}
       <button class="btn" id="bWarmPick"${warmSel ? '' : ' disabled'}>預備這一支⋯</button>
       <button class="btn" id="bClearOne"${warmSel ? '' : ' disabled'}>清除它的快取</button>
       <span style="flex:1"></span>

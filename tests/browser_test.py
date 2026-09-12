@@ -534,6 +534,24 @@ async def main():
               not fp["numberInputs"], fp["numberInputs"])
         check("還沒選檔案時「開始實測」是停用的（不是按了才被罵）", fp["btnDisabled"], fp)
 
+        # **這是「下拉選單」與「搜尋框」的分界線，不是可有可無的體驗細節。**
+        # 第一版只在打字之後才顯示清單 —— 點下去沒有任何反應，於是它看起來
+        # 就只是個要你自己打字的輸入框，而那正是這整件事要取代的東西。
+        # 什麼都不打、只點一下，就必須有東西掉下來。
+        await pg2.evaluate("""() => {
+            const i = document.querySelector('#benchPick .fpick-input');
+            i.dispatchEvent(new MouseEvent('click', { bubbles: true })); i.focus();
+        }""")
+        await pg2.wait_for_timeout(900)
+        drop = await pg2.evaluate("""() => ({
+            open: !document.querySelector('#benchPick .fpick-pop').hidden,
+            n: document.querySelectorAll('#benchPick .fpick-opt').length,
+            caret: !!document.querySelector('#benchPick .fpick-caret'),
+        })""")
+        check("什麼都不打、點一下就掉出清單（這才叫下拉選單）",
+              drop["open"] and drop["n"] > 0, drop)
+        check("有展開箭頭（「這裡有東西可以掉下來」的視覺線索）", drop["caret"], drop)
+
         await pg2.evaluate("""() => {
             const i = document.querySelector('#benchPick .fpick-input');
             i.value = 'a'; i.dispatchEvent(new Event('input', { bubbles: true }));
@@ -585,6 +603,21 @@ async def main():
         check("選中之後看得到選了什麼（片名摘要 + 檔名）",
               len(picked["text"]) > 0 and len(picked["file"].strip()) > 0, picked)
         check("選了才能按「開始實測」", picked["btnOk"], picked)
+
+        # 選好了再點開 = 他想換一個。清單要回到完整那一份，不是上一次搜尋
+        # 剩下的那幾筆 —— 選單裡只剩自己，看起來像「沒有別的可選」。
+        await pg2.evaluate("""() => {
+            const i = document.querySelector('#benchPick .fpick-input');
+            i.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }""")
+        await pg2.wait_for_timeout(900)
+        again = await pg2.evaluate("""() => ({
+            n: document.querySelectorAll('#benchPick .fpick-opt').length,
+            stillSelected: !document.querySelector('#bBench').disabled,
+        })""")
+        check("選好之後再點開，清單回到完整的那一份（不是只剩自己）",
+              again["n"] > 1, again)
+        check("而且選擇還在（點開不等於取消）", again["stillSelected"], again)
 
         await pg2.press("#benchPick .fpick-input", "Escape")
         await pg2.wait_for_timeout(150)

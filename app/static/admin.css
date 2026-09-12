@@ -312,17 +312,28 @@ table.t tr:last-child td{border-bottom:none}
 .fpick{position:relative;flex:1 1 320px;min-width:0}
 .fpick-field{position:relative;display:flex;align-items:center}
 .fpick-input{
-  width:100%;padding:9px 34px 9px 11px;border-radius:9px;min-height:40px;
+  width:100%;padding:9px 58px 9px 11px;border-radius:9px;min-height:40px;
   background:var(--bg-2);border:1px solid var(--line);color:var(--text);outline:none;
 }
 .fpick-input:focus{border-color:var(--accent)}
 .fpick-input:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* 輸入框右邊的兩顆：✕（清除，只在已選時出現）與 ▾（展開）。
+   padding-right 要留 58px 讓兩顆都放得下，不然長檔名會壓到它們。 */
 .fpick-x{
-  position:absolute;right:5px;width:28px;height:28px;border-radius:7px;
+  position:absolute;right:29px;width:26px;height:26px;border-radius:7px;
   display:grid;place-items:center;color:var(--dim);font-size:13px;
   background:none;border:0;cursor:pointer;
 }
 .fpick-x:hover{background:var(--panel-2);color:var(--text)}
+/* **這個箭頭是「我是下拉選單」的唯一視覺線索。**沒有它，一個空的框
+   看起來就只是個要你自己打字的輸入框 —— 而那正是要被取代的東西。 */
+.fpick-caret{
+  position:absolute;right:4px;width:24px;height:26px;border-radius:7px;
+  display:grid;place-items:center;color:var(--muted);font-size:11px;
+  background:none;border:0;cursor:pointer;transition:transform .15s;
+}
+.fpick-caret:hover{color:var(--text)}
+.fpick[data-open="1"] .fpick-caret{transform:rotate(180deg)}
 
 /* 浮層。z-index 30 = 在 savebar(40) 之下 —— 選檔案的時候讓「有未儲存的變更」
    那條列蓋過來是對的，那是更重要的全域狀態。 */
