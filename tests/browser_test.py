@@ -509,10 +509,117 @@ async def main():
         await pg2.click(".sidenav button[data-tab='playback']")
         await pg2.wait_for_selector("#encSel", timeout=8000)
         for sel, label in (("#encSel", "編碼器選單"), ("#bEnc", "編碼器診斷鈕"),
-                           ("#benchId", "轉碼實測輸入"), ("#bBench", "轉碼實測鈕"),
+                           ("#benchPick", "轉碼實測的檔案選擇器"), ("#bBench", "轉碼實測鈕"),
                            ("#bGpu", "GPU 查詢鈕"), ("#bProbe", "FTP 併發量測鈕"),
                            ("#bCache", "清快取鈕")):
             check(f"{label}在", await pg2.locator(sel).count() == 1)
+
+        # ---- 檔案選擇器 ----
+        # 這一段要守住的不變量是「**不讓人手打 file_id**」。手打的失敗方式很安靜：
+        # 打錯一個數字不會報錯，而是對另一支存在的片跑了一次好幾分鐘的實測，
+        # 畫面上有數字、有倍速，看起來完全正常，只是答非所問。
+        fp = await pg2.evaluate("""() => {
+            const r = document.querySelector('#benchPick');
+            const inp = r && r.querySelector('.fpick-input');
+            return {
+              role: inp && inp.getAttribute('role'),
+              expanded: inp && inp.getAttribute('aria-expanded'),
+              numberInputs: [...document.querySelectorAll('#tab-playback input[type=number]')]
+                              .map(i => i.id),
+              btnDisabled: document.querySelector('#bBench').disabled,
+            };
+        }""")
+        check("轉碼實測改成 combobox", fp["role"] == "combobox", fp)
+        check("播放頁沒有可以手打 file_id 的數字欄位了",
+              not fp["numberInputs"], fp["numberInputs"])
+        check("還沒選檔案時「開始實測」是停用的（不是按了才被罵）", fp["btnDisabled"], fp)
+
+        await pg2.evaluate("""() => {
+            const i = document.querySelector('#benchPick .fpick-input');
+            i.value = 'a'; i.dispatchEvent(new Event('input', { bubbles: true }));
+        }""")
+        await pg2.wait_for_timeout(900)     # debounce 300 + 查詢
+        res = await pg2.evaluate("""() => {
+            const opts = [...document.querySelectorAll('#benchPick .fpick-opt')];
+            const inp = document.querySelector('#benchPick .fpick-input');
+            return {
+              open: !document.querySelector('#benchPick .fpick-pop').hidden,
+              n: opts.length,
+              expanded: inp.getAttribute('aria-expanded'),
+              listRole: document.querySelector('#benchPick .fpick-list').getAttribute('role'),
+              optRole: opts[0] && opts[0].getAttribute('role'),
+              allHaveFilename: opts.length > 0 && opts.every(
+                  o => (o.querySelector('.fpick-file') || {}).textContent),
+            };
+        }""")
+        check(f"打字之後浮層開起來且有結果（{res['n']} 筆）", res["open"] and res["n"] > 0, res)
+        # 同一個 item 底下有多個檔案時（實測全庫約 5%）主行完全一樣，
+        # 檔名是唯一分得出來的東西 —— 少了它使用者只能用猜的。
+        check("每一列都帶檔名（同片多檔時只有檔名分得出來）", res["allHaveFilename"], res)
+        check("aria：combobox/listbox/option 三件都在",
+              res["expanded"] == "true" and res["listRole"] == "listbox"
+              and res["optRole"] == "option", res)
+
+        await pg2.press("#benchPick .fpick-input", "ArrowDown")
+        await pg2.wait_for_timeout(150)
+        kb = await pg2.evaluate("""() => {
+            const inp = document.querySelector('#benchPick .fpick-input');
+            const on = document.querySelector('#benchPick .fpick-opt.on');
+            return { focusStillInput: document.activeElement === inp,
+                     matches: !!on && on.id === inp.getAttribute('aria-activedescendant') };
+        }""")
+        # aria-activedescendant 模式：焦點留在 input（才能繼續打字），
+        # 由屬性告訴輔助技術「現在指著哪一列」。焦點真的跑到列上就打不了字了。
+        check("方向鍵移游標時焦點留在輸入框", kb["focusStillInput"], kb)
+        check("aria-activedescendant 指到真的那一列", kb["matches"], kb)
+
+        await pg2.press("#benchPick .fpick-input", "Enter")
+        await pg2.wait_for_timeout(250)
+        picked = await pg2.evaluate("""() => ({
+            closed: document.querySelector('#benchPick .fpick-pop').hidden,
+            text: document.querySelector('#benchPick .fpick-input').value,
+            file: (document.querySelector('#benchPick .fpick-picked') || {}).textContent || '',
+            btnOk: !document.querySelector('#bBench').disabled,
+        })""")
+        check("Enter 選中之後浮層關起來", picked["closed"], picked)
+        check("選中之後看得到選了什麼（片名摘要 + 檔名）",
+              len(picked["text"]) > 0 and len(picked["file"].strip()) > 0, picked)
+        check("選了才能按「開始實測」", picked["btnOk"], picked)
+
+        await pg2.press("#benchPick .fpick-input", "Escape")
+        await pg2.wait_for_timeout(150)
+        # Escape 只收浮層。把已經選好的東西一起清掉是資料損失 ——
+        # 使用者按 Escape 的意思是「不看清單了」，不是「我不要這個檔案」。
+        check("Escape 只收浮層，不清掉已選的檔案",
+              not await pg2.evaluate("() => document.querySelector('#bBench').disabled"))
+
+        await pg2.evaluate("""() => {
+            const i = document.querySelector('#benchPick .fpick-input');
+            i.value = 'zzzz不可能存在的片名zzzz';
+            i.dispatchEvent(new Event('input', { bubbles: true }));
+        }""")
+        await pg2.wait_for_timeout(900)
+        none = await pg2.evaluate("""() => {
+            const pop = document.querySelector('#benchPick .fpick-pop');
+            return { open: !pop.hidden,
+                     msg: (pop.textContent || '').trim(),
+                     opts: document.querySelectorAll('#benchPick .fpick-opt').length };
+        }""")
+        # 收起來的話使用者分不出「沒找到」與「元件壞了」。
+        check("查無結果時浮層開著並說明（不是空白也不是消失）",
+              none["open"] and none["opts"] == 0 and len(none["msg"]) > 0, none)
+
+        # 快取那一側用的是同一個元件（兩處都要改，不能只改一邊）
+        wsel = await pg2.evaluate("""() => ({
+            same: !!document.querySelector('#warmPickSel .fpick-input'),
+            numberInputs: [...document.querySelectorAll('#cacheBox input[type=number]')].length,
+            warmDisabled: document.querySelector('#bWarmPick').disabled,
+            clearDisabled: document.querySelector('#bClearOne').disabled,
+        })""")
+        check("快取預備用的是同一個元件", wsel["same"], wsel)
+        check("快取那一側也沒有手打 id 的欄位了", wsel["numberInputs"] == 0, wsel)
+        check("沒選檔案時預備與清除都是停用的",
+              wsel["warmDisabled"] and wsel["clearDisabled"], wsel)
         await pg2.click("#bGpu")
         await pg2.wait_for_timeout(1500)
         check("GPU 查詢有回應（沒有 GPU 也要說話）",

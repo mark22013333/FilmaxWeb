@@ -1526,6 +1526,65 @@ def admin_problems(_: str = Depends(admin_only)):
     }
 
 
+@router.get("/admin/files")
+def admin_files(q: str = Query(default="", max_length=120),
+                limit: int = Query(default=30, ge=1, le=100),
+                _: str = Depends(admin_only)):
+    """後台的檔案挑選器要的清單：關鍵字找檔案，回 file_id 與顯示要用的欄位。
+
+    **為什麼需要這支。**後台原本有兩個欄位要使用者自己打 file_id（「詳情頁
+    看得到」），也就是把資料庫主鍵當成介面。它的失敗方式很安靜：打錯一個
+    數字不會報錯，而是對**另一支存在的片**跑了一次好幾分鐘的轉碼實測，
+    畫面上有數字、有倍速，看起來完全正常，只是答非所問。
+
+    **`%` 與 `_` 要逸出，這一支跟 `/api/library` 不一樣。**那邊打「100%」
+    只是多撈幾筆、使用者自己看得出來；這裡只給 30 筆，一個沒逸出的 `_`
+    會讓「S01_E01」比對到「S01xE01」，使用者看到的是「我打的字明明對，
+    選單裡卻是別支片」—— 選錯比撈不到嚴重。
+
+    **不要幫 filename 加索引。**`LIKE '%q%'` 的前綴萬用字元讓 B-tree 用不上，
+    加了只是多一份寫入成本。實測三表 join、297 列是 2.4~9 ms。
+    """
+    kw = (q or "").strip()
+    # 純數字 = 使用者可能是從舊習慣（詳情頁抄 id）或日誌來的，把那個 id 置頂。
+    # 不是數字時給 -1，不會命中任何一列。
+    fid = int(kw) if kw.isdigit() and len(kw) <= 9 else -1
+
+    where = ""
+    args: List[Any] = []
+    if kw:
+        esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{esc}%"
+        where = ("WHERE (f.id = ? OR f.filename LIKE ? ESCAPE '\\' "
+                 "OR i.title LIKE ? ESCAPE '\\' "
+                 "OR i.original_title LIKE ? ESCAPE '\\')")
+        args = [fid, like, like, like]
+
+    # 排序：打了 id 就讓那一筆排第一；有關鍵字時同一部片的多個檔案要相鄰
+    # （才看得出「這六個是同一部片的不同版本」）；沒關鍵字就是最近加入的。
+    # **一律以 f.id 收尾** —— 同一個 item 底下的檔案 added_at 完全相同，
+    # 沒有決定性收尾的話兩次查詢的順序不保證一樣（見本檔上面排序規約）。
+    if kw:
+        order = "CASE WHEN f.id = ? THEN 0 ELSE 1 END, i.title, e.season, e.episode, f.id DESC"
+        args.append(fid)
+    else:
+        order = "f.added_at DESC, f.id DESC"
+
+    rows = db.q(
+        f"""SELECT f.id, f.filename, f.duration, f.height, f.size, f.probe_state,
+                   i.title, i.kind, i.year, e.season, e.episode
+            FROM media_file f
+            LEFT JOIN media_item i ON i.id = f.item_id
+            LEFT JOIN episode    e ON e.id = f.episode_id
+            {where}
+            ORDER BY {order}
+            LIMIT ?""",
+        args + [limit + 1])
+
+    more = len(rows) > limit
+    return {"items": [db.row_to_dict(r) for r in rows[:limit]], "more": more}
+
+
 @router.get("/diagnostics/stream")
 def diagnostics_stream(limit: int = Query(default=40, ge=0, le=200),
                        _: str = Depends(admin_only)):

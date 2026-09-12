@@ -177,6 +177,44 @@ r = admin.post("/api/cache/warm?file_id=9001")
 check("排不進去要回 409（前端才分得出「已經有一支在跑」）",
       r.status_code == 409, r.status_code)
 
+head("[檔案選擇器] 後端的搜尋端點")
+
+db.execute("INSERT INTO media_item(id, kind, title) VALUES(9, 'tv', '幸運女神')")
+db.execute("INSERT INTO episode(id, item_id, season, episode) VALUES(9, 9, 1, 2)")
+db.execute("""INSERT INTO media_file(id, item_id, episode_id, ftp_path, filename,
+              duration, height, probe_state, added_at)
+              VALUES(9101, 9, 9, '/x/L.mkv', 'Lucky.S01E02.1080p.mkv', 2880, 1080, 'ok', 100)""")
+db.execute("""INSERT INTO media_file(id, item_id, ftp_path, filename, added_at)
+              VALUES(9102, 9, '/x/pct.mkv', '100%_off_special.mkv', 200)""")
+
+r = admin.get("/api/cache/survey")     # 先確認 admin client 還活著
+r = admin.get("/api/admin/files?q=lucky")
+items = r.json()["items"]
+check("關鍵字找得到（檔名比對）", any(i["id"] == 9101 for i in items), r.text[:200])
+check("帶得出片名與季集（前端要組顯示字串）",
+      any(i["title"] == "幸運女神" and i["season"] == 1 and i["episode"] == 2
+          for i in items), items[:2])
+
+# **純數字要置頂。**舊習慣是從詳情頁抄 file_id，那條路不能因為改了 UI 就斷掉。
+r = admin.get("/api/admin/files?q=9101")
+items = r.json()["items"]
+check("打純數字時那個 id 排第一", items and items[0]["id"] == 9101,
+      [i["id"] for i in items[:3]])
+
+# **% 要逸出。**沒逸出的話 '%' 會比對到全部，而選單只給 30 筆 ——
+# 使用者看到的是「我打的字明明對，選單裡卻是別支片」。
+r = admin.get("/api/admin/files?q=%25")        # URL 編碼的 %
+ids = [i["id"] for i in r.json()["items"]]
+check("% 被當成字面而不是萬用字元", ids == [9102], ids)
+
+r = admin.get("/api/admin/files?q=&limit=2")
+body = r.json()
+check("沒有關鍵字時回最近加入的（不是空清單）", len(body["items"]) == 2, body)
+check("撈得到更多時要講（前端才顯示「再打幾個字」）", body["more"] is True, body)
+
+r = viewer.get("/api/admin/files?q=a")
+check("唯讀使用者不能用檔案搜尋", r.status_code == 403, r.status_code)
+
 print("\n" + "=" * 50)
 print(f"通過 {OK}，失敗 {FAIL}")
 sys.exit(1 if FAIL else 0)
