@@ -343,8 +343,10 @@ old_dir = CACHE_DIR / str(fid) / f"v2_{hls.profile_key(0, None, 0, hls.RUNG_REMU
 old_dir.mkdir(parents=True, exist_ok=True)
 (old_dir / "seg-100.ts").write_bytes(b"v2-content")
 new_dir = hls.seg_dir(fid, hls.profile_key(0, None, 0, hls.RUNG_REMUX))
-check("v3 的分段路徑帶版本（新舊 binary 短暫交錯也不會共用同一批 .ts）",
-      new_dir.name.startswith("v3_"), new_dir.name)
+# 綁常數而不是寫死 "v3_"：版本每升一次就要改一次測試的話，改的人會傾向
+# 把測試改成符合現況，而不是去想「這次升版是不是真的該升」。
+check("分段路徑帶版本（新舊 binary 短暫交錯也不會共用同一批 .ts）",
+      new_dir.name.startswith(f"v{hls.HLS_CACHE_FORMAT_VERSION}_"), new_dir.name)
 check("v2 與 v3 不是同一個資料夾", old_dir.resolve() != new_dir.resolve())
 db.kv_set("hls_profile_key_version", 2)
 hls.migrate_cache()
@@ -427,19 +429,30 @@ check("ac3 要轉 AAC（瀏覽器不吃 ac3）",
 check("-ss 在 -i 前面（輸入端 seek；copy 只能從 keyframe 起頭）",
       cmd.index("-ss") < cmd.index("-i"), cmd)
 check("-ss 就是邊界表給的時間", cmd[cmd.index("-ss") + 1] == "7.250")
+# **這一條是回歸測試。**copy 模式下 ffmpeg 一律退到前一個 keyframe 才起頭
+# （實測 file 334：要求 49.091 拿到 46.338，連續 12 個 keyframe 每個都退一格，
+# 且完全穩定、微調 -ss 也躲不掉）。舊寫法用 -output_ts_offset 無條件平移到
+# 宣告值，於是那 2.75 秒「剛播過的畫面」被標成從 49.091 開始 —— append 進
+# SourceBuffer 就是畫面倒退。改用 -copyts 保留片源原始時間戳讓標籤說實話。
+check("上階要用 -copyts（時間戳照片源，不要平移到宣告值）",
+      "-copyts" in cmd, cmd)
+check("-copyts 之下要用 -to（絕對時間）而不是 -t（會吐出空檔案）",
+      "-to" in cmd and "-t" not in cmd, cmd)
+check("-to 是這一段的結束絕對時間", cmd[cmd.index("-to") + 1] == "14.500")
 # **這一條是回歸測試，不是風格偏好。**原本寫的是 make_zero，而 make_zero
 # 是在 -output_ts_offset 之後才套用的 —— 它會把 offset 剛寫進去的絕對時間戳
 # 整個抹成 0。實測（file 433，2:33:55）：1540 段每段都從 0 起算，hls.js 只好
 # 一段接一段串起來，MediaSource 的 duration 變成 1540 × 4.816 = 7416 秒，
 # 播放器右下角就從 2:33:55 變成 2:03:36，seek 到 95% 還會直接 ended。
 # 而下階 transcode 沒有這個旗標 —— 所以兩階的時間軸原本是對不起來的。
-check("上階不可以用 make_zero（它會抹掉 output_ts_offset 的絕對時間戳）",
+check("上階不可以用 make_zero（它會抹掉 -copyts 保住的絕對時間戳）",
       cmd[cmd.index("-avoid_negative_ts") + 1] == "disabled", cmd)
-check("時間軸放回這一段該有的位置",
-      cmd[cmd.index("-output_ts_offset") + 1] == "7.250")
-# 兩階必須用同一種時間戳策略，否則切畫質時 currentTime 會對到另一條軸上
+check("上階不該再用 -output_ts_offset（-copyts 已經給了絕對時間，再平移會錯一次）",
+      "-output_ts_offset" not in cmd, cmd)
+# 兩階的時間戳都必須是「片源的絕對 media time」，否則切畫質時 currentTime
+# 會對到另一條軸上。手段不同（上階 -copyts、下階重編碼後平移），結果要一致。
 _tr = media.build_transcode_cmd(fid, 7.25, 7.25, 720, None)
-check("兩階都把時間軸放回絕對位置（切畫質才不會跳）",
+check("下階把時間軸放回絕對位置（切畫質才不會跳）",
       _tr[_tr.index("-output_ts_offset") + 1] == "7.250", _tr)
 check("下階本來就沒有 avoid_negative_ts，上階也不該再靠它平移",
       "make_zero" not in cmd and "make_zero" not in _tr, (cmd, _tr))

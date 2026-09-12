@@ -83,7 +83,7 @@ RUNG_REMUX = 1
 # 是另一段影片。播放清單說 seg-100 是 600 秒，快取吐出來的卻是 1060 秒的
 # 內容：這正是「畫面跳回之前看過的地方」的另一條路徑，而且它跨越重新部署
 # 存活，比 ABR 那條更難查。
-HLS_CACHE_FORMAT_VERSION = 3    # 3 = 上階邊界改成對齊固定格線（ABR 才切得動）
+HLS_CACHE_FORMAT_VERSION = 4    # 4 = 上階改用 -copyts，時間戳不再被平移到宣告值
 
 # 舊名字留著給還沒改的呼叫端；語意已經擴大，新的程式碼請用上面那個。
 PROFILE_KEY_VERSION = HLS_CACHE_FORMAT_VERSION

@@ -1459,15 +1459,40 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
     將來加一個轉碼參數就有機會漏進 copy 的路徑 —— 而那不會報錯，
     只會讓「零損失」這句話悄悄變成假的。
 
-    **`-ss` 一定要在 `-i` 前面（輸入端 seek）。**copy 模式只能從 keyframe 起頭，
-    而我們的 `start` 就是邊界表裡的 keyframe 時間戳，所以兩者剛好吻合。
-    放到輸出端 seek 的話 ffmpeg 會從 0 開始解，然後丟掉前面 —— 慢，而且
-    每一段都要從頭掃一次。
+    **`-ss` 一定要在 `-i` 前面（輸入端 seek）。**放到輸出端 seek 的話 ffmpeg 會
+    從 0 開始解，然後丟掉前面 —— 慢，而且每一段都要從頭掃一次。
+
+    **但「`start` 是 keyframe，所以 ffmpeg 會剛好從那裡起頭」是錯的。**
+    這個函式原本就是這樣假設的，實測推翻了它：copy 模式下，ffmpeg 一律退到
+    **前一個** keyframe 才開始抄。實測 file 334，邊界表裡連續 12 個 keyframe
+    每一個都退了整整一格（要求 49.091 → 實際 46.338，要求 54.638 → 實際
+    51.843），而且**完全穩定**（同一個 start 連跑三次，回退量分毫不差），
+    也不是浮點誤差 —— `-ss` 加上 0.001 ~ 0.1 的微調，落點一樣往前退一格。
+    那些 keyframe 本身是貨真價實的 I-frame（`pict_type=I`），只是 copy 模式
+    需要更前面那個 IDR 才敢起頭。
+
+    **真正會出事的不是「多抄了一段」，是「多抄的那段被貼上錯的標籤」。**
+    舊寫法用 `-output_ts_offset start` 無條件把輸出平移到 `start`，於是
+    46.338~49.091 那 2.75 秒（**剛剛才播過的畫面**）被標成「從 49.091 開始」。
+    hls.js append 進 SourceBuffer 之後，那幾秒的舊畫面就蓋在 49.091 的位置上
+    —— 畫面短暫跳回已經看過的地方，這正是使用者回報的症狀。實測 file 334
+    上階 474 段：**平均重疊 2.995 秒、最大 3.962 秒，每一個接縫都是負 gap。**
+
+    **修法是讓時間戳說實話，而不是想辦法讓 ffmpeg 不要回退**（試過，辦不到）。
+    `-copyts` 保留片源原始時間戳，配 `-to`（絕對時間）取代 `-t`：多抄的那段
+    仍然在，但它現在誠實地標著自己真正的 media time（46.338），MSE 就會把它
+    放回 46.338 那個位置 —— 與前一段重疊的區間被**同樣的內容**覆寫，是冪等的，
+    播放頭不動。段與段之間重疊沒關係，**標錯位置才有關係**。
+
+    注意 `-t` 一定要換成 `-to`：`-copyts` 之下 `-t` 的語意變成絕對時限，
+    配著用會吐出空檔案或只有一兩個封包（實測踩過）。
+    因為不再平移時間戳，`-output_ts_offset` 也一併拿掉 —— 留著會再平移一次。
 
     **`-avoid_negative_ts` 一定要是 `disabled`，不可以是 `make_zero`。**
-    這兩個選項會互相抵銷：`make_zero` 的語意是「把這一段的時間軸平移到 0」，
-    而它是在 `-output_ts_offset` **之後**才套用的 —— 於是 offset 寫進去的
-    絕對位置被整個抹掉，每一段都從 0 開始。
+    `make_zero` 的語意是「把這一段的時間軸平移到 0」，而它是在時間戳都決定
+    好之後才套用的 —— 於是 `-copyts` 好不容易保住的絕對位置被整個抹掉，
+    每一段都從 0 開始。（這一條在改用 `-copyts` 之前就成立，當時被抹掉的是
+    `-output_ts_offset` 寫進去的位置；換了做法之後它只是換個東西抹，一樣致命。）
 
     實測後果（file 433，2:33:55 的片）：1540 段每段宣告 6 秒、實際各自從 0
     起算，hls.js 只好把它們一段接一段地串起來，於是 MediaSource 的 duration
@@ -1485,9 +1510,10 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
     退路，不需要用「把時間軸弄壞」來換。
     """
     pre = [resolve_tool("ffmpeg"), "-v", "error", "-nostdin", "-y",
+           "-copyts",
            "-ss", f"{start:.3f}",
            *input_args(file_id),
-           "-t", f"{duration:.3f}",
+           "-to", f"{start + duration:.3f}",
            "-map", "0:v:0",
            "-map", f"0:{audio_index}" if audio_index is not None else "0:a:0?",
            "-sn", "-dn",
@@ -1501,7 +1527,6 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
             pre += ["-ac", str(settings.audio_channels)]
     pre += ["-avoid_negative_ts", "disabled",
             "-muxdelay", "0", "-muxpreload", "0",
-            "-output_ts_offset", f"{start:.3f}",
             "-f", "mpegts", "pipe:1"]
     return pre
 
