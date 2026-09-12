@@ -11,8 +11,8 @@ from fastapi import Depends, APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, media, mssql,
-                params, paramstore, purge, scanner, streamstat, users)
+from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, hlscache,
+                media, mssql, params, paramstore, purge, scanner, streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -1672,6 +1672,69 @@ def ftp_browse(path: str = "/", _: str = Depends(admin_only)):
 def cache_clear(file_id: Optional[int] = None, _: str = Depends(admin_only)):
     hls.clear_cache(file_id)
     media.clear_subtitle_cache(file_id)
+    return {"ok": True}
+
+
+@router.get("/cache/survey")
+def cache_survey(limit: int = Query(default=200, ge=1, le=2000),
+                 _: str = Depends(admin_only)):
+    """快取現況：總量、每個檔案佔多少、哪些是舊版本的殘留。
+
+    照磁碟上實際有什麼回答，不照 DB 猜 —— 快取跟 DB 不同步是常態
+    （LRU 汰過、手動刪過、升版清掉過），資料夾本身才是唯一可信的來源。
+    """
+    out = hlscache.survey(limit)
+    out["limitMb"] = settings.hls_cache_max_mb
+    return out
+
+
+@router.post("/cache/clear-stale")
+def cache_clear_stale(_: str = Depends(admin_only)):
+    """只清掉不是目前格式版本的殘留。
+
+    **這是唯一不必先看清單的清除**：舊版本的分段在定義上已經沒有人讀得到
+    （`seg_dir()` 只產生帶目前版本的路徑），刪掉不會讓任何一次播放要重轉。
+    """
+    return {"ok": True, **hlscache.clear_stale()}
+
+
+@router.get("/cache/warm")
+def cache_warm_status(_: str = Depends(admin_only)):
+    return hlscache.status.dict()
+
+
+@router.get("/cache/warm/options")
+def cache_warm_options(file_id: int = Query(...), _: str = Depends(admin_only)):
+    """這個檔案可以預備哪些階，以及各階已經有幾段。
+
+    profile 字串由後端算 —— 前端自己拼的話，兩邊有一天不一樣，後果是
+    「預備了半天，播的時候讀的是另一個資料夾」。
+    """
+    return hlscache.warm_options(file_id)
+
+
+@router.post("/cache/warm")
+def cache_warm(file_id: int = Query(...),
+               profile: str = Query(default=""),
+               head: int = Query(default=0, ge=0),
+               _: str = Depends(admin_only)):
+    """先把分段轉好，等一下播就不用等。
+
+    head=0   整支片都轉（背景慢慢跑，可以取消）
+    head=N   只轉開頭 N 段（讓開播不用等，很快就跑完）
+
+    一次只跑一支：預備是拿整台機器的 CPU 去換「等一下不用等」，同時跑兩支
+    只會讓兩支都慢，而且會跟正在播的人搶。
+    """
+    ok, msg = hlscache.start(file_id, profile, head)
+    if not ok:
+        return JSONResponse({"ok": False, "message": msg}, status_code=409)
+    return {"ok": True, "message": msg}
+
+
+@router.post("/cache/warm/cancel")
+def cache_warm_cancel(_: str = Depends(admin_only)):
+    hlscache.cancel()
     return {"ok": True}
 
 

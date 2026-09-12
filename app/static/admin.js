@@ -812,11 +812,11 @@ TABS.playback = async el => {
     </div>
 
     <h3 class="sub">快取</h3>
-    <div class="box">
-      <button class="btn" id="bCache">清空轉碼快取</button>
-      <span style="color:var(--muted);margin-left:10px;font-size:12.5px">
-        清掉之後第一次播放會重新轉碼，不影響片源。</span>
+    <div class="box" id="cacheBox">
+      <div style="color:var(--muted);font-size:12.5px">盤點中⋯</div>
     </div>`;
+
+  renderCache();
 
   $('#bProbe').onclick = async () => {
     const out = $('#probeOut');
@@ -874,13 +874,204 @@ TABS.playback = async el => {
     try { out.innerHTML = pre(await api('/diagnostics/gpu')); }
     catch (e) { out.innerHTML = `<span style="color:#ffaeae">${esc(e.message)}</span>`; }
   };
+};
+
+/* ---------------------------------------------------------------- 快取
+
+   這一塊刻意**先給看的、再給按的**：原本只有一顆「清空轉碼快取」，按下去
+   會刪掉什麼、省下多少空間，按的人完全看不到。清理工具最差的設計就是
+   「按一下就刪掉一些東西，而且不知道刪了什麼」（/maintenance/sweep 的
+   report→fix 兩段式就是同一個理由）。
+
+   預備（warm）的輪詢只在跑的時候開，跑完就停 —— 後台開著不動的時候不該
+   每兩秒打一次伺服器。 */
+let warmTimer = null;
+
+async function renderCache() {
+  const box = $('#cacheBox');
+  if (!box) { clearInterval(warmTimer); warmTimer = null; return; }
+  let s;
+  try { s = await api('/cache/survey?limit=100'); }
+  catch (e) { box.innerHTML = `<span style="color:#ffaeae">${esc(e.message)}</span>`; return; }
+
+  const pct = s.limitMb ? Math.min(100, s.totalBytes / (s.limitMb * 1048576) * 100) : 0;
+  const rows = (s.files || []).map(f => `
+    <tr>
+      <td style="white-space:nowrap">${f.file_id}</td>
+      <td title="${esc(f.filename || '')}">${esc((f.filename || '（DB 裡找不到這個檔案）').slice(0, 52))}</td>
+      <td style="white-space:nowrap">${bytes(f.bytes)}</td>
+      <td style="white-space:nowrap">${f.segments} 段</td>
+      <td>${f.profiles.map(p =>
+        `<span class="pill${p.stale ? ' warn' : ''}" title="${esc(p.dir)}">v${p.version} ${esc(p.profile)}</span>`
+      ).join(' ')}</td>
+      <td style="white-space:nowrap">
+        <button class="btn sm" data-warm="${f.file_id}">預備</button>
+        <button class="btn sm" data-clearfile="${f.file_id}">清除</button>
+      </td>
+    </tr>`).join('');
+
+  box.innerHTML = `
+    <div class="grid-cards" style="margin-bottom:12px">
+      <div class="stat"><b>${bytes(s.totalBytes)}</b><small>已用${
+        s.limitMb ? `（上限 ${s.limitMb} MB，${pct.toFixed(0)}%）` : ''}</small></div>
+      <div class="stat"><b>${s.fileCount}</b><small>有快取的檔案</small></div>
+      <div class="stat"><b>${s.totalSegments}</b><small>分段總數</small></div>
+      <div class="stat ${s.staleBytes ? 'warn' : ''}"><b>${bytes(s.staleBytes)}</b>
+        <small>舊版本殘留（目前 v${s.version}）</small></div>
+    </div>
+
+    ${s.staleBytes || s.emptyDirs ? `<div class="banner" style="margin-bottom:12px">
+      有 ${s.staleDirs} 個不是 v${s.version} 的資料夾（${bytes(s.staleBytes)}）${
+        s.emptyDirs ? `、${s.emptyDirs} 個空資料夾` : ''}。
+      這些分段<b>已經沒有人讀得到</b>（路徑帶版本，播放只會找 v${s.version}），
+      刪掉不會讓任何一次播放需要重轉。
+      <button class="btn sm" id="bStale" style="margin-left:8px">清掉殘留</button>
+    </div>` : ''}
+
+    <div id="warmPanel" style="margin-bottom:12px"></div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <input id="warmId" type="number" placeholder="檔案 id"
+        style="width:150px;padding:9px 11px;border-radius:9px;background:var(--bg-2);
+        border:1px solid var(--line);min-height:40px">
+      <button class="btn" id="bWarmPick">預備這一支⋯</button>
+      <span style="flex:1"></span>
+      <button class="btn danger" id="bCache">清空全部</button>
+    </div>
+
+    ${rows ? `<div class="scrollx"><table class="t">
+      <thead><tr><th>id</th><th>檔名</th><th>佔用</th><th>分段</th><th>階別</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      ${s.truncated ? `<p style="color:var(--muted);font-size:12px;margin:8px 0 0">
+        只列出最大的 ${s.files.length} 個（統計數字是全部算的）。</p>` : ''}`
+      : '<p style="color:var(--muted);font-size:12.5px;margin:0">目前沒有任何快取分段。</p>'}`;
+
   $('#bCache').onclick = async () => {
-    if (!await confirmBox({ title: '清空轉碼快取', ok: '清空',
-      body: '所有已轉好的分段會被刪掉，下次播放要重轉。<b>不影響 FTP 上的片源。</b>' })) return;
-    try { await api('/cache/clear', { method: 'POST' }); toast('已清空'); }
+    if (!await confirmBox({ title: '清空轉碼快取', ok: '清空', danger: true,
+      body: `所有已轉好的分段會被刪掉（${bytes(s.totalBytes)}、${s.totalSegments} 段），
+             下次播放要重轉。<b>不影響 FTP 上的片源。</b>` })) return;
+    try { await api('/cache/clear', { method: 'POST' }); toast('已清空'); renderCache(); }
     catch (e) { toast(e.message, true); }
   };
-};
+
+  const stale = $('#bStale');
+  if (stale) stale.onclick = async () => {
+    try {
+      const r = await api('/cache/clear-stale', { method: 'POST' });
+      toast(`清掉 ${r.dirs} 個資料夾，釋出 ${bytes(r.bytes)}`);
+      renderCache();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  $('#bWarmPick').onclick = () => {
+    const id = parseInt($('#warmId').value, 10);
+    if (!id) return toast('先填檔案 id', true);
+    warmPick(id);
+  };
+
+  box.onclick = e => {
+    const ds = e.target.dataset || {};
+    if (ds.warm) return warmPick(parseInt(ds.warm, 10));
+    if (ds.clearfile) return clearOne(parseInt(ds.clearfile, 10));
+  };
+
+  pollWarm();
+}
+
+async function clearOne(fileId) {
+  const f = (await api('/cache/survey?limit=2000')).files.find(x => x.file_id === fileId);
+  if (!await confirmBox({
+    title: `清除這一支的快取？`, ok: '清除', danger: true,
+    body: `<b>${esc((f && f.filename) || ('file_id=' + fileId))}</b><br><br>
+           會刪掉 ${f ? bytes(f.bytes) + '、' + f.segments + ' 段' : '它的所有分段'}，
+           下次播放要重轉。<b>不影響片源。</b>`
+  })) return;
+  try {
+    await api('/cache/clear?file_id=' + fileId, { method: 'POST' });
+    toast('已清除'); renderCache();
+  } catch (e) { toast(e.message, true); }
+}
+
+/** 預備前先問清楚要哪一階、整支還是只有開頭 —— 整支片可能要跑很久。 */
+async function warmPick(fileId) {
+  let o;
+  try { o = await api('/cache/warm/options?file_id=' + fileId); }
+  catch (e) { return toast(e.message, true); }
+  if (!o.ok) return toast(o.message, true);
+
+  const opts = o.options.map((p, i) => `
+    <label style="display:block;margin:6px 0">
+      <input type="radio" name="wp" value="${esc(p.profile)}" ${i ? '' : 'checked'}>
+      ${esc(p.label)} — 共 ${p.total} 段，已有 ${p.cached} 段</label>`).join('');
+
+  // confirmBox 只回 true/false，`collect` 是在關掉之前被呼叫的 side effect ——
+  // 選項要在那個時機抄下來，關掉之後 DOM 就沒了。
+  let picked = { profile: o.options[0].profile, head: 0 };
+  const ok = await confirmBox({
+    title: '預備分段', ok: '開始',
+    body: `<b>${esc(o.filename || '')}</b><br>
+      <span style="color:var(--muted)">長度 ${Math.round(o.duration / 60)} 分鐘</span>
+      <div style="margin-top:10px">${opts}</div>
+      <label style="display:block;margin-top:10px">
+        <input type="checkbox" id="wpHead"> 只預熱開頭 10 段（讓開播不用等，很快跑完）</label>
+      <p style="color:var(--muted);font-size:12px;margin:10px 0 0">
+        整支預備會佔用 CPU 一段時間，但優先權比正在播的人低，而且隨時可以取消。</p>`,
+    collect: m => {
+      const r = m.querySelector('input[name=wp]:checked');
+      const h = m.querySelector('#wpHead');
+      picked = { profile: (r && r.value) || o.options[0].profile,
+                 head: h && h.checked ? 10 : 0 };
+    },
+  });
+  if (!ok) return;
+  const { profile, head } = picked;
+  try {
+    const r = await api(`/cache/warm?file_id=${fileId}&profile=${encodeURIComponent(profile)}&head=${head}`,
+      { method: 'POST' });
+    toast(r.message || '已開始');
+    pollWarm();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function pollWarm() {
+  const panel = $('#warmPanel');
+  if (!panel) { clearInterval(warmTimer); warmTimer = null; return; }
+  let w;
+  try { w = await api('/cache/warm'); } catch { return; }
+
+  if (!w.running && !w.phase) { panel.innerHTML = ''; }
+  else {
+    const pctDone = w.total ? ((w.done + w.skipped) / w.total * 100) : 0;
+    const eta = w.eta > 0 ? `，預估還要 ${Math.ceil(w.eta / 60)} 分` : '';
+    const cls = w.phase === 'error' ? 'bad' : '';
+    panel.innerHTML = `<div class="banner ${cls}">
+      <b>${w.running ? '預備中' : ({ done: '預備完成', cancelled: '已取消', error: '預備失敗' }[w.phase] || w.phase)}</b>
+      ${esc((w.filename || '').slice(0, 46))}
+      <div style="margin-top:6px">
+        ${w.done + w.skipped} / ${w.total} 段（新轉 ${w.done}、本來就有 ${w.skipped}${
+          w.failed ? `、失敗 ${w.failed}` : ''}）${w.running ? eta : ''}
+      </div>
+      <div style="height:6px;background:var(--bg-2);border-radius:4px;margin-top:8px;overflow:hidden">
+        <div style="height:100%;width:${pctDone.toFixed(1)}%;background:var(--accent, #6ea8fe)"></div></div>
+      ${w.error ? `<div style="margin-top:6px;color:#ffaeae">${esc(w.error)}</div>` : ''}
+      ${(w.errors || []).length ? `<div style="margin-top:6px;font-size:12px;color:var(--muted)">
+        ${w.errors.map(x => esc(x)).join('<br>')}</div>` : ''}
+      ${w.running ? '<button class="btn sm" id="bWarmCancel" style="margin-top:8px">取消</button>' : ''}
+    </div>`;
+    const c = $('#bWarmCancel');
+    if (c) c.onclick = async () => {
+      try { await api('/cache/warm/cancel', { method: 'POST' }); toast('已送出取消'); }
+      catch (e) { toast(e.message, true); }
+    };
+  }
+
+  // 跑完就把輪詢收掉，並把盤點數字更新一次（快取變大了）。
+  if (w.running && !warmTimer) warmTimer = setInterval(pollWarm, 2000);
+  if (!w.running && warmTimer) {
+    clearInterval(warmTimer); warmTimer = null;
+    renderCache();
+  }
+}
 
 /* ================================================================ 紀錄 */
 let logPage = 0, logEvent = '';
