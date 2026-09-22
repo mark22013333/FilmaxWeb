@@ -456,22 +456,22 @@ def direct_ok_for_remote(src_bitrate_bps: Optional[int], has_remux: bool) -> Tup
     if kbps <= cap:
         return True, f"片源 {kbps} kbps 在遠端安全範圍內（上限 {cap}）"
     return False, (f"片源 {kbps} kbps 超過遠端上限 {cap}，direct 無階可降"
-                   + ("，改走 remux 上階（畫質相同）" if has_remux else "，改走轉碼 HLS"))
+                   + ("，改走 HLS（目前遠端採 transcode-only ABR）"
+                      if has_remux else "，改走轉碼 HLS"))
 
 
 def build_master(file_id: int, profile: str, remote: bool = False,
                  duration: float = 0.0, auto: bool = True) -> str:
-    """master playlist。**區網發一階、遠端發 remux 上階 ＋ 一條轉碼階梯。**
+    """master playlist。**區網一階；遠端只發固定時間格線的轉碼 ABR 階梯。**
 
-    區網不需要 ABR：鏈路夠寬，發單一的上階（remux）就是零轉碼路徑 ——
-    這是整個設計最確定會兌現的那一塊，所以它是規則不是最佳化。
-    遠端發多階讓客戶端自己按緩衝水位選（伺服器不猜頻寬 —— 那正是
-    Netflix 在 50 萬使用者上驗證後放棄的做法）。
+    遠端曾把 remux 上階與 transcode 階梯混在同一份 master；真實長片只要
+    中途出現一次 long GOP，兩邊的 seg-N 就可能差一整段，hls.js 切階時把
+    已播放過的畫格 append 回 SourceBuffer。現在遠端一律使用 transcode-only
+    timeline，所有 rendition 都從同一個固定 6 秒格線產生。
 
-    **為什麼遠端的轉碼階不只一階**（J 章第 1 層）：上階的峰值是 21.7 Mbps，
-    行動網路根本選不到它 —— 也就是說在只有「上階＋單一轉碼階」的形狀下，
-    遠端實際上只有一階可用，卡頓時無階可降。手機在收訊起伏的地方看片，
-    需要的正是那條往下的路。
+    區網仍維持單一 rendition；非 MKV 可用 remux 零轉碼。MKV 暫時改走
+    transcode，因為使用者回報的 Matroska/H.264 大檔即使不切階也會出現
+    frame regression，先把順暢播放放在零轉碼之前。
 
     `auto` = 使用者沒有手動挑畫質。手動挑過的話不發高畫質頂階（那一檔就是
     他要的上限）。預設 True 是為了讓既有呼叫端與測試不必全部改。
