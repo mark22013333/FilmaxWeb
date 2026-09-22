@@ -83,7 +83,7 @@ RUNG_REMUX = 1
 # 是另一段影片。播放清單說 seg-100 是 600 秒，快取吐出來的卻是 1060 秒的
 # 內容：這正是「畫面跳回之前看過的地方」的另一條路徑，而且它跨越重新部署
 # 存活，比 ABR 那條更難查。
-HLS_CACHE_FORMAT_VERSION = 4    # 4 = 上階改用 -copyts，時間戳不再被平移到宣告值
+HLS_CACHE_FORMAT_VERSION = 5    # 5 = 上階的 -ss 補償 copy 的退格，音訊跟著對齊
 
 # 舊名字留著給還沒改的呼叫端；語意已經擴大，新的程式碼請用上面那個。
 PROFILE_KEY_VERSION = HLS_CACHE_FORMAT_VERSION
@@ -600,15 +600,33 @@ def _produce(file_id: int, index: int, profile: str, duration: float, path: Path
             raise RuntimeError(f"上階沒有第 {index} 段（共 {len(spans)} 段）")
         start, end, _ = spans[index]
         length = max(end - start, 0.05)
+        # **只有真的會退格的檔案才把 `-ss` 往後推。**退格是容器的性質不是編碼的
+        # （實測同一份視訊 `-c copy` 換容器：mkv 退一整格、mp4 完全不退），
+        # 所以由 `seek_backoff` 這個量出來的欄位決定，不是一律推。
+        # 猜錯的代價不對稱：該推沒推只是接縫重疊，不該推卻推了會讓那一段
+        # 開頭整個缺一格 —— 所以 NULL（還沒量過）一律當作不退。
+        #
+        # **在這裡查好傳進去**，不要讓 build_remux_cmd() 自己查：那個函式目前
+        # 是純組指令的，讓它也去查表就會變成兩邊各查一次、可能拿到不同的答案。
+        # `end` 也一定要傳：只跨一個 keyframe 的短段，下一格就是這一段的結尾，
+        # 推過去會變成 `-ss X -to X`（空段，畫面整個不見）。
+        seek_at = start
+        _bk = db.q1("SELECT seek_backoff FROM media_file WHERE id=?", (file_id,))
+        if _bk and _bk["seek_backoff"]:
+            tbl = keyframes.table_for(file_id)
+            if tbl:
+                seek_at = keyframes.seek_start_for(tbl["times"], start, end)
     else:
         start = index * seg
         length = min(seg, max(duration - start, 0.05))
+        seek_at = start
     tmp = path.with_suffix(".ts.part")
 
     def run(force_software: bool) -> Optional[str]:
         """回傳 None 表示成功，否則回傳錯誤訊息。"""
         if rung == RUNG_REMUX:
-            cmd = media.build_remux_cmd(file_id, start, length, audio_index)
+            cmd = media.build_remux_cmd(file_id, start, length, audio_index,
+                                        seek_at=seek_at)
         else:
             cmd = media.build_transcode_cmd(file_id, start, length, height, audio_index,
                                             force_software=force_software,

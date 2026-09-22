@@ -428,7 +428,28 @@ check("ac3 要轉 AAC（瀏覽器不吃 ac3）",
       cmd[cmd.index("-c:a") + 1] == "aac", cmd)
 check("-ss 在 -i 前面（輸入端 seek；copy 只能從 keyframe 起頭）",
       cmd.index("-ss") < cmd.index("-i"), cmd)
-check("-ss 就是邊界表給的時間", cmd[cmd.index("-ss") + 1] == "7.250")
+check("沒給 seek_at 時退回 start（呼叫端漏傳不能炸）",
+      cmd[cmd.index("-ss") + 1] == "7.250")
+
+# **這一組是回歸測試。**copy 模式下 ffmpeg 一律退到前一個 keyframe，
+# **即使 start 本身就是貨真價實的 keyframe**（實測 file 360：邊界 600.600
+# 在容器裡是 flags=K__，-ss 600.600 的落點仍然是 598.598）。-copyts 只讓那段
+# 多抄的內容標對位置，並沒有讓它消失 —— 於是每個接縫都重疊一整個 keyframe
+# 間距（實測 2.044／2.169 秒），而「重疊是冪等的」對這條路徑不成立：
+# 音訊要重編（eac3／5.1 AAC），重編的音訊不冪等，每段開頭那個 2 秒的洞
+# 會蓋掉前一段的聲音；hls.js 也會因為 buffered 對不上而 seek 回去修正。
+# 修法是 -ss 餵下一格 keyframe，讓退格剛好被補償掉。
+_cmd_ss = media.build_remux_cmd(fid, 7.25, 7.25, None, seek_at=10.875)
+check("給了 seek_at 就用它當 -ss（補償 copy 的退格）",
+      _cmd_ss[_cmd_ss.index("-ss") + 1] == "10.875", _cmd_ss)
+check("但 -to 仍然是這一段真正的結束時間（不跟著推後）",
+      _cmd_ss[_cmd_ss.index("-to") + 1] == "14.500", _cmd_ss)
+# 只推後 -ss 的話音訊會落後一整格（音訊是精確 seek 的，它真的從推後那一格
+# 開始）—— 實測 video 頭 600.600、audio 頭 602.580，比原本更糟。
+check("-noaccurate_seek 要在（不然音訊會落後推後量那麼多）",
+      "-noaccurate_seek" in _cmd_ss, _cmd_ss)
+check("-noaccurate_seek 也在 -i 前面（它是輸入端選項）",
+      _cmd_ss.index("-noaccurate_seek") < _cmd_ss.index("-i"), _cmd_ss)
 # **這一條是回歸測試。**copy 模式下 ffmpeg 一律退到前一個 keyframe 才起頭
 # （實測 file 334：要求 49.091 拿到 46.338，連續 12 個 keyframe 每個都退一格，
 # 且完全穩定、微調 -ss 也躲不掉）。舊寫法用 -output_ts_offset 無條件平移到
@@ -473,6 +494,95 @@ check("5.1 的 AAC 仍然要轉（不然 AUDIO_CHANNELS 的降混會在上階失
       cmd3[cmd3.index("-c:a") + 1] == "aac" and "-ac" in cmd3, cmd3)
 
 
+# ============================================================ 接起來
+head("[J 0] _produce 真的把下一格 keyframe 傳下去")
+
+# **上面那幾條只驗 build_remux_cmd 自己。**真正會壞掉的是接線：
+# seek_at 算在 _produce() 裡（刻意不讓 build_remux_cmd 自己查表，否則兩邊
+# 各查一次就可能拿到不同的答案）—— 所以要驗的是「跑一段出來，-ss 是下一格」。
+# 攔 subprocess.run 拿到真正送出去的指令，不實際叫 ffmpeg。
+import subprocess as _sp
+from app import keyframes as keyframes_mod
+
+_seen = []
+_orig_run = _sp.run
+
+
+def _fake_run(cmd, *a, **kw):
+    _seen.append(cmd)
+    # _produce 會檢查 returncode 與檔案大小，餵一個「成功」的假結果，
+    # 並把 stdout 那個檔案寫進去（它用 open(tmp,"wb") 接 stdout）
+    fh = kw.get("stdout")
+    if fh is not None and hasattr(fh, "write"):
+        fh.write(b"x" * 16)
+    class _R:
+        returncode = 0
+        stderr = b""
+    return _R()
+
+
+def _produce_cmd(fid_, index, prof):
+    """跑一次 _produce，回傳它真正送出去的 ffmpeg 指令。"""
+    _seen.clear()
+    _sp.run = _fake_run
+    try:
+        hls._produce(fid_, index, prof, DUR, hls.seg_dir(fid_, prof) / f"seg-{index}.ts")
+    finally:
+        _sp.run = _orig_run
+    return _seen[0] if _seen else []
+
+
+_pfid = add_file()
+_spans = hls.bounds_for(_pfid, DUR)
+_start1, _end1, _ = _spans[1]
+_prof = hls.profile_key(None, None, 0, hls.RUNG_REMUX)
+
+# **退格是量出來的，不是假設的。**實測把同一份視訊 -c copy 換個容器，
+# 退格行為就變了（mp4 不退、mkv 退一整格）—— 所以推不推由 seek_backoff 決定。
+# 沒量過（NULL）一律當作不退：不該推卻推了會讓那一段開頭整個缺一格，
+# 比「該推沒推」（只是重疊）嚴重得多。
+db.execute("UPDATE media_file SET seek_backoff=NULL WHERE id=?", (_pfid,))
+_pc0 = _produce_cmd(_pfid, 1, _prof)
+check("還沒量過退格 → -ss 就是 start（保守，不推）",
+      _pc0[_pc0.index("-ss") + 1] == f"{_start1:.3f}", _pc0)
+
+db.execute("UPDATE media_file SET seek_backoff=0 WHERE id=?", (_pfid,))
+_pc1 = _produce_cmd(_pfid, 1, _prof)
+check("量到不會退格 → -ss 還是 start（推了會缺開頭）",
+      _pc1[_pc1.index("-ss") + 1] == f"{_start1:.3f}", _pc1)
+
+db.execute("UPDATE media_file SET seek_backoff=1 WHERE id=?", (_pfid,))
+# seg-2 跨兩個 keyframe，推得動；seg-1 只跨一個，推過去就是空段（下面驗）。
+_start2, _end2, _ = _spans[2]
+_pc = _produce_cmd(_pfid, 2, _prof)
+_next_kf = keyframes_mod.seek_start_for(TIMES, _start2, _end2)
+check("量到會退格 → -ss 推到下一格 keyframe",
+      _pc[_pc.index("-ss") + 1] == f"{_next_kf:.3f}",
+      (_pc[_pc.index("-ss") + 1], _start2, _next_kf))
+check("而且它確實比 start 大（真的有推後）", _next_kf > _start2,
+      (_next_kf, _start2))
+check("-to 仍然是這一段的結束（不跟著推後）",
+      _pc[_pc.index("-to") + 1] == f"{_start2 + max(_end2 - _start2, 0.05):.3f}", _pc)
+check("-noaccurate_seek 有跟著出去", "-noaccurate_seek" in _pc, _pc)
+
+# **只跨一個 keyframe 的短段不能推。**下一格就是這一段的結尾，推過去等於
+# `-ss X -to X` —— 實測吐出來的分段從 415,668 位元組掉到 18,424（只有兩個
+# 封包），那一段的畫面整個不見。重疊只是瑕疵，空段是整段播不出來。
+_pc_short = _produce_cmd(_pfid, 1, _prof)
+check("會退格、但短段仍然不推（推過去就是空段）",
+      _pc_short[_pc_short.index("-ss") + 1] == f"{_start1:.3f}",
+      (_pc_short[_pc_short.index("-ss") + 1], _start1, _end1))
+
+# 下階完全不受影響：它沒有退格問題（重新編碼，不是 copy），
+# 推後 -ss 只會讓它少掉開頭那一段。
+_lp = hls.profile_key(720, None, 2800, hls.RUNG_TRANSCODE)
+_lc = _produce_cmd(_pfid, 1, _lp)
+check("下階的 -ss 仍然是 index*seg（沒有被推後）",
+      _lc[_lc.index("-ss") + 1] == "6.000", _lc)
+check("下階沒有 -noaccurate_seek（它不是 copy，沒有退格要補）",
+      "-noaccurate_seek" not in _lc, _lc)
+
+
 # ============================================================ 下線
 head("[J 0] 一段失敗 → 整個檔案的上階下線")
 
@@ -511,6 +621,18 @@ prof = db.q1("SELECT video_profile FROM media_file WHERE id=?", (fid,))["video_p
 check("問不到就寫 unknown", prof == keyframes.STREAM_UNKNOWN, prof)
 check("unknown 推不出 CODECS（所以那個屬性會被省略）",
       hls.codecs_attr(keyframes.STREAM_UNKNOWN, 41) is None)
+
+# **退格也要有升級路徑。**seek_backoff 是後來才加的欄位，而既有的檔案全都是
+# kf_state='ok'（不會再被排進佇列）—— 不補的話它們永遠是 NULL，
+# 而 NULL 一律當作「不退」，於是這次修的重疊對它們全部不會生效。
+db.execute("UPDATE media_file SET kf_state='ok', seek_backoff=NULL WHERE id=?", (fid,))
+check("有退格要量", keyframes.seek_backfill_count() >= 1,
+      keyframes.seek_backfill_count())
+keyframes.backfill_seek_backoff(limit=5)
+check("量過之後不會再排進來（量不出來也要寫 0，不然每次啟動都重跑）",
+      keyframes.seek_backfill_count() == 0, keyframes.seek_backfill_count())
+_bk = db.q1("SELECT seek_backoff FROM media_file WHERE id=?", (fid,))["seek_backoff"]
+check("量不出來就寫 0（保守：不推，寧可重疊也不要缺開頭）", _bk == 0, _bk)
 
 
 # ============================================================ 真的 remux 一段

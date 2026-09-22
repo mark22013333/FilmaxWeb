@@ -206,9 +206,15 @@ def scan_one(row: Dict[str, Any], cancel=None) -> str:
         return "pending"
     except Exception as e:                       # 問不到不是失敗：省略 CODECS 就好
         log.debug("profile/level 問不到 file=%s: %s", fid, e)
+    # 退格行為跟邊界表一起量：上階要用的兩個前置條件，分開更新就會出現
+    # 「有邊界表但不知道要不要補償」這種只差一半的狀態。
+    try:
+        backoff = measure_backoff(row, times, cancel=cancel)
+    except media.Cancelled:
+        return "pending"
     db.execute("""UPDATE media_file SET kf_state='ok', kf_error=NULL,
-                         video_profile=?, video_level=? WHERE id=?""",
-               (prof or STREAM_UNKNOWN, lvl, fid))
+                         video_profile=?, video_level=?, seek_backoff=? WHERE id=?""",
+               (prof or STREAM_UNKNOWN, lvl, backoff, fid))
     log.info("keyframe file=%s %s 個（%.1fs，%s）", fid, len(times),
              time.time() - t0, "本機直讀" if is_local else "走 FTP")
     return "ok"
@@ -297,6 +303,138 @@ def derive_bounds(times: List[float], positions: List[int], seg_seconds: float,
     return bounds
 
 
+def _backoff_cmd(source: str, is_local: bool, at: float) -> List[str]:
+    """問「`ffmpeg -ss at -c:v copy` 的落點是哪裡」。
+
+    **一定要用 ffmpeg，不能用 ffprobe 的 `-read_intervals` 代替**（試過）：
+    兩者的 seek 語意不同，`-read_intervals 600.600%+4` 在會退格的 mkv 上
+    照樣回 600.600，量不到退格。要量的就是 `build_remux_cmd()` 實際會用的
+    那條路徑，所以這裡的參數要跟它一致（`-copyts` + 輸入端 `-ss` + `-c:v copy`）。
+
+    **輸出 matroska 而不是 mpegts**：mpegts muxer 會把整段再往後平移約 1.4 秒
+    （實測），那層平移跟退格無關，混進來會讓量測多一個常數。
+    `-frames:v 1` 只要第一個封包，不必真的搬完四秒。
+    """
+    cmd = [media.resolve_tool("ffmpeg"), "-v", "error", "-nostdin", "-y",
+           "-copyts", "-ss", f"{at:.3f}"]
+    if not is_local:
+        cmd += [*media.source_headers(), "-rw_timeout", "30000000"]
+    cmd += ["-i", source, "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-c:v", "copy", "-frames:v", "1", "-f", "matroska", "-"]
+    return cmd
+
+
+def measure_backoff(row: Dict[str, Any], times: List[float],
+                    cancel=None) -> Optional[int]:
+    """`-ss` 在這個檔案上會不會退到前一個 keyframe。回 1／0，問不出來回 None。
+
+    **為什麼一定要量。**`build_remux_cmd()` 的 docstring 原本斷言「copy 模式下
+    ffmpeg 一律退到前一個 keyframe」—— 那句話對 mkv 成立，對 mp4 不成立。
+    實測把同一份視訊 `-c copy` 換個容器再測：
+
+        abr.mp4  -ss 3.480 → 落點 3.480   （完全不退）
+        abr.mkv  -ss 3.480 → 落點 0.000   （退一整格 3.48 秒）
+
+    **同樣的視訊內容、同樣的 keyframe，只換容器就換了行為。**
+    所以退格不是編碼的性質，推導不出來，只能對每個檔案實際問一次。
+
+    **猜錯的代價是不對稱的。**該推沒推 = 接縫重疊（畫面往回跳，就是原本的 bug）；
+    不該推卻推了 = 那一段開頭整個缺一格（實測 seg0 從 0.000 變成 4.880，
+    開頭 4.88 秒不見）。後者比前者嚴重，所以**問不出來就回 None**，
+    呼叫端當作「不退」處理。
+
+    量測點取檔案中段的一個 keyframe：開頭那幾個可能有 edit list／負時間戳之類
+    的特例，拿它當樣本會量到別的東西。
+    """
+    if len(times) < 6:
+        return None
+    probe_at = times[len(times) // 2]
+    prev = times[len(times) // 2 - 1]
+    source, is_local = source_for(row)
+    try:
+        code, out, _err = media.run_tool(_backoff_cmd(source, is_local, probe_at),
+                                         timeout=120, cancel=cancel)
+    except media.Cancelled:
+        raise
+    except Exception as e:
+        log.debug("退格量測失敗 file=%s: %s", row.get("id"), e)
+        return None
+    if code != 0 or not out:
+        return None
+    land = _first_pts(out)
+    if land is None:
+        return None
+    # 落點落在「前一個 keyframe」附近 → 會退格。容許半格的誤差：
+    # 落點是封包時間，跟 keyframe 表的值可能差幾毫秒。
+    tol = max((probe_at - prev) * 0.5, 0.05)
+    return 1 if abs(land - prev) <= tol else 0
+
+
+def _first_pts(mkv_bytes: bytes) -> Optional[float]:
+    """從 `_backoff_cmd` 吐出來的 matroska 位元組裡讀出那一個封包的 pts。
+
+    ffprobe 吃 stdin（`pipe:0`）—— 不必為了問一個數字把它落地成檔案。
+    """
+    import subprocess
+    try:
+        p = subprocess.run(
+            [media.resolve_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", "pipe:0"],
+            input=mkv_bytes, capture_output=True, timeout=60)
+    except Exception:
+        return None
+    vals = []
+    for line in p.stdout.decode("utf-8", "ignore").splitlines():
+        line = line.strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            vals.append(float(line))
+        except ValueError:
+            continue
+    return min(vals) if vals else None
+
+
+def seek_start_for(times: List[float], start: float,
+                   end: Optional[float] = None) -> float:
+    """上階要餵給 `ffmpeg -ss` 的值：`times` 裡**下一個** keyframe。
+
+    **為什麼不是直接給 `start`。**copy 模式下 ffmpeg 一律退到前一個 keyframe
+    才開始抄 —— 即使 `start` 本身就是一個貨真價實的 keyframe（實測 file 360：
+    邊界 600.600 在容器裡是 `flags=K__`，`-ss 600.600` 的落點仍然是 598.598）。
+    退格量修不掉（copy 需要前一個 IDR 才敢起頭，微調 `-ss` 也躲不掉，
+    `media.build_remux_cmd()` 的 docstring 已經為這件事付過學費）。
+
+    **能改的是餵給它什麼起點。**把 `-ss` 往後推一格，demux 退回來之後剛好
+    落在我們宣告的邊界上。實測三種形狀都成立：
+
+        file 360（均勻 2.0s）          接縫重疊 2.044 → 0.042 秒
+        file 297（0.959~10.428s）      接縫重疊 0.251 秒
+        file 438（0.133~0.934s）       接縫重疊 0.100 秒
+
+    **推後量是查表得到的，不是算的。**全庫 172 個會發上階的檔案裡有 96 個
+    `gap_max - gap_min > 0.5` —— 間距均勻不是常態，`start + gap_med` 那種算法
+    在稀疏處會跳過好幾格。查表才能讓上面那三種形狀用同一條規則。
+
+    **找不到下一格就回 `start` 本身。**那是最後一段的情形（`start` 已經是最後
+    一個 keyframe，或尾巴那段的起點在所有 keyframe 之後）。這時候退格沒有東西
+    可以補償，但也不會更糟 —— 最後一段後面沒有下一段，沒有接縫會重疊。
+
+    **`end` 是必要的保險，不是選用的精修。**只跨一個 keyframe 的短段
+    （`derive_bounds` 在格線附近會切出這種段）下一格就是這一段的**結尾**，
+    推過去等於 `-ss X -to X`：ffmpeg 吐出一個只有兩個封包的空殼
+    （實測 415,668 → 18,424 位元組），那一段的畫面整個不見。
+    所以下一格只要碰到或越過 `end` 就不推 —— 退格造成的重疊只是瑕疵，
+    推成空段是整段播不出來，兩者不是同一個量級。
+    """
+    for t in times:
+        if t > start + 1e-6:
+            if end is not None and t >= end - 1e-6:
+                return start        # 推過去會把這一段推成空的
+            return t
+    return start
+
+
 def bandwidth_for(bounds: List[Tuple[float, float, int]],
                   audio_kbps: int = 0) -> Tuple[int, int]:
     """回傳 (BANDWIDTH, AVERAGE-BANDWIDTH)，單位 bps，已含音訊。
@@ -372,6 +510,55 @@ def backfill_stream_info(cancel=None, limit: Optional[int] = None) -> int:
     return done
 
 
+def backfill_seek_backoff(cancel=None, limit: Optional[int] = None) -> int:
+    """把已經有邊界表、但還沒量過退格的檔案補起來。回傳補了幾個。
+
+    跟 `backfill_stream_info()` 同一個理由（升級路徑）：`seek_backoff` 是後來
+    才加的欄位，而 `kf_state='ok'` 的檔案不會再被排進佇列 —— 不補的話既有的
+    172 個會發上階的檔案永遠是 NULL，而 NULL 一律當作「不退」，
+    於是 R 章要修的那個重疊對它們全部不會生效。
+
+    **比 profile／level 貴。**這一支每個檔案要真的跑一次 `ffmpeg -ss`
+    （`-frames:v 1`，只搬一個封包），不是讀檔頭。所以放在 profile／level
+    後面，並且照舊吃 `cancel`。
+    """
+    done = 0
+    while limit is None or done < limit:
+        if cancel is not None and cancel.is_set():
+            break
+        row = db.q1("""SELECT id, ftp_path FROM media_file
+                       WHERE kf_state='ok' AND seek_backoff IS NULL
+                       ORDER BY id LIMIT 1""")
+        if not row:
+            break
+        fid = int(row["id"])
+        tbl = table_for(fid)
+        bk = None
+        if tbl:
+            try:
+                bk = measure_backoff(dict(row), tbl["times"], cancel=cancel)
+            except media.Cancelled:
+                break
+            except Exception as e:
+                log.debug("回填退格失敗 file=%s: %s", fid, e)
+        # **量不出來也要寫 0，不要留 NULL。**NULL 的意思是「還沒量過」，
+        # 而這支的條件就是 NULL —— 留著會每次啟動都重跑一次，永遠補不完。
+        # 寫 0 的語意（不推）正好也是量不出來時該有的保守行為。
+        db.execute("UPDATE media_file SET seek_backoff=? WHERE id=?",
+                   (0 if bk is None else bk, fid))
+        done += 1
+    if done:
+        log.info("量好 %s 個檔案的 -ss 退格行為（上階的分段邊界要用）", done)
+    return done
+
+
+def seek_backfill_count() -> int:
+    """還等著量退格的檔案數（升級路徑，見 backfill_seek_backoff）。"""
+    r = db.q1("""SELECT COUNT(*) AS n FROM media_file
+                 WHERE kf_state='ok' AND seek_backoff IS NULL""")
+    return int(r["n"]) if r else 0
+
+
 def pending_count() -> int:
     r = db.q1("SELECT COUNT(*) AS n FROM media_file WHERE kf_state IN ('pending','failed')")
     return int(r["n"]) if r else 0
@@ -418,6 +605,11 @@ def run_queue(cancel=None, limit: Optional[int] = None) -> Dict[str, int]:
         backfill_stream_info(cancel=cancel)
     except Exception as e:
         log.debug("回填 profile/level 整批失敗：%s", e)
+    # 退格量測放在後面：它比讀檔頭貴（每檔要真的跑一次 ffmpeg -ss）。
+    try:
+        backfill_seek_backoff(cancel=cancel)
+    except Exception as e:
+        log.debug("回填退格整批失敗：%s", e)
     done = 0
     while True:
         if cancel is not None and cancel.is_set():
@@ -444,13 +636,15 @@ def start_background(cancel=None) -> bool:
             return False
         n = pending_count()
         b = backfill_count()
-        # 待辦是零、但還有 profile／level 要補的話也要開 —— 升級之後
+        sb = seek_backfill_count()
+        # 待辦是零、但還有 profile／level 或退格要補的話也要開 —— 升級之後
         # 既有的檔案全都是 kf_state='ok'，`pending_count()` 會是零。
-        if n == 0 and b == 0:
+        if n == 0 and b == 0 and sb == 0:
             return False
 
         def worker():
-            log.info("keyframe 佇列開始，待辦 %s 個（另有 %s 個要補 profile／level）", n, b)
+            log.info("keyframe 佇列開始，待辦 %s 個"
+                     "（另有 %s 個要補 profile／level、%s 個要量退格）", n, b, sb)
             try:
                 stats = run_queue(cancel=cancel)
                 log.info("keyframe 佇列結束：%s", stats)

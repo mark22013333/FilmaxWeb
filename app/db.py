@@ -333,6 +333,13 @@ _ADDED_COLUMNS = {
         # 一份播放清單裡混著 copy 與重編的分段是更糟的失效（J 章第 0 層）。
         ("remux_state", "TEXT"),
         ("remux_error", "TEXT"),
+        # `-ss` 在這個檔案上會不會退到前一個 keyframe。**量出來的，不是猜的**：
+        # 實測同一段視訊內容，容器就足以改變行為 —— mkv 退一整格、mp4 完全不退
+        # （`-c copy` 換容器再測，退格從 0 變成 3.48 秒）。所以這不是編碼的性質，
+        # 不能從 codec／profile 推導，只能對每個檔案實際問一次。
+        # 1 = 會退（上階的 `-ss` 要往後推一格補償），0 = 不退（推了反而會缺開頭）。
+        # NULL = 還沒量過，這時候一律當作不退（保守：寧可重疊也不要缺畫面）。
+        ("seek_backoff", "INTEGER"),
     ],
 }
 
@@ -606,7 +613,9 @@ ON CONFLICT(ftp_path) DO UPDATE SET
     -- 發明一套判斷 —— 兩套判斷遲早會不一致，而不一致的那一邊會安靜地留著舊資料。
     kf_state='pending', kf_error=NULL,
     -- 上階的下線紀錄也一起清掉：檔案換了，之前那個失敗的理由不再適用。
-    remux_state=NULL, remux_error=NULL
+    remux_state=NULL, remux_error=NULL,
+    -- 退格行為跟著容器走，檔案換了就要重量（跟 kf_state 同一個訊號）。
+    seek_backoff=NULL
 """
 _FILE_TOUCH = "UPDATE media_file SET seen_at=? WHERE id=?"
 _PHOTO_UPSERT = """
