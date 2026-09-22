@@ -67,7 +67,12 @@ root.mkdir(parents=True, exist_ok=True)
 src = root / "abr.mp4"
 subprocess.run([
     ff, "-hide_banner", "-loglevel", "error",
-    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25",
+    # **解析度要夠大，遠端階梯才切得出好幾階。**遠端現在是 transcode-only
+    # （remux 不進 ABR），所以可切的階全部來自 _ABR_STEPS —— 而那幾階會被
+    # _ABR_MIN_GAP(100px) 與 _ABR_MIN_HEIGHT(240) 砍。640x360 只剩 360／240
+    # 兩階（240→180 差 60 < 100 就不發），再被 capLevelToPlayerSize 一擋就
+    # 可能只剩一階，這支測試要驗的「切階」就無從發生。1280x720 給得出三階。
+    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25",
     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
     "-t", "120",
     "-vf", "drawtext=text='%{eif\\:t\\:d}':fontsize=64:fontcolor=white:x=20:y=20",
@@ -96,7 +101,7 @@ fid = db.execute(
     """INSERT INTO media_file(item_id,ftp_path,filename,ext,size,duration,width,height,
                               video_codec,audio_codec,audio_tracks,bitrate,probe_state,
                               play_mode,kf_state,seen_at,added_at)
-       VALUES(?,?,?,'mp4',?,?,640,360,'h264','aac',?,1200000,'ok','hls','pending',?,?)""",
+       VALUES(?,?,?,'mp4',?,?,1280,720,'h264','aac',?,1200000,'ok','hls','pending',?,?)""",
     (item, "/abr.mp4", "abr.mp4", src.stat().st_size, dur,
      json.dumps([{"index": 1, "codec": "aac", "channels": 2, "default": 1}]),
      now, now)).lastrowid
