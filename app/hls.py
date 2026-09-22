@@ -186,7 +186,10 @@ def rungs_for(file_id: int, duration: float) -> List[int]:
 # 4.00／5.51 秒 —— **除不盡 6 秒**，所以每段只能跨兩個 keyframe（約 10 秒），
 # 段數與下階差了一截，偏差一路累加到 1256 秒。那三個檔案的上階就不要進
 # ABR master（本身沒壞，只是跟下階拼不成同一條時間軸）。
-_ABR_ALIGN_TOLERANCE = 1.5      # 偏差超過這個倍數的分段長度就不併進 ABR
+# ABR rendition 的 seg-N 必須代表同一段影片。舊值 1.5 代表 6 秒分段竟可容許
+# 9 秒偏差，連「少一整段」都會被判定為可切換；那正是畫面回退的來源。
+# 0.25 秒已比一個正常畫格寬很多，但不再容許肉眼可見的 segment 級錯位。
+_ABR_ALIGN_TOLERANCE_SECONDS = 0.25
 
 
 def abr_alignable(file_id: int, duration: float) -> Tuple[bool, str]:
@@ -204,17 +207,31 @@ def abr_alignable(file_id: int, duration: float) -> Tuple[bool, str]:
     spans = bounds_for(file_id, duration)
     if not spans:
         return False, "沒有邊界表"
-    tol = max(seg * _ABR_ALIGN_TOLERANCE, 0.1)
+
+    expected = max(1, math.ceil(duration / seg))
+    if len(spans) != expected:
+        return False, (f"上階有 {len(spans)} 段、下階有 {expected} 段；"
+                       "段數不同代表 seg-N 已經不是同一段影片")
+
+    tol = _ABR_ALIGN_TOLERANCE_SECONDS
     worst = 0.0
     worst_i = 0
-    for i, (start, _end, _b) in enumerate(spans):
-        drift = abs(start - i * seg)
-        if drift > worst:
-            worst, worst_i = drift, i
+    worst_edge = "start"
+    for i, (start, end, _b) in enumerate(spans):
+        expected_start = i * seg
+        expected_end = min((i + 1) * seg, duration)
+        for edge, actual, wanted in (
+            ("start", start, expected_start),
+            ("end", end, expected_end),
+        ):
+            drift = abs(actual - wanted)
+            if drift > worst:
+                worst, worst_i, worst_edge = drift, i, edge
+
     if worst > tol:
-        return False, (f"上階 seg-{worst_i} 與下階差 {worst:.1f} 秒"
-                       f"（容許 {tol:.1f}），不能放進同一份 ABR master")
-    return True, f"最大偏差 {worst:.1f} 秒，在容許範圍內"
+        return False, (f"上階 seg-{worst_i} 的 {worst_edge} 與固定格線差 {worst:.3f} 秒"
+                       f"（容許 {tol:.2f}），不能放進同一份 ABR master")
+    return True, f"所有分段起訖最大偏差 {worst:.3f} 秒"
 
 
 # ffprobe 的 profile 字串 → avc1.PPCCLL 的前四位（PP=profile_idc、CC=約束旗標）。
@@ -439,27 +456,27 @@ def direct_ok_for_remote(src_bitrate_bps: Optional[int], has_remux: bool) -> Tup
     if kbps <= cap:
         return True, f"片源 {kbps} kbps 在遠端安全範圍內（上限 {cap}）"
     return False, (f"片源 {kbps} kbps 超過遠端上限 {cap}，direct 無階可降"
-                   + ("，改走 remux 上階（畫質相同）" if has_remux else "，改走轉碼 HLS"))
+                   + ("，改走 HLS（目前遠端採 transcode-only ABR）"
+                      if has_remux else "，改走轉碼 HLS"))
 
 
 def build_master(file_id: int, profile: str, remote: bool = False,
                  duration: float = 0.0, auto: bool = True) -> str:
-    """master playlist。**區網發一階、遠端發 remux 上階 ＋ 一條轉碼階梯。**
+    """master playlist。**區網一階；遠端只發固定時間格線的轉碼 ABR 階梯。**
 
-    區網不需要 ABR：鏈路夠寬，發單一的上階（remux）就是零轉碼路徑 ——
-    這是整個設計最確定會兌現的那一塊，所以它是規則不是最佳化。
-    遠端發多階讓客戶端自己按緩衝水位選（伺服器不猜頻寬 —— 那正是
-    Netflix 在 50 萬使用者上驗證後放棄的做法）。
+    遠端曾把 remux 上階與 transcode 階梯混在同一份 master；真實長片只要
+    中途出現一次 long GOP，兩邊的 seg-N 就可能差一整段，hls.js 切階時把
+    已播放過的畫格 append 回 SourceBuffer。現在遠端一律使用 transcode-only
+    timeline，所有 rendition 都從同一個固定 6 秒格線產生。
 
-    **為什麼遠端的轉碼階不只一階**（J 章第 1 層）：上階的峰值是 21.7 Mbps，
-    行動網路根本選不到它 —— 也就是說在只有「上階＋單一轉碼階」的形狀下，
-    遠端實際上只有一階可用，卡頓時無階可降。手機在收訊起伏的地方看片，
-    需要的正是那條往下的路。
+    區網仍維持單一 rendition；非 MKV 可用 remux 零轉碼。MKV 暫時改走
+    transcode，因為使用者回報的 Matroska/H.264 大檔即使不切階也會出現
+    frame regression，先把順暢播放放在零轉碼之前。
 
     `auto` = 使用者沒有手動挑畫質。手動挑過的話不發高畫質頂階（那一檔就是
     他要的上限）。預設 True 是為了讓既有呼叫端與測試不必全部改。
     """
-    row = db.q1("""SELECT width, height, bitrate, size, video_profile, video_level
+    row = db.q1("""SELECT width, height, bitrate, size, ext, video_profile, video_level
                    FROM media_file WHERE id=?""", (file_id,))
     w = (row["width"] if row else None) or 1920
     h = (row["height"] if row else None) or 1080
@@ -498,22 +515,33 @@ def build_master(file_id: int, profile: str, remote: bool = False,
                           codecs_attr("High", _level_int(out_h)))
         return inf, f"index.m3u8?p={profile_key(step_h, prof_a, step_b, RUNG_TRANSCODE)}"
 
-    if upper and not remote:
-        # 區網：只發上階。播放全程不會有任何 ffmpeg 被啟動。
-        # **這條路只有一個 rendition，所以不必問對齊** —— 沒有另一階可以
-        # 切過去，`abr_alignable()` 要擋的那種失效在這裡不存在。
+    source_ext = ((row["ext"] if row else None) or "").lower()
+
+    if upper and not remote and source_ext != "mkv":
+        # 區網的 MP4-family 片源仍保留零轉碼 remux。
+        # MKV 暫時不走這條路：實機回報顯示大容量 Matroska/H.264 在單一 remux
+        # rendition 也可能出現呈現畫格回退；先走固定格線 transcode，等有
+        # 真實 segment PTS 驗證後再開回來。順暢播放優先於零轉碼。
         lines += [upper, f"index.m3u8?p={upper_profile}"]
         return "\n".join(lines) + "\n"
 
     if upper:
-        # 遠端要把上階跟轉碼階梯放進同一份 master，hls.js 會在它們之間切 ——
-        # 所以這裡是唯一需要「兩階的 seg-N 是不是同一段」的地方。
-        ok, why = abr_alignable(file_id, duration)
-        if ok:
-            lines += [upper, f"index.m3u8?p={upper_profile}"]
+        if remote:
+            # 遠端 ABR **一律只混用 transcode rendition**。即使 remux 邊界看起來
+            # 接近固定格線，只要中途少一個 keyframe 格線，seg-N 就會整段錯位；
+            # hls.js 切階後會把已播放過的 media time append 回 SourceBuffer，
+            # 使用者看到的就是「每幾秒畫面往回跳」。
+            log.info("file=%s 的 remux 不進遠端 ABR：遠端採 transcode-only timeline", file_id)
+        elif source_ext == "mkv":
+            log.info("file=%s 是 MKV，區網也暫停 remux，改用固定格線 transcode", file_id)
         else:
-            # 對不齊就不發。**畫質少一階，好過 ABR 一切就倒退畫面。**
-            log.info("file=%s 的上階不進遠端 ABR master：%s", file_id, why)
+            # 理論上已在上面的 LAN fast path return；留這個分支避免將來條件改動
+            # 時又不小心把 remux 混進多階 master。
+            ok, why = abr_alignable(file_id, duration)
+            if ok:
+                lines += [upper, f"index.m3u8?p={upper_profile}"]
+            else:
+                log.info("file=%s 的上階不進 ABR master：%s", file_id, why)
 
     # 遠端發整條階梯讓 ABR 有得降；區網（走到這裡代表沒有上階可給）維持單一階
     # —— 鏈路夠寬，多發幾階只是多養幾份轉碼快取，換不到東西。
