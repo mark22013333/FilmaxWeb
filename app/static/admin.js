@@ -408,6 +408,316 @@ function wireAcl(el, ac) {
   });
 }
 
+/* ---------------------------------------------------------------- 檔案選擇器
+
+   取代「自己去詳情頁抄 file_id 回來貼」。那個做法的失敗方式很安靜：
+   貼錯一個數字不會報錯，而是對**另一支存在的片**跑了一次好幾分鐘的實測。
+
+   形狀照 aclBlock／wireAcl 那一對：一個純函式回 HTML 字串、一個函式接線。
+   不要用 <select>：option 在 Chrome/Safari 套不了樣式，而且一列要放兩行
+   （片名摘要 + 檔名）option 做不到。篩選也不能靠 option.hidden ——
+   那個屬性只有 Firefox 認（見 wireAcl 裡那段註解）。 */
+
+/** 一列的主行文字。純函式，測試與渲染共用。 */
+/** 拆成三份而不是一串字：標題、集數、技術規格。
+ *
+ *  **為什麼要拆。**原本全部串成「沙丘：第二部 · 2024 · 4K · 166 分」一行等寬
+ *  同色的字，掃起來是一團灰 —— 眼睛要找的是片名，卻得先讀過年份與規格。
+ *  拆開之後片名可以用正常字重與 --text，規格降成小字 chip，一眼就分得出
+ *  「哪一列是我要的片」與「這一列是哪個版本」。 */
+function fpParts(it) {
+  const pad2 = n => String(n).padStart(2, '0');
+  // 沒刮到的孤兒檔沒有 title，退回檔名去掉副檔名 —— 標題空著比什麼都糟。
+  const title = it.title || (it.filename || '').replace(/\.[^.]+$/, '') || `#${it.id}`;
+  const ep = (it.season != null && it.episode != null)
+    ? `S${pad2(it.season)}E${pad2(it.episode)}` : '';
+  const meta = [];
+  if (it.kind === 'movie' && it.year) meta.push(String(it.year));
+  if (it.height) meta.push(it.height >= 2160 ? '4K' : it.height + 'p');
+  // 片長一律用「N 分」而不是 dur()：dur() 超過一小時會變成「1 小時 55 分」，
+  // 選單裡長度不一很難掃。選單是拿來比對的，數字比句子好用。
+  if (it.duration) meta.push(Math.round(it.duration / 60) + ' 分');
+  return { title, ep, meta };
+}
+
+/** 已選之後顯示在輸入框裡的那一行（只有這裡需要串成一串）。 */
+function fpLabel(it) {
+  const p = fpParts(it);
+  return [p.title, p.ep, ...p.meta].filter(Boolean).join(' · ');
+}
+
+/** 檔名太長時**從中間**省略。
+ *  同一支片的多個檔案差異通常在尾巴（-part2、.720p vs .1080p），
+ *  尾巴被切掉等於把唯一的消歧義資訊丟了。 */
+function fpShortName(name) {
+  const s = String(name || '');
+  return s.length <= 54 ? s : s.slice(0, 26) + '…' + s.slice(-24);
+}
+
+const FP_KIND = { home: '家庭', jav: 'JAV' };
+
+function filePick({ id, placeholder = '選擇影片（可直接打字搜尋）…', value = null }) {
+  const v = value ? fpLabel(value) : '';
+  return `
+  <div class="fpick" id="${esc(id)}">
+    <div class="fpick-field">
+      <input class="fpick-input" id="${esc(id)}-q" type="text" role="combobox"
+             autocomplete="off" spellcheck="false"
+             aria-expanded="false" aria-autocomplete="list" aria-haspopup="listbox"
+             aria-controls="${esc(id)}-list" placeholder="${esc(placeholder)}"
+             value="${esc(v)}">
+      <button type="button" class="fpick-x" id="${esc(id)}-x" tabindex="-1"
+              aria-label="清除已選的檔案"${value ? '' : ' hidden'}>✕</button>
+      <!-- 這個箭頭不只是裝飾：它是「這是一個下拉選單，點了會有東西掉下來」
+           的唯一視覺線索。沒有它，一個空的框就只是一個要你自己打字的輸入框
+           —— 而那正是這整件事要取代的東西。 -->
+      <button type="button" class="fpick-caret" id="${esc(id)}-caret" tabindex="-1"
+              aria-label="展開清單">▾</button>
+    </div>
+    <div class="fpick-pop" id="${esc(id)}-pop" hidden>
+      <div class="fpick-list" id="${esc(id)}-list" role="listbox" aria-label="搜尋結果"></div>
+    </div>
+    <div class="fpick-picked" id="${esc(id)}-picked"${value ? '' : ' hidden'}>${
+      value ? esc(value.filename || '') : ''}</div>
+    <div class="fpick-live" id="${esc(id)}-live" role="status" aria-live="polite"></div>
+  </div>`;
+}
+
+/** 接線。回傳 { get, set, clear, destroy }。
+ *  get() 回 null 或 item 物件；要 file_id 就用 .id。 */
+function wireFilePick(el, { id, onPick = null, initial = null }) {
+  const root = el.querySelector('#' + id);
+  if (!root) return { get: () => null, set() {}, clear() {}, destroy() {} };
+  const input = root.querySelector('.fpick-input');
+  const pop = root.querySelector('.fpick-pop');
+  const list = root.querySelector('.fpick-list');
+  const xbtn = root.querySelector('.fpick-x');
+  const caret = root.querySelector('.fpick-caret');
+  const picked = root.querySelector('.fpick-picked');
+  const live = root.querySelector('.fpick-live');
+
+  let items = [];           // 目前清單
+  let cur = -1;             // 鍵盤游標（-1 = 沒有 active 列）
+  let sel = initial;        // 已選的 item
+  let seq = 0;              // 請求序號
+  let ctrl = null;          // AbortController
+  let timer = null;         // debounce
+  let lastQ = null;         // 同一個 q 不重發
+  let open = false;
+
+  const say = msg => { if (live.textContent !== msg) live.textContent = msg; };
+
+  const setOpen = v => {
+    open = v;
+    pop.hidden = !v;
+    root.dataset.open = v ? '1' : '0';      // 箭頭靠這個轉方向
+    input.setAttribute('aria-expanded', v ? 'true' : 'false');
+    if (!v) { cur = -1; input.removeAttribute('aria-activedescendant'); }
+  };
+
+  const paintMsg = (html, bad) =>
+    { list.innerHTML = `<div class="fpick-msg${bad ? ' bad' : ''}">${html}</div>`; };
+
+  const paint = (rows, more) => {
+    items = rows;
+    if (!rows.length) {
+      const q = input.value.trim();
+      // 沒打字卻什麼都沒有 = 片庫是空的，不要說「沒有符合『』的檔案」。
+      paintMsg(q && !sel
+        ? `沒有符合「<b>${esc(q)}</b>」的檔案。
+           <div class="fpick-hint">片名、原文片名、檔名都會找。試試少打幾個字。</div>`
+        : '片庫裡還沒有任何檔案。<div class="fpick-hint">掃描完成後這裡就會有東西。</div>');
+      say('沒有符合的檔案');
+      return;
+    }
+    let prev = '';
+    list.innerHTML = rows.map((it, n) => {
+      const p = fpParts(it);
+      const dup = p.title === prev;   // 跟上一列同一部片 → 檔名是唯一的區別
+      prev = p.title;
+      const kind = FP_KIND[it.kind];
+      return `<div class="fpick-opt${dup ? ' dup' : ''}" role="option"
+                   id="${esc(id)}-o${n}" data-n="${n}" aria-selected="false">
+        <div class="fpick-main">
+          <span class="fpick-title">${esc(p.title)}</span>
+          ${p.ep ? `<span class="fpick-ep">${esc(p.ep)}</span>` : ''}
+          ${kind ? `<span class="fpick-kind">${esc(kind)}</span>` : ''}
+          ${it.probe_state && it.probe_state !== 'ok'
+            ? '<span class="fpick-warn">未分析</span>' : ''}
+        </div>
+        <div class="fpick-sub">
+          <span class="fpick-file" title="${esc(it.filename || '')}">${
+            esc(fpShortName(it.filename))}</span>
+          ${p.meta.map(m => `<span class="fpick-tag">${esc(m)}</span>`).join('')}
+          <span class="fpick-id">#${it.id}</span>
+        </div>
+      </div>`;
+    }).join('') + (more
+      ? '<div class="fpick-more">還有更多，再打幾個字縮小範圍</div>' : '');
+    say(`找到 ${rows.length} 個檔案`);
+  };
+
+  const move = n => {
+    const opts = [...list.querySelectorAll('.fpick-opt')];
+    if (!opts.length) return;
+    if (cur >= 0 && opts[cur]) {
+      opts[cur].classList.remove('on');
+      opts[cur].setAttribute('aria-selected', 'false');
+    }
+    cur = (n + opts.length) % opts.length;     // 環繞
+    opts[cur].classList.add('on');
+    opts[cur].setAttribute('aria-selected', 'true');
+    input.setAttribute('aria-activedescendant', opts[cur].id);
+    // nearest 不是 center —— center 會讓清單在每次按鍵時都跳一下
+    opts[cur].scrollIntoView({ block: 'nearest' });
+  };
+
+  const run = async (q) => {
+    const my = ++seq;
+    if (ctrl) ctrl.abort();
+    ctrl = new AbortController();
+    // 還沒有任何結果時才顯示「搜尋中」。已經有舊結果就讓它留著，
+    // 只在頂端跑一條線 —— 清單閃一下變空再變回來，使用者一定看得到。
+    if (!items.length) paintMsg('搜尋中⋯');
+    pop.insertBefore(Object.assign(document.createElement('div'),
+      { className: 'fpick-bar' }), pop.firstChild);
+    try {
+      const r = await api(`/admin/files?q=${encodeURIComponent(q)}`,
+                          { signal: ctrl.signal });
+      // **序號檢查不能省。**abort 只保證 fetch 的 promise 被 reject，
+      // 回應已經在飛行途中、json() 已經完成的那些攔不到 ——
+      // 舊結果蓋掉新結果的症狀是「清單內容跟輸入框對不上」，很難查。
+      if (my !== seq) return;
+      lastQ = q;
+      paint(r.items || [], !!r.more);
+      setOpen(true);
+    } catch (e) {
+      if (e.name === 'AbortError' || my !== seq) return;
+      paintMsg(`搜尋失敗：${esc(e.message)}`, true);
+      setOpen(true);
+    } finally {
+      if (my === seq) {
+        const bar = pop.querySelector('.fpick-bar');
+        if (bar) bar.remove();
+      }
+    }
+  };
+
+  const ask = (q, now) => {
+    clearTimeout(timer);
+    if (q === lastQ && items.length) { setOpen(true); return; }
+    timer = setTimeout(() => run(q), now ? 0 : 300);
+  };
+
+  const choose = n => {
+    const it = items[n];
+    if (!it) return;
+    sel = it;
+    input.value = fpLabel(it);
+    picked.textContent = it.filename || '';
+    picked.hidden = false;
+    xbtn.hidden = false;
+    setOpen(false);
+    say(`已選 ${fpLabel(it)}，按 Backspace 或 ✕ 可重新搜尋`);
+    if (onPick) onPick(it);
+  };
+
+  const clear = (focus) => {
+    sel = null; lastQ = null; items = [];
+    input.value = '';
+    picked.hidden = true; picked.textContent = '';
+    xbtn.hidden = true;
+    setOpen(false);
+    if (onPick) onPick(null);
+    if (focus) input.focus();
+  };
+
+  input.oninput = () => {
+    // 已經選了又開始打字 = 他要換一個。立刻把選擇放掉，不然畫面顯示 A、
+    // 實際送出的還是 B。
+    if (sel) { sel = null; picked.hidden = true; xbtn.hidden = true; if (onPick) onPick(null); }
+    cur = -1;
+    ask(input.value.trim());
+  };
+
+  /* **點一下就要有清單掉下來。**這是「下拉選單」與「搜尋框」的差別，
+     也是這個元件存在的理由 —— 一個點了沒反應的空框，跟原本那個要你自己
+     去別的頁面抄 id 回來貼的輸入框，對使用者來說是同一個東西。
+
+     所以 focus／click／箭頭三條路都走同一個 openList()：已經有結果就直接
+     開，沒有就先去要一批回來（q 空白 = 最近加入的 30 筆）。 */
+  const openList = () => {
+    if (open) return;
+    // **已經選好了又點開 = 他想換一個。**這時候清單要回到完整的那一份，
+    // 不是上一次搜尋剩下的那三筆 —— 選單裡只剩自己，看起來像「沒有別的可選」。
+    if (sel) { lastQ = null; items = []; ask('', true); return; }
+    if (items.length) { setOpen(true); return; }
+    ask(input.value.trim(), true);
+  };
+
+  input.onfocus = openList;
+  input.onclick = openList;
+  caret.onclick = () => { if (open) setOpen(false); else { input.focus(); openList(); } };
+
+  input.onkeydown = e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!open) { ask(input.value.trim(), true); return; }
+      move(cur + (e.key === 'ArrowDown' ? 1 : -1));
+    } else if (e.key === 'Home' && open) { e.preventDefault(); move(0); }
+    else if (e.key === 'End' && open) { e.preventDefault(); move(items.length - 1); }
+    else if (e.key === 'Enter') {
+      if (open && cur >= 0) { e.preventDefault(); choose(cur); }
+    } else if (e.key === 'Escape') {
+      // 已選的東西不要因為 Escape 就消失，那是資料損失。只收浮層。
+      // stopPropagation 是防著哪天這個元件被放進 confirmBox —— 那裡的
+      // 全域 Escape 會把整個對話框關掉。
+      if (open) { e.preventDefault(); e.stopPropagation(); setOpen(false); }
+      else if (!sel && input.value) clear(true);
+    } else if (e.key === 'Backspace' && sel) {
+      // 已選狀態下的第一下 Backspace = 清除選擇（不是刪一個字）。
+      e.preventDefault(); clear(true);
+    } else if (e.key === 'Tab') {
+      setOpen(false);       // Tab 是「我要走了」，不是「就選這個」
+    }
+  };
+
+  // 清單一個委派就夠，不要掛 30 個 handler
+  list.onclick = e => {
+    const row = e.target.closest('.fpick-opt');
+    if (row) choose(+row.dataset.n);
+  };
+  list.onmousemove = e => {
+    const row = e.target.closest('.fpick-opt');
+    // 鍵盤與滑鼠共用同一個 .on，不要一個 hover 一個 active —— 會同時亮兩列
+    if (row && +row.dataset.n !== cur) move(+row.dataset.n);
+  };
+  // mousedown 時擋掉預設行為，避免 input 先失焦讓浮層收起來、點擊落空
+  list.onmousedown = e => e.preventDefault();
+  xbtn.onclick = () => clear(true);
+
+  // 點外面收起來。**不要用 blur** —— blur 在 mousedown 之後、click 之前觸發，
+  // 清單一收起來使用者的點擊就落空了（自製 combobox 最經典的 bug）。
+  const outside = e => {
+    // 後台每次 render() 都把容器 innerHTML 整個換掉，DOM 沒了監聽還在。
+    // 監聽自己檢查自己還在不在，不然切幾次分頁就累積幾份。
+    // （renderCache 的 warmTimer 用的是同一招。）
+    if (!root.isConnected) {
+      document.removeEventListener('pointerdown', outside, true);
+      return;
+    }
+    if (!e.target.closest('#' + id)) setOpen(false);
+  };
+  document.addEventListener('pointerdown', outside, true);
+
+  return {
+    get: () => sel,
+    set: it => { if (it) { items = [it]; choose(0); } else clear(); },
+    clear: () => clear(false),
+    destroy: () => document.removeEventListener('pointerdown', outside, true),
+  };
+}
+
 /* ================================================================ 媒體庫 */
 TABS.library = async el => {
   const [st, pr, ac, mn] = await Promise.all(
@@ -791,10 +1101,8 @@ TABS.playback = async el => {
         同一段影片跑好幾種設定並計時，用來找出是哪一個設定拖慢的。
         倍速低於 1 就代表播放會卡。</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <input id="benchId" type="number" placeholder="檔案 id（詳情頁看得到）"
-          style="width:190px;padding:9px 11px;border-radius:9px;background:var(--bg-2);
-          border:1px solid var(--line);min-height:40px">
-        <button class="btn" id="bBench">開始實測</button>
+        ${filePick({ id: 'benchPick', placeholder: '選擇要實測的影片…' })}
+        <button class="btn" id="bBench" disabled>開始實測</button>
       </div>
       <div id="benchOut" style="margin-top:12px"></div>
     </div>
@@ -812,11 +1120,11 @@ TABS.playback = async el => {
     </div>
 
     <h3 class="sub">快取</h3>
-    <div class="box">
-      <button class="btn" id="bCache">清空轉碼快取</button>
-      <span style="color:var(--muted);margin-left:10px;font-size:12.5px">
-        清掉之後第一次播放會重新轉碼，不影響片源。</span>
+    <div class="box" id="cacheBox">
+      <div style="color:var(--muted);font-size:12.5px">盤點中⋯</div>
     </div>`;
+
+  renderCache();
 
   $('#bProbe').onclick = async () => {
     const out = $('#probeOut');
@@ -848,9 +1156,16 @@ TABS.playback = async el => {
     try { out.innerHTML = pre(await api('/diagnostics/encoder/' + $('#encSel').value)); }
     catch (e) { out.innerHTML = `<span style="color:#ffaeae">${esc(e.message)}</span>`; }
   };
+  // 「還沒選檔案」原本是按下去才 toast 說要先填 id。有了選單之後那是一個
+  // 看得見的狀態，用 disabled 表達比讓人按了被罵好。
+  const benchPick = wireFilePick(el, {
+    id: 'benchPick',
+    onPick: it => { $('#bBench').disabled = !it; },
+  });
   $('#bBench').onclick = async () => {
-    const id = $('#benchId').value.trim();
-    if (!id) return toast('要先填檔案 id', true);
+    const f = benchPick.get();
+    if (!f) return toast('先挑一個檔案', true);
+    const id = f.id;
     const out = $('#benchOut');
     $('#bBench').disabled = true;
     out.innerHTML = '<span style="color:var(--muted)">實測中，這會花上一分鐘⋯</span>';
@@ -866,7 +1181,9 @@ TABS.playback = async el => {
             </tbody></table></div>` + pre({ 檔案: r['檔案'], 片源: r['片源'] })
         : pre(r);
     } catch (e) { out.innerHTML = `<span style="color:#ffaeae">${esc(e.message)}</span>`; }
-    $('#bBench').disabled = false;
+    // 跑完要不要放開，看的是「現在還有沒有選著檔案」——
+    // 使用者可能在實測期間把選擇清掉了，無條件 false 會讓按鈕變成可按但沒東西。
+    $('#bBench').disabled = !benchPick.get();
   };
   $('#bGpu').onclick = async () => {
     const out = $('#gpuOut');
@@ -874,13 +1191,236 @@ TABS.playback = async el => {
     try { out.innerHTML = pre(await api('/diagnostics/gpu')); }
     catch (e) { out.innerHTML = `<span style="color:#ffaeae">${esc(e.message)}</span>`; }
   };
+};
+
+/* ---------------------------------------------------------------- 快取
+
+   這一塊刻意**先給看的、再給按的**：原本只有一顆「清空轉碼快取」，按下去
+   會刪掉什麼、省下多少空間，按的人完全看不到。清理工具最差的設計就是
+   「按一下就刪掉一些東西，而且不知道刪了什麼」（/maintenance/sweep 的
+   report→fix 兩段式就是同一個理由）。
+
+   預備（warm）的輪詢只在跑的時候開，跑完就停 —— 後台開著不動的時候不該
+   每兩秒打一次伺服器。 */
+let warmTimer = null;
+
+/* 選擇器選到的檔案。**存在這裡而不是 DOM 上**，因為 renderCache() 會在
+   預備跑完時自己重畫一次（pollWarm 的最後一段）—— 選好檔案、按下預備、
+   跑完，然後發現選擇不見了，使用者會以為是自己按錯。 */
+let warmSel = null;
+
+async function renderCache() {
+  const box = $('#cacheBox');
+  if (!box) { clearInterval(warmTimer); warmTimer = null; return; }
+  let s;
+  try { s = await api('/cache/survey?limit=100'); }
+  catch (e) { box.innerHTML = `<span style="color:#ffaeae">${esc(e.message)}</span>`; return; }
+
+  const pct = s.limitMb ? Math.min(100, s.totalBytes / (s.limitMb * 1048576) * 100) : 0;
+  const rows = (s.files || []).map(f => `
+    <tr>
+      <td style="white-space:nowrap">${f.file_id}</td>
+      <td title="${esc(f.filename || '')}">${esc((f.filename || '（DB 裡找不到這個檔案）').slice(0, 52))}</td>
+      <td style="white-space:nowrap">${bytes(f.bytes)}</td>
+      <td style="white-space:nowrap">${f.segments} 段</td>
+      <td>${f.profiles.map(p =>
+        `<span class="pill${p.stale ? ' warn' : ''}" title="${esc(p.dir)}">v${p.version} ${esc(p.profile)}</span>`
+      ).join(' ')}</td>
+      <td style="white-space:nowrap">
+        <button class="btn sm" data-warm="${f.file_id}">預備</button>
+        <button class="btn sm" data-clearfile="${f.file_id}">清除</button>
+      </td>
+    </tr>`).join('');
+
+  box.innerHTML = `
+    <div class="grid-cards" style="margin-bottom:12px">
+      <div class="stat"><b>${bytes(s.totalBytes)}</b><small>已用${
+        s.limitMb ? `（上限 ${s.limitMb} MB，${pct.toFixed(0)}%）` : ''}</small></div>
+      <div class="stat"><b>${s.fileCount}</b><small>有快取的檔案</small></div>
+      <div class="stat"><b>${s.totalSegments}</b><small>分段總數</small></div>
+      <div class="stat ${s.staleBytes ? 'warn' : ''}"><b>${bytes(s.staleBytes)}</b>
+        <small>舊版本殘留（目前 v${s.version}）</small></div>
+    </div>
+
+    ${s.staleBytes || s.emptyDirs ? `<div class="banner" style="margin-bottom:12px">
+      有 ${s.staleDirs} 個不是 v${s.version} 的資料夾（${bytes(s.staleBytes)}）${
+        s.emptyDirs ? `、${s.emptyDirs} 個空資料夾` : ''}。
+      這些分段<b>已經沒有人讀得到</b>（路徑帶版本，播放只會找 v${s.version}），
+      刪掉不會讓任何一次播放需要重轉。
+      <button class="btn sm" id="bStale" style="margin-left:8px">清掉殘留</button>
+    </div>` : ''}
+
+    <div id="warmPanel" style="margin-bottom:12px"></div>
+
+    <!-- 這一列的選擇器是給**表格外**的檔案用的：下面的表格只列最大的 N 個，
+         被截斷的那些原本完全沒有入口（預備要打 id、清除根本沒有）。 -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      ${filePick({ id: 'warmPickSel', placeholder: '選擇影片…', value: warmSel })}
+      <button class="btn" id="bWarmPick"${warmSel ? '' : ' disabled'}>預備這一支⋯</button>
+      <button class="btn" id="bClearOne"${warmSel ? '' : ' disabled'}>清除它的快取</button>
+      <span style="flex:1"></span>
+      <button class="btn danger" id="bCache">清空全部</button>
+    </div>
+
+    ${rows ? `<div class="scrollx"><table class="t">
+      <thead><tr><th>id</th><th>檔名</th><th>佔用</th><th>分段</th><th>階別</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      ${s.truncated ? `<p style="color:var(--muted);font-size:12px;margin:8px 0 0">
+        只列出最大的 ${s.files.length} 個（統計數字是全部算的）。</p>` : ''}`
+      : '<p style="color:var(--muted);font-size:12.5px;margin:0">目前沒有任何快取分段。</p>'}`;
+
   $('#bCache').onclick = async () => {
-    if (!await confirmBox({ title: '清空轉碼快取', ok: '清空',
-      body: '所有已轉好的分段會被刪掉，下次播放要重轉。<b>不影響 FTP 上的片源。</b>' })) return;
-    try { await api('/cache/clear', { method: 'POST' }); toast('已清空'); }
+    if (!await confirmBox({ title: '清空轉碼快取', ok: '清空', danger: true,
+      body: `所有已轉好的分段會被刪掉（${bytes(s.totalBytes)}、${s.totalSegments} 段），
+             下次播放要重轉。<b>不影響 FTP 上的片源。</b>` })) return;
+    try { await api('/cache/clear', { method: 'POST' }); toast('已清空'); renderCache(); }
     catch (e) { toast(e.message, true); }
   };
-};
+
+  const stale = $('#bStale');
+  if (stale) stale.onclick = async () => {
+    try {
+      const r = await api('/cache/clear-stale', { method: 'POST' });
+      toast(`清掉 ${r.dirs} 個資料夾，釋出 ${bytes(r.bytes)}`);
+      renderCache();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  // 選擇器要在 box.innerHTML 賦值**之後**才接線 —— 順序反了 querySelector
+  // 回 null，而且不會噴錯（指派到 null 才噴，querySelector 本身不會）。
+  // 這跟 wireAcl(el, ac) 必須在 el.innerHTML 之後被呼叫是同一個約束。
+  const wp = wireFilePick(box, {
+    id: 'warmPickSel',
+    initial: warmSel,
+    onPick: it => {
+      warmSel = it;
+      $('#bWarmPick').disabled = !it;
+      $('#bClearOne').disabled = !it;
+    },
+  });
+
+  $('#bWarmPick').onclick = () => {
+    const f = wp.get();
+    if (!f) return toast('先挑一個檔案', true);
+    warmPick(f.id);
+  };
+  // 表格只列最大的 N 個，被截斷的那些原本沒有清除入口。
+  // clearOne() 本來就有確認框，直接沿用，不必再問一次。
+  $('#bClearOne').onclick = () => {
+    const f = wp.get();
+    if (!f) return toast('先挑一個檔案', true);
+    clearOne(f.id, f.filename);
+  };
+
+  box.onclick = e => {
+    const ds = e.target.dataset || {};
+    if (ds.warm) return warmPick(parseInt(ds.warm, 10));
+    if (ds.clearfile) return clearOne(parseInt(ds.clearfile, 10));
+  };
+
+  pollWarm();
+}
+
+async function clearOne(fileId, fallbackName) {
+  const f = (await api('/cache/survey?limit=2000')).files.find(x => x.file_id === fileId);
+  // 從選擇器挑的檔案可能根本沒有快取（表格裡找不到它）。這時候「清除」是
+  // 個 no-op，與其開一個講不出要刪什麼的確認框，不如直接說清楚。
+  if (!f) {
+    toast(`${fallbackName || 'file_id=' + fileId} 目前沒有任何快取分段`);
+    return;
+  }
+  if (!await confirmBox({
+    title: `清除這一支的快取？`, ok: '清除', danger: true,
+    body: `<b>${esc(f.filename || ('file_id=' + fileId))}</b><br><br>
+           會刪掉 ${bytes(f.bytes)}、${f.segments} 段，
+           下次播放要重轉。<b>不影響片源。</b>`
+  })) return;
+  try {
+    await api('/cache/clear?file_id=' + fileId, { method: 'POST' });
+    toast('已清除'); renderCache();
+  } catch (e) { toast(e.message, true); }
+}
+
+/** 預備前先問清楚要哪一階、整支還是只有開頭 —— 整支片可能要跑很久。 */
+async function warmPick(fileId) {
+  let o;
+  try { o = await api('/cache/warm/options?file_id=' + fileId); }
+  catch (e) { return toast(e.message, true); }
+  if (!o.ok) return toast(o.message, true);
+
+  const opts = o.options.map((p, i) => `
+    <label style="display:block;margin:6px 0">
+      <input type="radio" name="wp" value="${esc(p.profile)}" ${i ? '' : 'checked'}>
+      ${esc(p.label)} — 共 ${p.total} 段，已有 ${p.cached} 段</label>`).join('');
+
+  // confirmBox 只回 true/false，`collect` 是在關掉之前被呼叫的 side effect ——
+  // 選項要在那個時機抄下來，關掉之後 DOM 就沒了。
+  let picked = { profile: o.options[0].profile, head: 0 };
+  const ok = await confirmBox({
+    title: '預備分段', ok: '開始',
+    body: `<b>${esc(o.filename || '')}</b><br>
+      <span style="color:var(--muted)">長度 ${Math.round(o.duration / 60)} 分鐘</span>
+      <div style="margin-top:10px">${opts}</div>
+      <label style="display:block;margin-top:10px">
+        <input type="checkbox" id="wpHead"> 只預熱開頭 10 段（讓開播不用等，很快跑完）</label>
+      <p style="color:var(--muted);font-size:12px;margin:10px 0 0">
+        整支預備會佔用 CPU 一段時間，但優先權比正在播的人低，而且隨時可以取消。</p>`,
+    collect: m => {
+      const r = m.querySelector('input[name=wp]:checked');
+      const h = m.querySelector('#wpHead');
+      picked = { profile: (r && r.value) || o.options[0].profile,
+                 head: h && h.checked ? 10 : 0 };
+    },
+  });
+  if (!ok) return;
+  const { profile, head } = picked;
+  try {
+    const r = await api(`/cache/warm?file_id=${fileId}&profile=${encodeURIComponent(profile)}&head=${head}`,
+      { method: 'POST' });
+    toast(r.message || '已開始');
+    pollWarm();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function pollWarm() {
+  const panel = $('#warmPanel');
+  if (!panel) { clearInterval(warmTimer); warmTimer = null; return; }
+  let w;
+  try { w = await api('/cache/warm'); } catch { return; }
+
+  if (!w.running && !w.phase) { panel.innerHTML = ''; }
+  else {
+    const pctDone = w.total ? ((w.done + w.skipped) / w.total * 100) : 0;
+    const eta = w.eta > 0 ? `，預估還要 ${Math.ceil(w.eta / 60)} 分` : '';
+    const cls = w.phase === 'error' ? 'bad' : '';
+    panel.innerHTML = `<div class="banner ${cls}">
+      <b>${w.running ? '預備中' : ({ done: '預備完成', cancelled: '已取消', error: '預備失敗' }[w.phase] || w.phase)}</b>
+      ${esc((w.filename || '').slice(0, 46))}
+      <div style="margin-top:6px">
+        ${w.done + w.skipped} / ${w.total} 段（新轉 ${w.done}、本來就有 ${w.skipped}${
+          w.failed ? `、失敗 ${w.failed}` : ''}）${w.running ? eta : ''}
+      </div>
+      <div style="height:6px;background:var(--bg-2);border-radius:4px;margin-top:8px;overflow:hidden">
+        <div style="height:100%;width:${pctDone.toFixed(1)}%;background:var(--accent, #6ea8fe)"></div></div>
+      ${w.error ? `<div style="margin-top:6px;color:#ffaeae">${esc(w.error)}</div>` : ''}
+      ${(w.errors || []).length ? `<div style="margin-top:6px;font-size:12px;color:var(--muted)">
+        ${w.errors.map(x => esc(x)).join('<br>')}</div>` : ''}
+      ${w.running ? '<button class="btn sm" id="bWarmCancel" style="margin-top:8px">取消</button>' : ''}
+    </div>`;
+    const c = $('#bWarmCancel');
+    if (c) c.onclick = async () => {
+      try { await api('/cache/warm/cancel', { method: 'POST' }); toast('已送出取消'); }
+      catch (e) { toast(e.message, true); }
+    };
+  }
+
+  // 跑完就把輪詢收掉，並把盤點數字更新一次（快取變大了）。
+  if (w.running && !warmTimer) warmTimer = setInterval(pollWarm, 2000);
+  if (!w.running && warmTimer) {
+    clearInterval(warmTimer); warmTimer = null;
+    renderCache();
+  }
+}
 
 /* ================================================================ 紀錄 */
 let logPage = 0, logEvent = '';

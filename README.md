@@ -375,9 +375,9 @@ filmax-web/
 │  ├─ localfs.py         FTP 路徑 → 本機路徑（含路徑防護）
 │  ├─ ftpclient.py       FTP 連線池與 Range 串流
 │  ├─ auth.py oauth.py acl.py users*.py    登入、Google、目錄權限、帳號
-│  ├─ routers/           api.py（52 端點）／stream.py／auth_google.py
+│  ├─ routers/           api.py（68 端點）／stream.py／auth_google.py
 │  └─ static/            前端（無框架，原生 JS）
-├─ tests/                15 支獨立腳本（不是 pytest）
+├─ tests/                23 支獨立腳本（不是 pytest）
 ├─ docs/規格需求書.md     規格索引・分期計畫・25 項決策
 ├─ docs/規格/            一章一檔（A 資料層 … N 刮削修正）
 ├─ data/                 library.db・hls 快取・images・subs（不進版控）

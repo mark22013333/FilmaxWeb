@@ -233,8 +233,14 @@ check("沒權限的人看不到受限影集（一筆都不行）",
       [(i["item_id"], i["file_id"]) for i in cont(denied)])
 check("沒權限的人拿不到受限影集的片名",
       all("影集C" != i.get("title") for i in cont(denied)), cont(denied))
-gi = cont(granted)
-check("被授權的人看得到，而且同樣去重成一筆",
+# 一般入口不再把受限的東西混進來，連被授權的人也一樣 ——
+# 「繼續看」那一排就掛在首頁上，旁邊的人會看到。
+check("被授權的人在一般入口也看不到受限影集",
+      all(i["item_id"] != 4 for i in cont(granted)),
+      [(i["item_id"], i["file_id"]) for i in cont(granted)])
+# 去重仍然要驗，只是改在保險庫入口。
+gi = cont(granted, scope="vault")
+check("被授權的人在保險庫看得到，而且同樣去重成一筆",
       len([i for i in gi if i["item_id"] == 4]) == 1,
       [(i["item_id"], i["file_id"]) for i in gi])
 check("被授權的人看到的是最近觀看的 C S01E02",

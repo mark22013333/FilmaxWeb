@@ -83,7 +83,7 @@ RUNG_REMUX = 1
 # 是另一段影片。播放清單說 seg-100 是 600 秒，快取吐出來的卻是 1060 秒的
 # 內容：這正是「畫面跳回之前看過的地方」的另一條路徑，而且它跨越重新部署
 # 存活，比 ABR 那條更難查。
-HLS_CACHE_FORMAT_VERSION = 3    # 3 = 上階邊界改成對齊固定格線（ABR 才切得動）
+HLS_CACHE_FORMAT_VERSION = 5    # 5 = 上階的 -ss 補償 copy 的退格，音訊跟著對齊
 
 # 舊名字留著給還沒改的呼叫端；語意已經擴大，新的程式碼請用上面那個。
 PROFILE_KEY_VERSION = HLS_CACHE_FORMAT_VERSION
@@ -178,17 +178,20 @@ def rungs_for(file_id: int, duration: float) -> List[int]:
 
 
 # 上階要能進同一份 ABR master，它的第 i 段必須跟下階的 [i*seg, (i+1)*seg)
-# 對得起來。允許的偏差是**一個 keyframe 間距**：邊界只能落在 keyframe 上，
-# 所以再怎麼對齊也不可能比片源的 keyframe 密度更準。
+# 是**同一段影片** —— hls.js 切階之後照著 MEDIA-SEQUENCE 挑下一段，
+# seg-N 指到別的 media time 就是重疊或倒退。
 #
-# 實測（全庫 149 個可 remux 的檔案）：對齊規則改好之後 146 個的最大偏差
-# 在 4.4 秒以內，剩下 3 個（file 297／303／437）的 keyframe 間距是 4.67／
-# 4.00／5.51 秒 —— **除不盡 6 秒**，所以每段只能跨兩個 keyframe（約 10 秒），
-# 段數與下階差了一截，偏差一路累加到 1256 秒。那三個檔案的上階就不要進
-# ABR master（本身沒壞，只是跟下階拼不成同一條時間軸）。
-# ABR rendition 的 seg-N 必須代表同一段影片。舊值 1.5 代表 6 秒分段竟可容許
-# 9 秒偏差，連「少一整段」都會被判定為可切換；那正是畫面回退的來源。
-# 0.25 秒已比一個正常畫格寬很多，但不再容許肉眼可見的 segment 級錯位。
+# **舊規則（容許 1.5 個分段長 = 9 秒、而且只看 start）太鬆。**9 秒比一整段
+# 還長，連「少了一整段」都會被判定成可以切換；而只看 start 的話，
+# 一段從對的地方開始、卻在錯的地方結束也會過關。
+#
+# 現在是兩道：**段數必須一樣**（少一段就代表 seg-N 整個錯位，這一道擋掉
+# 實測 172 個裡的 58 個），加上 start 與 end 都要落在 0.25 秒內。
+# 0.25 秒比一個畫格寬很多，但不再容許肉眼看得到的錯位。
+#
+# **這一道只管遠端 ABR。**區網只發一個 rendition，沒有另一階可以切過去，
+# 所以嚴格的對齊要求不會讓區網失去零轉碼路徑（實測 172 個檔案裡只有 34 個
+# 進得了遠端 ABR，但區網 172 個全部照發上階）。
 _ABR_ALIGN_TOLERANCE_SECONDS = 0.25
 
 
@@ -456,8 +459,7 @@ def direct_ok_for_remote(src_bitrate_bps: Optional[int], has_remux: bool) -> Tup
     if kbps <= cap:
         return True, f"片源 {kbps} kbps 在遠端安全範圍內（上限 {cap}）"
     return False, (f"片源 {kbps} kbps 超過遠端上限 {cap}，direct 無階可降"
-                   + ("，改走 HLS（目前遠端採 transcode-only ABR）"
-                      if has_remux else "，改走轉碼 HLS"))
+                   + ("，改走 remux 上階（畫質相同）" if has_remux else "，改走轉碼 HLS"))
 
 
 def build_master(file_id: int, profile: str, remote: bool = False,
@@ -472,6 +474,12 @@ def build_master(file_id: int, profile: str, remote: bool = False,
     區網仍維持單一 rendition；非 MKV 可用 remux 零轉碼。MKV 暫時改走
     transcode，因為使用者回報的 Matroska/H.264 大檔即使不切階也會出現
     frame regression，先把順暢播放放在零轉碼之前。
+
+    **`-ss` 的退格補償（`media.build_remux_cmd()` 的 `seek_at`）仍然在，
+    而且是對的** —— 它讓 remux 分段的接縫重疊從 2.044 秒降到 0.042 秒
+    （實測，起點誤差 ±0.000）。但實機重開後遠端仍會回退，代表**退格不是
+    唯一的成因**：還有別的東西在讓 seg-N 對不起來，在查清楚之前不把 remux
+    放回遠端 ABR。順暢播放優先於零轉碼。
 
     `auto` = 使用者沒有手動挑畫質。手動挑過的話不發高畫質頂階（那一檔就是
     他要的上限）。預設 True 是為了讓既有呼叫端與測試不必全部改。
@@ -520,8 +528,8 @@ def build_master(file_id: int, profile: str, remote: bool = False,
     if upper and not remote and source_ext != "mkv":
         # 區網的 MP4-family 片源仍保留零轉碼 remux。
         # MKV 暫時不走這條路：實機回報顯示大容量 Matroska/H.264 在單一 remux
-        # rendition 也可能出現呈現畫格回退；先走固定格線 transcode，等有
-        # 真實 segment PTS 驗證後再開回來。順暢播放優先於零轉碼。
+        # rendition 也可能出現呈現畫格回退；先走固定格線 transcode，等根因
+        # 查清楚再開回來。順暢播放優先於零轉碼。
         lines += [upper, f"index.m3u8?p={upper_profile}"]
         return "\n".join(lines) + "\n"
 
@@ -531,6 +539,10 @@ def build_master(file_id: int, profile: str, remote: bool = False,
             # 接近固定格線，只要中途少一個 keyframe 格線，seg-N 就會整段錯位；
             # hls.js 切階後會把已播放過的 media time append 回 SourceBuffer，
             # 使用者看到的就是「每幾秒畫面往回跳」。
+            #
+            # **退格補償（seek_at）修好之後這一道仍然留著。**實機重開後遠端
+            # 還是會回退，代表退格不是唯一的成因 —— 在查清楚之前不要把
+            # remux 放回遠端 ABR。
             log.info("file=%s 的 remux 不進遠端 ABR：遠端採 transcode-only timeline", file_id)
         elif source_ext == "mkv":
             log.info("file=%s 是 MKV，區網也暫停 remux，改用固定格線 transcode", file_id)
@@ -628,15 +640,33 @@ def _produce(file_id: int, index: int, profile: str, duration: float, path: Path
             raise RuntimeError(f"上階沒有第 {index} 段（共 {len(spans)} 段）")
         start, end, _ = spans[index]
         length = max(end - start, 0.05)
+        # **只有真的會退格的檔案才把 `-ss` 往後推。**退格是容器的性質不是編碼的
+        # （實測同一份視訊 `-c copy` 換容器：mkv 退一整格、mp4 完全不退），
+        # 所以由 `seek_backoff` 這個量出來的欄位決定，不是一律推。
+        # 猜錯的代價不對稱：該推沒推只是接縫重疊，不該推卻推了會讓那一段
+        # 開頭整個缺一格 —— 所以 NULL（還沒量過）一律當作不退。
+        #
+        # **在這裡查好傳進去**，不要讓 build_remux_cmd() 自己查：那個函式目前
+        # 是純組指令的，讓它也去查表就會變成兩邊各查一次、可能拿到不同的答案。
+        # `end` 也一定要傳：只跨一個 keyframe 的短段，下一格就是這一段的結尾，
+        # 推過去會變成 `-ss X -to X`（空段，畫面整個不見）。
+        seek_at = start
+        _bk = db.q1("SELECT seek_backoff FROM media_file WHERE id=?", (file_id,))
+        if _bk and _bk["seek_backoff"]:
+            tbl = keyframes.table_for(file_id)
+            if tbl:
+                seek_at = keyframes.seek_start_for(tbl["times"], start, end)
     else:
         start = index * seg
         length = min(seg, max(duration - start, 0.05))
+        seek_at = start
     tmp = path.with_suffix(".ts.part")
 
     def run(force_software: bool) -> Optional[str]:
         """回傳 None 表示成功，否則回傳錯誤訊息。"""
         if rung == RUNG_REMUX:
-            cmd = media.build_remux_cmd(file_id, start, length, audio_index)
+            cmd = media.build_remux_cmd(file_id, start, length, audio_index,
+                                        seek_at=seek_at)
         else:
             cmd = media.build_transcode_cmd(file_id, start, length, height, audio_index,
                                             force_software=force_software,

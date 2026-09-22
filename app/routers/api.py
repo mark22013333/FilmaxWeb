@@ -11,8 +11,8 @@ from fastapi import Depends, APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, media, mssql,
-                params, paramstore, purge, scanner, streamstat, users)
+from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, hlscache,
+                media, mssql, params, paramstore, purge, scanner, streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -210,6 +210,27 @@ def genres(request: Request):
             continue
     return {"genres": [{"name": k, "count": v}
                        for k, v in sorted(counts.items(), key=lambda x: -x[1])]}
+
+
+@router.get("/vault")
+def vault_info(request: Request):
+    """這個人有沒有保險庫可以進，以及裡面有幾部。
+
+    前端靠這個決定要不要顯示那個入口。**沒有授權的人回 has_vault=false，
+    而且不附任何規則資訊** —— 受限資料夾的存在本身就是資訊，回一份空的
+    prefixes 清單跟回「有 3 個你進不去的資料夾」是兩件完全不同的事。
+
+    數量是用 `scope=vault` 的同一份條件算的，所以它跟入口裡真的列得出來的
+    筆數一致 —— 對不上的數字會讓人以為東西不見了。
+    """
+    if not acl.has_vault(request):
+        return {"has_vault": False}
+    frag, args = acl._vault_only_sql(request, "f2.ftp_path")
+    n = db.q1(f"""SELECT COUNT(*) c FROM media_item i
+                  WHERE EXISTS(SELECT 1 FROM media_file f2
+                               WHERE f2.item_id=i.id AND {frag})""", args)["c"]
+    return {"has_vault": True, "items": n,
+            "folders": [p.rsplit("/", 1)[-1] for p in acl.granted_prefixes(request)]}
 
 
 @router.get("/stats")
@@ -429,7 +450,9 @@ def play_info(file_id: int, request: Request,
     # 全部在 app/episodes.py，前端與之後的自動播放都問同一份答案。
     next_ep = None
     if f.get("kind") == "tv" and f.get("item_id"):
-        nff, nfa = acl.filter_sql(request, "f.ftp_path")
+        # ANY：下一集是這一筆播放的延伸，跟「從哪個入口進來」無關。
+        # 用 shared 的話保險庫裡的影集會沒有下一集可以接（自動播放斷掉）。
+        nff, nfa = acl.filter_sql_any(request, "f.ftp_path")
         next_ep = episodes.next_episode(f["item_id"], f.get("season"), f.get("episode"),
                                         nff, nfa)
         if next_ep:
@@ -1526,6 +1549,65 @@ def admin_problems(_: str = Depends(admin_only)):
     }
 
 
+@router.get("/admin/files")
+def admin_files(q: str = Query(default="", max_length=120),
+                limit: int = Query(default=30, ge=1, le=100),
+                _: str = Depends(admin_only)):
+    """後台的檔案挑選器要的清單：關鍵字找檔案，回 file_id 與顯示要用的欄位。
+
+    **為什麼需要這支。**後台原本有兩個欄位要使用者自己打 file_id（「詳情頁
+    看得到」），也就是把資料庫主鍵當成介面。它的失敗方式很安靜：打錯一個
+    數字不會報錯，而是對**另一支存在的片**跑了一次好幾分鐘的轉碼實測，
+    畫面上有數字、有倍速，看起來完全正常，只是答非所問。
+
+    **`%` 與 `_` 要逸出，這一支跟 `/api/library` 不一樣。**那邊打「100%」
+    只是多撈幾筆、使用者自己看得出來；這裡只給 30 筆，一個沒逸出的 `_`
+    會讓「S01_E01」比對到「S01xE01」，使用者看到的是「我打的字明明對，
+    選單裡卻是別支片」—— 選錯比撈不到嚴重。
+
+    **不要幫 filename 加索引。**`LIKE '%q%'` 的前綴萬用字元讓 B-tree 用不上，
+    加了只是多一份寫入成本。實測三表 join、297 列是 2.4~9 ms。
+    """
+    kw = (q or "").strip()
+    # 純數字 = 使用者可能是從舊習慣（詳情頁抄 id）或日誌來的，把那個 id 置頂。
+    # 不是數字時給 -1，不會命中任何一列。
+    fid = int(kw) if kw.isdigit() and len(kw) <= 9 else -1
+
+    where = ""
+    args: List[Any] = []
+    if kw:
+        esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{esc}%"
+        where = ("WHERE (f.id = ? OR f.filename LIKE ? ESCAPE '\\' "
+                 "OR i.title LIKE ? ESCAPE '\\' "
+                 "OR i.original_title LIKE ? ESCAPE '\\')")
+        args = [fid, like, like, like]
+
+    # 排序：打了 id 就讓那一筆排第一；有關鍵字時同一部片的多個檔案要相鄰
+    # （才看得出「這六個是同一部片的不同版本」）；沒關鍵字就是最近加入的。
+    # **一律以 f.id 收尾** —— 同一個 item 底下的檔案 added_at 完全相同，
+    # 沒有決定性收尾的話兩次查詢的順序不保證一樣（見本檔上面排序規約）。
+    if kw:
+        order = "CASE WHEN f.id = ? THEN 0 ELSE 1 END, i.title, e.season, e.episode, f.id DESC"
+        args.append(fid)
+    else:
+        order = "f.added_at DESC, f.id DESC"
+
+    rows = db.q(
+        f"""SELECT f.id, f.filename, f.duration, f.height, f.size, f.probe_state,
+                   i.title, i.kind, i.year, e.season, e.episode
+            FROM media_file f
+            LEFT JOIN media_item i ON i.id = f.item_id
+            LEFT JOIN episode    e ON e.id = f.episode_id
+            {where}
+            ORDER BY {order}
+            LIMIT ?""",
+        args + [limit + 1])
+
+    more = len(rows) > limit
+    return {"items": [db.row_to_dict(r) for r in rows[:limit]], "more": more}
+
+
 @router.get("/diagnostics/stream")
 def diagnostics_stream(limit: int = Query(default=40, ge=0, le=200),
                        _: str = Depends(admin_only)):
@@ -1672,6 +1754,69 @@ def ftp_browse(path: str = "/", _: str = Depends(admin_only)):
 def cache_clear(file_id: Optional[int] = None, _: str = Depends(admin_only)):
     hls.clear_cache(file_id)
     media.clear_subtitle_cache(file_id)
+    return {"ok": True}
+
+
+@router.get("/cache/survey")
+def cache_survey(limit: int = Query(default=200, ge=1, le=2000),
+                 _: str = Depends(admin_only)):
+    """快取現況：總量、每個檔案佔多少、哪些是舊版本的殘留。
+
+    照磁碟上實際有什麼回答，不照 DB 猜 —— 快取跟 DB 不同步是常態
+    （LRU 汰過、手動刪過、升版清掉過），資料夾本身才是唯一可信的來源。
+    """
+    out = hlscache.survey(limit)
+    out["limitMb"] = settings.hls_cache_max_mb
+    return out
+
+
+@router.post("/cache/clear-stale")
+def cache_clear_stale(_: str = Depends(admin_only)):
+    """只清掉不是目前格式版本的殘留。
+
+    **這是唯一不必先看清單的清除**：舊版本的分段在定義上已經沒有人讀得到
+    （`seg_dir()` 只產生帶目前版本的路徑），刪掉不會讓任何一次播放要重轉。
+    """
+    return {"ok": True, **hlscache.clear_stale()}
+
+
+@router.get("/cache/warm")
+def cache_warm_status(_: str = Depends(admin_only)):
+    return hlscache.status.dict()
+
+
+@router.get("/cache/warm/options")
+def cache_warm_options(file_id: int = Query(...), _: str = Depends(admin_only)):
+    """這個檔案可以預備哪些階，以及各階已經有幾段。
+
+    profile 字串由後端算 —— 前端自己拼的話，兩邊有一天不一樣，後果是
+    「預備了半天，播的時候讀的是另一個資料夾」。
+    """
+    return hlscache.warm_options(file_id)
+
+
+@router.post("/cache/warm")
+def cache_warm(file_id: int = Query(...),
+               profile: str = Query(default=""),
+               head: int = Query(default=0, ge=0),
+               _: str = Depends(admin_only)):
+    """先把分段轉好，等一下播就不用等。
+
+    head=0   整支片都轉（背景慢慢跑，可以取消）
+    head=N   只轉開頭 N 段（讓開播不用等，很快就跑完）
+
+    一次只跑一支：預備是拿整台機器的 CPU 去換「等一下不用等」，同時跑兩支
+    只會讓兩支都慢，而且會跟正在播的人搶。
+    """
+    ok, msg = hlscache.start(file_id, profile, head)
+    if not ok:
+        return JSONResponse({"ok": False, "message": msg}, status_code=409)
+    return {"ok": True, "message": msg}
+
+
+@router.post("/cache/warm/cancel")
+def cache_warm_cancel(_: str = Depends(admin_only)):
+    hlscache.cancel()
     return {"ok": True}
 
 

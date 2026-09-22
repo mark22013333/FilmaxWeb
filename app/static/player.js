@@ -1217,8 +1217,12 @@ function playUrl({ height, audio, forceDirect }) {
 /** 手動切換播放來源。跟自動 fallback 走不同的路：
  *  使用者明確要求時要**尊重他的選擇**，所以要重新跟伺服器要一份帶
  *  force_direct 的播放資訊（不然遠端大檔會被政策擋回 HLS，按了沒反應）。 */
+/* **播放位置一定要在 `await` 之後才讀。**寫成 `const at = v.currentTime` 放在
+   函式開頭看起來無害，但 `await fetch(...)` 期間影片沒有暫停、還在往前播 ——
+   手機上這一趟 RTT 是 0.2 秒到數秒，於是 `play()` 會把位置設回一個**比實際
+   播放位置更舊**的時間點，使用者看到的就是「切個畫質，畫面倒退幾秒」。
+   行動網路 RTT 大，所以手機比桌機明顯得多。 */
 async function switchMode(which) {
-  const at = v.currentTime;
   if (which === 'direct') {
     busy('切換來源');
     try {
@@ -1232,20 +1236,20 @@ async function switchMode(which) {
       toast('這個片源位元率偏高，遠端可能會卡；卡住會自動切回自動畫質');
     }
   }
-  play(which, at);
+  play(which, v.currentTime);
   buildPanel();
 }
 
 async function switchAudio(index) {
   if (index === info.audio_index) return;
-  const at = v.currentTime;
   busy('切換音軌');
   try {
     info = await (await fetch(playUrl({ height: cfg.quality, audio: index }))).json();
   } catch { busy(''); toast('切換音軌失敗'); return; }
   rememberAudio(index);
   // 直接播放是把原始檔整個丟給瀏覽器，選哪一軌由瀏覽器決定；只有轉碼選得了
-  play('hls', at);
+  // 位置在這裡才讀，理由見 switchMode() 上面那段註解。
+  play('hls', v.currentTime);
   const t = (info.audio_tracks || []).find(x => x.index === index);
   toast(`音軌：${t ? audioLabel(t, 0) : index}`);
   buildPanel();
@@ -1268,7 +1272,6 @@ function qualityToast(height) {
 
 async function switchQuality(height) {
   cfg.quality = height; saveCfg();
-  const at = v.currentTime;
   busy('切換畫質');
   try {
     info = await (await fetch(playUrl({ height, audio: info.audio_index }))).json();
@@ -1276,7 +1279,8 @@ async function switchQuality(height) {
   // play() 會 resetPlaybackState()，把上一階的 curLevel／解析度整個清掉。
   // **這正是「切了畫質，右上角還寫著舊的 720p」那個症狀的修法**：
   // 新狀態一開始是空的，等 LEVEL_SWITCHED 進來才會有實際畫質。
-  play(info.mode, at);
+  // 位置在這裡才讀，理由見 switchMode() 上面那段註解。
+  play(info.mode, v.currentTime);
   toast(qualityToast(height));
   buildPanel();
 }
@@ -1302,7 +1306,15 @@ $('#tap').onclick = e => { if (e.pointerType === 'touch') return; togglePlay(); 
 $('#tap').ondblclick = () => toggleFull();
 // 跳秒數也要走 clamp —— 在片尾按「快轉 10 秒」不該把 currentTime 頂到
 // duration 而直接觸發 ended。
-const skipBy = n => { v.currentTime = clampSeekTarget(v.currentTime + n); };
+// **跳秒是我們自己發動的 seek，要標記起來。**不標的話「倒退 10 秒」會被
+// startFrameMonitor() 記成一次 FRAME REGRESSION（它只看 mediaTime 有沒有變小），
+// 於是驗收用的 `Frame regress` 數字會被自己的操作灌水，看起來比實際嚴重。
+const skipBy = n => {
+  seekingByUs = true;
+  v.currentTime = clampSeekTarget(v.currentTime + n);
+};
+// seeked 一定會來（同一個位置的 seek 也會），所以旗標不會卡住。
+v.addEventListener('seeked', () => { seekingByUs = false; });
 $('#btnBack').onclick = () => { skipBy(-cfg.skip); toast(`◀ ${cfg.skip} 秒`); };
 $('#btnFwd').onclick = () => { skipBy(cfg.skip); toast(`${cfg.skip} 秒 ▶`); };
 function syncSkipLabels() {

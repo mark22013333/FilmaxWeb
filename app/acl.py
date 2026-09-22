@@ -30,6 +30,13 @@ viewer **沒有身分可以判斷，因此一律看不到受限資料夾**；管
 
 `tests/acl_test.py` 會走過 route table，確認每一條非管理員路由都經過其中一個。
 
+## 受限資料夾是「另一個入口」，不是「混在一起的那幾部」
+
+被授權**不等於**應該混進共用清單。受限資料夾的內容只在保險庫入口
+（`scope=vault`）出現；一般入口一律看不到，連被授權的人也一樣。
+範圍怎麼運作見下面 SHARED／VAULT／ANY 那一段 —— 關鍵是**範圍不是權限**，
+帶 `scope=vault` 不會讓任何人看到他本來看不到的東西。
+
 ## 為什麼回 404 而不是 403
 
 403 等於確認「這個東西存在，你只是沒權限」。受限資料夾的存在本身就是資訊。
@@ -77,17 +84,105 @@ def rules() -> List[Dict[str, Any]]:
     return out
 
 
-# ------------------------- 判斷 -------------------------
-def denied_prefixes(request) -> List[str]:
-    """這個請求看不到的資料夾前綴。管理員永遠是空的。"""
+# ------------------------- 範圍（共用區 vs 保險庫） -------------------------
+# 「看得到」與「應該混進共用清單」是兩個不同的問題，之前被當成同一個。
+#
+# 原本只要被授權，受限資料夾的內容就跟其他片子**混在一起**出現在片庫清單、
+# 搜尋、首頁那幾排與統計數字上。對被授權的人來說這其實是個困擾：
+# 他要的是「需要的時候進去看」，不是「每次打開首頁都攤在畫面上」——
+# 尤其那台電視／那支手機常常不只他一個人在用，而旁邊的人不必知道
+# 這些東西存在。
+#
+# 所以受限資料夾改成一個**獨立入口**（下面叫 vault，保險庫）：
+#
+#     shared  一般入口。受限資料夾一律排除 —— **連被授權的人也一樣**。
+#     vault   保險庫入口。只回受限資料夾裡「這個人被授權的那幾個」。
+#     any     不分範圍，看得到就算（單筆讀取用：播放、縮圖、字幕…）。
+#
+# **為什麼單筆讀取要用 any**：播放頁是從保險庫點進去的，但它送出的是
+# `/api/play?file=123`，那個請求身上沒有「我從哪個入口來」的資訊。
+# 如果單筆讀取也照 shared 擋，保險庫裡的片子會變成點得到卻播不出來。
+# 能不能讀取只跟授權有關，跟從哪個入口進來無關。
+#
+# **範圍不是權限**。vault 只是換一份要排除的前綴清單，授權判斷
+# （uid 在不在 user_ids 裡）兩邊完全一樣 —— 帶 `scope=vault` 進來
+# 並不會讓任何人看到他本來看不到的東西。所以這個參數可以直接從
+# 查詢字串讀，不必怕被亂改。
+SHARED = "shared"
+VAULT = "vault"
+ANY = "any"
+
+# 請求上放解析結果的鍵。放在 scope 上而不是每個端點自己讀查詢字串：
+# 二十個端點各讀一次遲早會有人漏，而漏掉的表現形式一樣是安靜的外洩。
+_SCOPE_KEY = "filmax.acl_scope"
+
+
+def scope_of(request) -> str:
+    """這個請求走的是哪個入口。預設 shared —— 漏接的端點要往安全的那邊倒。"""
+    if request is None:
+        return SHARED
+    scope = getattr(request, "scope", request)
+    v = scope.get(_SCOPE_KEY) if hasattr(scope, "get") else None
+    if v in (SHARED, VAULT, ANY):
+        return v
+    # 沒有被中介層標記過（例如測試直接呼叫）就自己讀一次查詢字串
+    try:
+        v = request.query_params.get("scope")
+    except Exception:
+        v = None
+    return v if v in (SHARED, VAULT, ANY) else SHARED
+
+
+def mark_scope(scope_dict, value: str) -> None:
+    """給中介層／端點用：把解析好的範圍記在請求上。"""
+    scope_dict[_SCOPE_KEY] = value if value in (SHARED, VAULT, ANY) else SHARED
+
+
+def granted_prefixes(request) -> List[str]:
+    """這個請求**看得到**的受限資料夾。管理員是全部。
+
+    保險庫入口要列的就是這一份；空的代表這個人沒有保險庫可以進，
+    前端據此決定要不要顯示那個入口。
+    """
     rs = rules()
     if not rs:
         return []
     if auth.is_admin(request):
-        return []
+        return [r["prefix"] for r in rs]
     uid = auth.user_id(request)
-    # uid 是 None = 密碼登入，沒有身分可以判斷 → 受限資料夾一律看不到
-    return [r["prefix"] for r in rs if uid is None or uid not in r["user_ids"]]
+    if uid is None:
+        return []
+    return [r["prefix"] for r in rs if uid in r["user_ids"]]
+
+
+def has_vault(request) -> bool:
+    return bool(granted_prefixes(request))
+
+
+# ------------------------- 判斷 -------------------------
+def denied_prefixes(request, scope: Optional[str] = None) -> List[str]:
+    """這個請求看不到的資料夾前綴。
+
+    `scope` 不給就從請求上讀（見上面的 SHARED／VAULT／ANY）。
+    """
+    rs = rules()
+    if not rs:
+        return []
+    sc = scope or scope_of(request)
+    allowed = set(granted_prefixes(request))
+
+    if sc == VAULT:
+        # 保險庫裡**只**有受限資料夾：沒被授權的受限資料夾要擋（它本來就看不到），
+        # 而「不受限的一切」也要擋 —— 否則保險庫會變成第二個完整片庫。
+        # 後者沒有前綴可以列舉，所以交給 vault_only_sql 用 OR 正面表列。
+        return [r["prefix"] for r in rs if r["prefix"] not in allowed]
+
+    if sc == ANY:
+        # 單筆讀取：看得到就算，跟從哪個入口進來無關。
+        return [r["prefix"] for r in rs if r["prefix"] not in allowed]
+
+    # shared：受限資料夾一律排除，連被授權的人也一樣 —— 它們只在保險庫裡。
+    return [r["prefix"] for r in rs]
 
 
 def _norm(p: str) -> str:
@@ -100,12 +195,38 @@ def _norm(p: str) -> str:
     return p + "/" if p else "/"
 
 
+def _vault_only_sql(request, col: str) -> Tuple[str, List[Any]]:
+    """保險庫入口：**只**回這個人被授權的受限資料夾底下的東西。
+
+    這裡是正面表列（OR 起來的白名單），不是「排除」—— 因為「不受限的一切」
+    沒有前綴可以列舉。沒有任何授權時回一個恆假條件，不是回 ("", [])：
+    後者的意思是「不必過濾」，會讓沒有保險庫的人看到整個片庫。
+    **這是這個檔案裡最容易寫錯、而且錯了不會有錯誤訊息的一行。**
+    """
+    good = granted_prefixes(request)
+    if not good:
+        return "(1=0)", []
+    parts, args = [], []
+    for p in good:
+        pre = _norm(p)
+        # 跟 subtree_sql 同一套範圍比對（含「自己那一列」的 OR）
+        parts.append(f"(({col} >= ? AND {col} < ?) OR {col} = ?)")
+        args += [pre, pre + _HI, pre.rstrip("/")]
+    return "(" + " OR ".join(parts) + ")", args
+
+
 def filter_sql(request, col: str) -> Tuple[str, List[Any]]:
     """清單查詢用。回 ("", []) 表示不必過濾。
 
     col 要是完整路徑或資料夾欄位：media_file 用 ftp_path（它沒有 folder 欄位），
     photo 與 document 用 folder。
+
+    **二十個呼叫點一行都不必改**：範圍是從請求上讀的，所以 `/library`、
+    `/search`、`/stats`、`/continue` 這些端點原本怎麼呼叫就怎麼呼叫，
+    帶 `scope=vault` 進來時它們自動變成「只看保險庫」。
     """
+    if scope_of(request) == VAULT:
+        return _vault_only_sql(request, col)
     bad = denied_prefixes(request)
     if not bad:
         return "", []
@@ -117,6 +238,24 @@ def filter_sql(request, col: str) -> Tuple[str, List[Any]]:
         # 那個範圍會把 `/私人物品/…` 一起吃進去，因為「物」比「/」大。
         # 實測就是這樣壞的：名字以受限資料夾為開頭的另一個資料夾整個消失。
         # 另外 folder 欄位剛好等於前綴本身（沒有結尾斜線）的那一列也要擋。
+        parts.append(f"NOT ({col} >= ? AND {col} < ?) AND {col} <> ?")
+        args += [pre, pre + _HI, pre.rstrip("/")]
+    return "(" + " AND ".join(parts) + ")", args
+
+
+def filter_sql_any(request, col: str) -> Tuple[str, List[Any]]:
+    """單筆讀取的延伸查詢用的清單條件（scope 固定 ANY）。
+
+    `/api/play` 的 next_episode 就是這種東西：它是一筆播放的延伸，不是一份
+    共用清單。用 shared 的話，從保險庫播受限影集會沒有下一集可以接 ——
+    自動播放在保險庫裡整個斷掉，而畫面上只會看到「這部影集好像只有一集」。
+    """
+    bad = denied_prefixes(request, ANY)
+    if not bad:
+        return "", []
+    parts, args = [], []
+    for p in bad:
+        pre = _norm(p)
         parts.append(f"NOT ({col} >= ? AND {col} < ?) AND {col} <> ?")
         args += [pre, pre + _HI, pre.rstrip("/")]
     return "(" + " AND ".join(parts) + ")", args
@@ -141,9 +280,15 @@ def subtree_sql(col: str, prefix: str) -> Tuple[str, List[Any]]:
 
 
 def can_read(request, path: Optional[str]) -> bool:
+    """能不能讀這一筆。**一律用 ANY** —— 見上面的範圍說明。
+
+    單筆讀取（播放、實際位元組、字幕、縮圖）不看入口：從保險庫點進去的
+    播放頁送出的 `/api/play?file=123` 身上沒有入口資訊，照 shared 擋的話
+    保險庫裡的片子會變成點得到卻播不出來。
+    """
     if not path:
         return True
-    bad = denied_prefixes(request)
+    bad = denied_prefixes(request, ANY)
     if not bad:
         return True
     path = str(path)
@@ -168,9 +313,16 @@ def visible_item(request, item_id: int) -> bool:
     影集分組可能跨資料夾（`/HBO/某劇/01/…`），所以不能拿條目本身判斷 ——
     條目沒有路徑，路徑在 media_file 上。
     """
-    frag, args = filter_sql(request, "ftp_path")
-    if not frag:
+    # 跟 can_read 一樣用 ANY：條目詳情頁是單筆讀取，從保險庫點進去要打得開。
+    bad = denied_prefixes(request, ANY)
+    if not bad:
         return True
+    parts, args = [], []
+    for p in bad:
+        pre = _norm(p)
+        parts.append("NOT (ftp_path >= ? AND ftp_path < ?) AND ftp_path <> ?")
+        args += [pre, pre + _HI, pre.rstrip("/")]
+    frag = "(" + " AND ".join(parts) + ")"
     r = db.q1(f"SELECT 1 FROM media_file WHERE item_id=? AND {frag} LIMIT 1",
               [item_id] + args)
     return r is not None

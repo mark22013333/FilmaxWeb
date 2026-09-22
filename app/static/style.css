@@ -793,3 +793,18 @@ nav{flex-wrap:wrap;min-width:0}
     padding-right:max(14px, env(safe-area-inset-right));
   }
 }
+
+/* ---- 保險庫（受限資料夾的獨立入口）----
+   這顆按鈕只有被授權的人才會長出來（見 app.js 的 initVault）。
+   刻意跟其他分頁用同一個形狀、只換顏色：它是「另一個入口」，
+   不是一個需要大聲強調的特殊模式。 */
+nav button.vault-btn{display:inline-flex;align-items:center;gap:5px}
+nav button.vault-btn svg{opacity:.75}
+nav button.vault-btn.on{background:var(--panel-2);color:var(--blue)}
+nav button.vault-btn.on svg{opacity:1}
+
+/* 進到保險庫時給一條細線當背景提示。
+   用的是「看得見但不吵」的強度：使用者要知道自己在哪個入口
+   （否則會以為片庫東西不見了），但這塊畫面常常有別人在旁邊看，
+   不適合放一條寫著「私人」的橫幅。 */
+body.in-vault header{box-shadow:inset 0 -2px 0 var(--blue)}

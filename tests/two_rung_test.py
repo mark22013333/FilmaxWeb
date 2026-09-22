@@ -143,9 +143,9 @@ head("[J 0] master playlist")
 
 m_remote = hls.build_master(fid, lower, remote=True, duration=DUR)
 m_lan = hls.build_master(fid, lower, remote=False, duration=DUR)
-# 遠端只允許固定格線的 transcode rendition 互切；remux 的 keyframe 邊界
-# 只要中途漏一個格線，seg-N 就會整段錯位。MKV 在區網也先走 transcode，
-# 避免 Matroska 單一 remux 的 PTS/DTS 仍把舊畫格送回播放器。
+# **遠端一律 transcode-only。**退格補償（seek_at）已經讓 remux 分段的接縫
+# 重疊降到 0.042 秒，但實機重開後遠端仍會回退 —— 代表退格不是唯一成因，
+# 在查清楚之前不把 remux 放回遠端 ABR。MKV 在區網也先停用，理由相同。
 check("遠端仍發完整轉碼階梯", m_remote.count("#EXT-X-STREAM-INF") >= 2, m_remote)
 check("遠端不混 remux 上階", "_m1" not in m_remote, m_remote)
 check("MKV 區網暫停 remux，改發單一轉碼階", m_lan.count("#EXT-X-STREAM-INF") == 1, m_lan)
@@ -158,14 +158,42 @@ check("MP4 區網仍保留單一 remux 零轉碼路徑",
       f"?p={upper}" in m_lan_mp4 and m_lan_mp4.count("#EXT-X-STREAM-INF") == 1,
       m_lan_mp4)
 
-first = [l for l in m_remote.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
-bw = int(first.split("BANDWIDTH=")[1].split(",")[0])
-check("遠端第一階仍有有效 BANDWIDTH", bw > 0, first)
+# 上階那一行的屬性要驗，就得用一個**真的進得了 ABR** 的片源 ——
+# 預設那組 fixture 的 keyframe 是 3.625 秒，除不盡 6 秒（偏差 1.5 秒），
+# 嚴格規則會把它擋在 ABR 之外，於是 master 的第一行變成轉碼階，
+# 拿它來驗「上階的 CODECS」等於什麼都沒驗到。
+def _aligned_file(**kw):
+    """keyframe 剛好 2 秒（除得盡 6 秒）的片源，上階進得了 ABR master。"""
+    f = add_file(gap=2.0, **kw)
+    t = [round(i * 2.0, 3) for i in range(31)]
+    db.execute("UPDATE media_keyframe SET times=?, positions=?, count=? WHERE file_id=?",
+               (json.dumps(t), json.dumps([i * 1_000_000 for i in range(len(t))]),
+                len(t), f))
+    db.execute("UPDATE media_file SET duration=? WHERE id=?", (60.0, f))
+    return f
 
-fid_np = add_file(profile=None, level=None)
-m_np = hls.build_master(fid_np, lower, remote=True, duration=DUR)
-check("遠端即使片源 profile／level 不明，也不會因此把 remux 混進 ABR",
-      "_m1" not in m_np, m_np)
+
+# **上階那一行只剩區網的 mp4 拿得到**（遠端一律 transcode-only、mkv 區網也停用），
+# 所以屬性測試要從區網的 mp4 master 取。
+fid_al = _aligned_file(ext="mp4")
+m_al = hls.build_master(fid_al, lower, remote=False, duration=60.0)
+check("對得齊的 mp4 在區網有上階", "_m1" in m_al, m_al)
+first = [l for l in m_al.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
+bw = int(first.split("BANDWIDTH=")[1].split(",")[0])
+avg = int(first.split("AVERAGE-BANDWIDTH=")[1].split(",")[0])
+# 邊界是均勻的，所以峰值≈平均＋音訊；重點是「兩個都有、峰值不小於平均」
+check("上階有 BANDWIDTH 與 AVERAGE-BANDWIDTH 兩個", bw > 0 and avg > 0, first)
+check("BANDWIDTH 是峰值，不小於平均", bw >= avg, (bw, avg))
+check("兩個都含音訊碼率", avg > 192_000, avg)
+check("上階的解析度是片源原本的（不縮放）", "RESOLUTION=1920x960" in first, first)
+check("上階的 CODECS 照片源的 profile／level 填（不是寫死的 64001f）",
+      'CODECS="avc1.640029,mp4a.40.2"' in first, first)
+
+fid_np = _aligned_file(profile=None, level=None, ext="mp4")
+m_np = hls.build_master(fid_np, lower, remote=False, duration=60.0)
+up_np = [l for l in m_np.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
+check("推不出 profile／level 就整個省略 CODECS（規格允許；填錯會被 Safari 拒收）",
+      "CODECS" not in up_np, up_np)
 
 # 主階（使用者選的那一檔）在階梯裡，但**不保證是第 1 行** —— 自動模式下
 # 上面還有一階高畫質頂階。用碼率去找它，不要用位置。
@@ -344,8 +372,10 @@ old_dir = CACHE_DIR / str(fid) / f"v2_{hls.profile_key(0, None, 0, hls.RUNG_REMU
 old_dir.mkdir(parents=True, exist_ok=True)
 (old_dir / "seg-100.ts").write_bytes(b"v2-content")
 new_dir = hls.seg_dir(fid, hls.profile_key(0, None, 0, hls.RUNG_REMUX))
-check("v3 的分段路徑帶版本（新舊 binary 短暫交錯也不會共用同一批 .ts）",
-      new_dir.name.startswith("v3_"), new_dir.name)
+# 綁常數而不是寫死 "v3_"：版本每升一次就要改一次測試的話，改的人會傾向
+# 把測試改成符合現況，而不是去想「這次升版是不是真的該升」。
+check("分段路徑帶版本（新舊 binary 短暫交錯也不會共用同一批 .ts）",
+      new_dir.name.startswith(f"v{hls.HLS_CACHE_FORMAT_VERSION}_"), new_dir.name)
 check("v2 與 v3 不是同一個資料夾", old_dir.resolve() != new_dir.resolve())
 db.kv_set("hls_profile_key_version", 2)
 hls.migrate_cache()
@@ -366,11 +396,26 @@ check("上階切得出分段", len(_spans) > 1, len(_spans))
 _worst = max(abs(s0 - i * _seg) for i, (s0, _e, _b) in enumerate(_spans))
 check("舊的寬鬆檢查確實可能只看到『沒有累積到幾百秒』",
       _worst < _seg * 1.5, (_worst, [round(s0, 2) for s0, _, _ in _spans]))
+# 3.625 除不盡 6，所以邊界最多只能貼到 1.5 秒 —— 那是肉眼看得到的錯位，
+# 嚴格規則（0.25 秒）要擋下來。**這不是 remux 壞了**，是這個片源的
+# keyframe 密度拼不出跟下階一樣的格線。
 check("嚴格 ABR 驗證不接受肉眼可見的 sub-segment 偏差",
       hls.abr_alignable(fid, DUR)[0] is False, hls.abr_alignable(fid, DUR))
 
 _m = hls.build_master(fid, lower, remote=True, duration=DUR)
 check("即使邊界看起來接近，遠端也一律不混 remux", "_m1" not in _m, _m)
+
+# `abr_alignable()` 本身仍然要能分辨對得齊與對不齊 —— 遠端目前不靠它決定
+# 發不發上階（一律不發），但它是將來把 remux 放回 ABR 的前置條件，
+# 而且後台診斷要靠它說得出「為什麼這個檔案不能混階」。
+_even = add_file(gap=2.0)
+_even_times = [round(i * 2.0, 3) for i in range(31)]
+db.execute("UPDATE media_keyframe SET times=?, positions=? WHERE file_id=?",
+           (json.dumps(_even_times),
+            json.dumps([i * 1_000_000 for i in range(len(_even_times))]), _even))
+db.execute("UPDATE media_file SET duration=? WHERE id=?", (60.0, _even))
+_even_ok, _even_why = hls.abr_alignable(_even, 60.0)
+check("keyframe 除得盡分段長度 → abr_alignable 回 True", _even_ok, (_even_ok, _even_why))
 
 # **片源的 keyframe 比分段長度還疏**就對不齊，而且不是理論上的：
 # 實測 file 297 的 `gap_med` 是 4.67 秒（看起來很安全），但那個中位數是被
@@ -404,7 +449,7 @@ db.execute("UPDATE media_file SET duration=? WHERE id=?", (60.0, _long))
 _long_ok, _long_why = hls.abr_alignable(_long, 60.0)
 check("中途 long GOP 漏掉一個 6 秒格線 → 必須判定不能混 ABR",
       not _long_ok, (_long_ok, _long_why))
-check("long GOP 的遠端 master 仍是 transcode-only",
+check("long GOP 的遠端 master 不發上階（只剩轉碼階梯）",
       "_m1" not in hls.build_master(_long, lower, remote=True, duration=60.0))
 
 _m2 = hls.build_master(_odd, lower, remote=True, duration=_odd_dur)
@@ -433,20 +478,52 @@ check("ac3 要轉 AAC（瀏覽器不吃 ac3）",
       cmd[cmd.index("-c:a") + 1] == "aac", cmd)
 check("-ss 在 -i 前面（輸入端 seek；copy 只能從 keyframe 起頭）",
       cmd.index("-ss") < cmd.index("-i"), cmd)
-check("-ss 就是邊界表給的時間", cmd[cmd.index("-ss") + 1] == "7.250")
+check("沒給 seek_at 時退回 start（呼叫端漏傳不能炸）",
+      cmd[cmd.index("-ss") + 1] == "7.250")
+
+# **這一組是回歸測試。**copy 模式下 ffmpeg 一律退到前一個 keyframe，
+# **即使 start 本身就是貨真價實的 keyframe**（實測 file 360：邊界 600.600
+# 在容器裡是 flags=K__，-ss 600.600 的落點仍然是 598.598）。-copyts 只讓那段
+# 多抄的內容標對位置，並沒有讓它消失 —— 於是每個接縫都重疊一整個 keyframe
+# 間距（實測 2.044／2.169 秒），而「重疊是冪等的」對這條路徑不成立：
+# 音訊要重編（eac3／5.1 AAC），重編的音訊不冪等，每段開頭那個 2 秒的洞
+# 會蓋掉前一段的聲音；hls.js 也會因為 buffered 對不上而 seek 回去修正。
+# 修法是 -ss 餵下一格 keyframe，讓退格剛好被補償掉。
+_cmd_ss = media.build_remux_cmd(fid, 7.25, 7.25, None, seek_at=10.875)
+check("給了 seek_at 就用它當 -ss（補償 copy 的退格）",
+      _cmd_ss[_cmd_ss.index("-ss") + 1] == "10.875", _cmd_ss)
+check("但 -to 仍然是這一段真正的結束時間（不跟著推後）",
+      _cmd_ss[_cmd_ss.index("-to") + 1] == "14.500", _cmd_ss)
+# 只推後 -ss 的話音訊會落後一整格（音訊是精確 seek 的，它真的從推後那一格
+# 開始）—— 實測 video 頭 600.600、audio 頭 602.580，比原本更糟。
+check("-noaccurate_seek 要在（不然音訊會落後推後量那麼多）",
+      "-noaccurate_seek" in _cmd_ss, _cmd_ss)
+check("-noaccurate_seek 也在 -i 前面（它是輸入端選項）",
+      _cmd_ss.index("-noaccurate_seek") < _cmd_ss.index("-i"), _cmd_ss)
+# **這一條是回歸測試。**copy 模式下 ffmpeg 一律退到前一個 keyframe 才起頭
+# （實測 file 334：要求 49.091 拿到 46.338，連續 12 個 keyframe 每個都退一格，
+# 且完全穩定、微調 -ss 也躲不掉）。舊寫法用 -output_ts_offset 無條件平移到
+# 宣告值，於是那 2.75 秒「剛播過的畫面」被標成從 49.091 開始 —— append 進
+# SourceBuffer 就是畫面倒退。改用 -copyts 保留片源原始時間戳讓標籤說實話。
+check("上階要用 -copyts（時間戳照片源，不要平移到宣告值）",
+      "-copyts" in cmd, cmd)
+check("-copyts 之下要用 -to（絕對時間）而不是 -t（會吐出空檔案）",
+      "-to" in cmd and "-t" not in cmd, cmd)
+check("-to 是這一段的結束絕對時間", cmd[cmd.index("-to") + 1] == "14.500")
 # **這一條是回歸測試，不是風格偏好。**原本寫的是 make_zero，而 make_zero
 # 是在 -output_ts_offset 之後才套用的 —— 它會把 offset 剛寫進去的絕對時間戳
 # 整個抹成 0。實測（file 433，2:33:55）：1540 段每段都從 0 起算，hls.js 只好
 # 一段接一段串起來，MediaSource 的 duration 變成 1540 × 4.816 = 7416 秒，
 # 播放器右下角就從 2:33:55 變成 2:03:36，seek 到 95% 還會直接 ended。
 # 而下階 transcode 沒有這個旗標 —— 所以兩階的時間軸原本是對不起來的。
-check("上階不可以用 make_zero（它會抹掉 output_ts_offset 的絕對時間戳）",
+check("上階不可以用 make_zero（它會抹掉 -copyts 保住的絕對時間戳）",
       cmd[cmd.index("-avoid_negative_ts") + 1] == "disabled", cmd)
-check("時間軸放回這一段該有的位置",
-      cmd[cmd.index("-output_ts_offset") + 1] == "7.250")
-# 兩階必須用同一種時間戳策略，否則切畫質時 currentTime 會對到另一條軸上
+check("上階不該再用 -output_ts_offset（-copyts 已經給了絕對時間，再平移會錯一次）",
+      "-output_ts_offset" not in cmd, cmd)
+# 兩階的時間戳都必須是「片源的絕對 media time」，否則切畫質時 currentTime
+# 會對到另一條軸上。手段不同（上階 -copyts、下階重編碼後平移），結果要一致。
 _tr = media.build_transcode_cmd(fid, 7.25, 7.25, 720, None)
-check("兩階都把時間軸放回絕對位置（切畫質才不會跳）",
+check("下階把時間軸放回絕對位置（切畫質才不會跳）",
       _tr[_tr.index("-output_ts_offset") + 1] == "7.250", _tr)
 check("下階本來就沒有 avoid_negative_ts，上階也不該再靠它平移",
       "make_zero" not in cmd and "make_zero" not in _tr, (cmd, _tr))
@@ -465,6 +542,95 @@ db.execute("""UPDATE media_file SET audio_tracks=? WHERE id=?""",
 cmd3 = media.build_remux_cmd(fid, 0.0, 7.25, None)
 check("5.1 的 AAC 仍然要轉（不然 AUDIO_CHANNELS 的降混會在上階失效）",
       cmd3[cmd3.index("-c:a") + 1] == "aac" and "-ac" in cmd3, cmd3)
+
+
+# ============================================================ 接起來
+head("[J 0] _produce 真的把下一格 keyframe 傳下去")
+
+# **上面那幾條只驗 build_remux_cmd 自己。**真正會壞掉的是接線：
+# seek_at 算在 _produce() 裡（刻意不讓 build_remux_cmd 自己查表，否則兩邊
+# 各查一次就可能拿到不同的答案）—— 所以要驗的是「跑一段出來，-ss 是下一格」。
+# 攔 subprocess.run 拿到真正送出去的指令，不實際叫 ffmpeg。
+import subprocess as _sp
+from app import keyframes as keyframes_mod
+
+_seen = []
+_orig_run = _sp.run
+
+
+def _fake_run(cmd, *a, **kw):
+    _seen.append(cmd)
+    # _produce 會檢查 returncode 與檔案大小，餵一個「成功」的假結果，
+    # 並把 stdout 那個檔案寫進去（它用 open(tmp,"wb") 接 stdout）
+    fh = kw.get("stdout")
+    if fh is not None and hasattr(fh, "write"):
+        fh.write(b"x" * 16)
+    class _R:
+        returncode = 0
+        stderr = b""
+    return _R()
+
+
+def _produce_cmd(fid_, index, prof):
+    """跑一次 _produce，回傳它真正送出去的 ffmpeg 指令。"""
+    _seen.clear()
+    _sp.run = _fake_run
+    try:
+        hls._produce(fid_, index, prof, DUR, hls.seg_dir(fid_, prof) / f"seg-{index}.ts")
+    finally:
+        _sp.run = _orig_run
+    return _seen[0] if _seen else []
+
+
+_pfid = add_file()
+_spans = hls.bounds_for(_pfid, DUR)
+_start1, _end1, _ = _spans[1]
+_prof = hls.profile_key(None, None, 0, hls.RUNG_REMUX)
+
+# **退格是量出來的，不是假設的。**實測把同一份視訊 -c copy 換個容器，
+# 退格行為就變了（mp4 不退、mkv 退一整格）—— 所以推不推由 seek_backoff 決定。
+# 沒量過（NULL）一律當作不退：不該推卻推了會讓那一段開頭整個缺一格，
+# 比「該推沒推」（只是重疊）嚴重得多。
+db.execute("UPDATE media_file SET seek_backoff=NULL WHERE id=?", (_pfid,))
+_pc0 = _produce_cmd(_pfid, 1, _prof)
+check("還沒量過退格 → -ss 就是 start（保守，不推）",
+      _pc0[_pc0.index("-ss") + 1] == f"{_start1:.3f}", _pc0)
+
+db.execute("UPDATE media_file SET seek_backoff=0 WHERE id=?", (_pfid,))
+_pc1 = _produce_cmd(_pfid, 1, _prof)
+check("量到不會退格 → -ss 還是 start（推了會缺開頭）",
+      _pc1[_pc1.index("-ss") + 1] == f"{_start1:.3f}", _pc1)
+
+db.execute("UPDATE media_file SET seek_backoff=1 WHERE id=?", (_pfid,))
+# seg-2 跨兩個 keyframe，推得動；seg-1 只跨一個，推過去就是空段（下面驗）。
+_start2, _end2, _ = _spans[2]
+_pc = _produce_cmd(_pfid, 2, _prof)
+_next_kf = keyframes_mod.seek_start_for(TIMES, _start2, _end2)
+check("量到會退格 → -ss 推到下一格 keyframe",
+      _pc[_pc.index("-ss") + 1] == f"{_next_kf:.3f}",
+      (_pc[_pc.index("-ss") + 1], _start2, _next_kf))
+check("而且它確實比 start 大（真的有推後）", _next_kf > _start2,
+      (_next_kf, _start2))
+check("-to 仍然是這一段的結束（不跟著推後）",
+      _pc[_pc.index("-to") + 1] == f"{_start2 + max(_end2 - _start2, 0.05):.3f}", _pc)
+check("-noaccurate_seek 有跟著出去", "-noaccurate_seek" in _pc, _pc)
+
+# **只跨一個 keyframe 的短段不能推。**下一格就是這一段的結尾，推過去等於
+# `-ss X -to X` —— 實測吐出來的分段從 415,668 位元組掉到 18,424（只有兩個
+# 封包），那一段的畫面整個不見。重疊只是瑕疵，空段是整段播不出來。
+_pc_short = _produce_cmd(_pfid, 1, _prof)
+check("會退格、但短段仍然不推（推過去就是空段）",
+      _pc_short[_pc_short.index("-ss") + 1] == f"{_start1:.3f}",
+      (_pc_short[_pc_short.index("-ss") + 1], _start1, _end1))
+
+# 下階完全不受影響：它沒有退格問題（重新編碼，不是 copy），
+# 推後 -ss 只會讓它少掉開頭那一段。
+_lp = hls.profile_key(720, None, 2800, hls.RUNG_TRANSCODE)
+_lc = _produce_cmd(_pfid, 1, _lp)
+check("下階的 -ss 仍然是 index*seg（沒有被推後）",
+      _lc[_lc.index("-ss") + 1] == "6.000", _lc)
+check("下階沒有 -noaccurate_seek（它不是 copy，沒有退格要補）",
+      "-noaccurate_seek" not in _lc, _lc)
 
 
 # ============================================================ 下線
@@ -505,6 +671,20 @@ prof = db.q1("SELECT video_profile FROM media_file WHERE id=?", (fid,))["video_p
 check("問不到就寫 unknown", prof == keyframes.STREAM_UNKNOWN, prof)
 check("unknown 推不出 CODECS（所以那個屬性會被省略）",
       hls.codecs_attr(keyframes.STREAM_UNKNOWN, 41) is None)
+
+# **退格也要有升級路徑。**seek_backoff 是後來才加的欄位，而既有的檔案全都是
+# kf_state='ok'（不會再被排進佇列）—— 不補的話它們永遠是 NULL，
+# 而 NULL 一律當作「不退」，於是這次修的重疊對它們全部不會生效。
+db.execute("UPDATE media_file SET kf_state='ok', seek_backoff=NULL WHERE id=?", (fid,))
+check("有退格要量", keyframes.seek_backfill_count() >= 1,
+      keyframes.seek_backfill_count())
+# 不給 limit：要驗的是「排完之後佇列真的空了」，
+# 而這個檔案裡有幾個 fixture 會隨著測試增減 —— 寫死一個數字遲早會對不上。
+keyframes.backfill_seek_backoff()
+check("量過之後不會再排進來（量不出來也要寫 0，不然每次啟動都重跑）",
+      keyframes.seek_backfill_count() == 0, keyframes.seek_backfill_count())
+_bk = db.q1("SELECT seek_backoff FROM media_file WHERE id=?", (fid,))["seek_backoff"]
+check("量不出來就寫 0（保守：不推，寧可重疊也不要缺開頭）", _bk == 0, _bk)
 
 
 # ============================================================ 真的 remux 一段

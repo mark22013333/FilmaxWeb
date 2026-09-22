@@ -1449,7 +1449,8 @@ def audio_can_copy(file_id: int, audio_index: Optional[int]) -> bool:
 
 
 def build_remux_cmd(file_id: int, start: float, duration: float,
-                    audio_index: Optional[int]) -> List[str]:
+                    audio_index: Optional[int],
+                    seek_at: Optional[float] = None) -> List[str]:
     """上階的單一分段：視訊照抄，音訊按需轉 AAC（J 章第 0 層）。
 
     **為什麼不走 build_transcode_cmd 的分支而是自己一支。**兩者共用的部分
@@ -1459,15 +1460,92 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
     將來加一個轉碼參數就有機會漏進 copy 的路徑 —— 而那不會報錯，
     只會讓「零損失」這句話悄悄變成假的。
 
-    **`-ss` 一定要在 `-i` 前面（輸入端 seek）。**copy 模式只能從 keyframe 起頭，
-    而我們的 `start` 就是邊界表裡的 keyframe 時間戳，所以兩者剛好吻合。
-    放到輸出端 seek 的話 ffmpeg 會從 0 開始解，然後丟掉前面 —— 慢，而且
-    每一段都要從頭掃一次。
+    **`-ss` 一定要在 `-i` 前面（輸入端 seek）。**放到輸出端 seek 的話 ffmpeg 會
+    從 0 開始解，然後丟掉前面 —— 慢，而且每一段都要從頭掃一次。
+
+    **但「`start` 是 keyframe，所以 ffmpeg 會剛好從那裡起頭」是錯的。**
+    這個函式原本就是這樣假設的，實測推翻了它：copy 模式下，ffmpeg 一律退到
+    **前一個** keyframe 才開始抄。實測 file 334，邊界表裡連續 12 個 keyframe
+    每一個都退了整整一格（要求 49.091 → 實際 46.338，要求 54.638 → 實際
+    51.843），而且**完全穩定**（同一個 start 連跑三次，回退量分毫不差），
+    也不是浮點誤差 —— `-ss` 加上 0.001 ~ 0.1 的微調，落點一樣往前退一格。
+    那些 keyframe 本身是貨真價實的 I-frame（`pict_type=I`），只是 copy 模式
+    需要更前面那個 IDR 才敢起頭。
+
+    **真正會出事的不是「多抄了一段」，是「多抄的那段被貼上錯的標籤」。**
+    舊寫法用 `-output_ts_offset start` 無條件把輸出平移到 `start`，於是
+    46.338~49.091 那 2.75 秒（**剛剛才播過的畫面**）被標成「從 49.091 開始」。
+    hls.js append 進 SourceBuffer 之後，那幾秒的舊畫面就蓋在 49.091 的位置上
+    —— 畫面短暫跳回已經看過的地方，這正是使用者回報的症狀。實測 file 334
+    上階 474 段：**平均重疊 2.995 秒、最大 3.962 秒，每一個接縫都是負 gap。**
+
+    **第一步的修法是讓時間戳說實話**（`-copyts` 保留片源原始時間戳，配 `-to`
+    絕對時間取代 `-t`）：多抄的那段仍然在，但它現在誠實地標著自己真正的
+    media time（46.338），MSE 就會把它放回 46.338 那個位置。
+
+    **但「重疊沒關係、只有標錯位置才有關係」是錯的，第二步才是真正的修法。**
+    當時的理由是「重疊的區間被同樣的內容覆寫，是冪等的」—— 那對視訊成立，
+    對這條路徑卻不成立，有兩個獨立的破口：
+
+      1. **音訊不是 copy。**`audio_can_copy()` 只在「本來就是 AAC 且聲道數
+         符合」時才回 true，eac3／5.1 AAC 都要重編。重編的 AAC 不會產生位元
+         相同的輸出，frame 邊界也對不上前一段 —— 實測每段開頭有個約 2 秒
+         「有畫面、沒聲音」的洞，而那個洞正好蓋在前一段的聲音上。
+      2. **hls.js 會主動修正播放位置。**重疊讓 EXTINF 累加出來的時間軸與
+         SourceBuffer 的 buffered 區間對不上，它偵測到就 seek 回去對齊 ——
+         那一次 seek 就是使用者看到的「畫面往回跳」。
+
+    實測 file 360（keyframe 間距 2.002 秒）連續三段，**每個接縫都重疊一整個
+    keyframe 間距**（2.044／2.169 秒）—— 症狀就是「每 6 秒往回跳 2 秒」。
+
+    **所以會退格的檔案要餵「下一個 keyframe」（`seek_at`），不是 `start`。**
+    退格量修不掉，但可以補償：往後推一格，demux 退回來剛好落在宣告邊界上。
+    推後量由 `keyframes.seek_start_for()` **查表**得到（間距不均勻是常態，
+    172 個檔案裡 96 個 `gap_max - gap_min > 0.5`，用算的會跳過好幾格）。
+
+    **但「一律退一格」是錯的 —— 退格是每個檔案不同的性質。**
+    上面那句「copy 模式下 ffmpeg 一律退到前一個 keyframe」對 mkv 成立，
+    對很多 mp4 不成立。實測把同一份視訊 `-c copy` 換個容器再測：
+
+        abr.mp4  -ss 3.480 → 落點 3.480   （完全不退）
+        abr.mkv  -ss 3.480 → 落點 0.000   （退一整格）
+
+    同樣的視訊內容、同樣的 keyframe，只換容器就換行為 —— **也不能用副檔名
+    判斷**（庫裡的 mp4 有的退有的不退，mkv 也一樣）。所以推不推由
+    `media_file.seek_backoff`（`keyframes.measure_backoff()` 對每個檔案量出來的）
+    決定，`_produce()` 負責查；這個函式只收算好的 `seek_at`。
+
+    **猜錯的代價不對稱**：該推沒推只是接縫重疊（原本的 bug），
+    不該推卻推了是那一段開頭整個缺一格（實測 seg0 從 0.000 變成 4.880）。
+    所以還沒量過（NULL）一律當作不退。
+
+    **`-noaccurate_seek` 一定要跟著加。**只推後 `-ss` 的話音訊會落後 2 秒
+    （音訊是精確 seek 的，它真的從推後的那一格開始），反而比原本更糟。
+    這個旗標讓音訊不做精確 seek、跟著容器落點走。實測三種形狀：
+
+        file 360（均勻 2.0s）        起點完全對齊，接縫重疊 2.044 → 0.042 秒
+        file 297（0.959~10.428s）    起點完全對齊，接縫重疊 0.251 秒
+        file 438（0.133~0.934s）     起點完全對齊，接縫重疊 0.100 秒
+        音訊接縫重疊 0.000 / −0.021 秒（原本是那個 2 秒的洞）
+
+    殘餘的 0.04~0.25 秒是 B-frame 的 PTS 亂序（尾端幾張 B-frame 的 PTS 大於
+    宣告的結束時間），**不是回退**。要求它歸零會逼出「切在 GOP 中間」，
+    那比重疊嚴重得多。
+
+    **輸出端 `-ss`（放到 `-i` 後面）不能用來丟掉回退的部分**（試過）：
+    它會把時間戳歸零，video 頭變成 1.996，`-copyts` 保住的絕對時間軸全毀 ——
+    那正是下面 `-avoid_negative_ts` 那一段在講的同一種災難。
+    `-start_at_zero` 同理（實測 video 頭 3.396）。
+
+    注意 `-t` 一定要換成 `-to`：`-copyts` 之下 `-t` 的語意變成絕對時限，
+    配著用會吐出空檔案或只有一兩個封包（實測踩過）。
+    因為不再平移時間戳，`-output_ts_offset` 也一併拿掉 —— 留著會再平移一次。
 
     **`-avoid_negative_ts` 一定要是 `disabled`，不可以是 `make_zero`。**
-    這兩個選項會互相抵銷：`make_zero` 的語意是「把這一段的時間軸平移到 0」，
-    而它是在 `-output_ts_offset` **之後**才套用的 —— 於是 offset 寫進去的
-    絕對位置被整個抹掉，每一段都從 0 開始。
+    `make_zero` 的語意是「把這一段的時間軸平移到 0」，而它是在時間戳都決定
+    好之後才套用的 —— 於是 `-copyts` 好不容易保住的絕對位置被整個抹掉，
+    每一段都從 0 開始。（這一條在改用 `-copyts` 之前就成立，當時被抹掉的是
+    `-output_ts_offset` 寫進去的位置；換了做法之後它只是換個東西抹，一樣致命。）
 
     實測後果（file 433，2:33:55 的片）：1540 段每段宣告 6 秒、實際各自從 0
     起算，hls.js 只好把它們一段接一段地串起來，於是 MediaSource 的 duration
@@ -1484,10 +1562,15 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
     真的整段 muxer 吐錯時 `_produce()` 會把該檔案的上階下線，那是既有的
     退路，不需要用「把時間軸弄壞」來換。
     """
+    # seek_at 沒給就退回 start（等於舊行為）—— 呼叫端漏傳時寧可重疊，
+    # 也不要因為 None 參與運算而整段炸掉。
+    ss = start if seek_at is None else seek_at
     pre = [resolve_tool("ffmpeg"), "-v", "error", "-nostdin", "-y",
-           "-ss", f"{start:.3f}",
+           "-copyts",
+           "-noaccurate_seek",
+           "-ss", f"{ss:.3f}",
            *input_args(file_id),
-           "-t", f"{duration:.3f}",
+           "-to", f"{start + duration:.3f}",
            "-map", "0:v:0",
            "-map", f"0:{audio_index}" if audio_index is not None else "0:a:0?",
            "-sn", "-dn",
@@ -1501,7 +1584,6 @@ def build_remux_cmd(file_id: int, start: float, duration: float,
             pre += ["-ac", str(settings.audio_channels)]
     pre += ["-avoid_negative_ts", "disabled",
             "-muxdelay", "0", "-muxpreload", "0",
-            "-output_ts_offset", f"{start:.3f}",
             "-f", "mpegts", "pipe:1"]
     return pre
 

@@ -36,3 +36,6 @@ segment-boundary-result.txt
 
 # Cygwin/Git Bash 的當機轉存檔
 *.stackdump
+
+# Claude Code 的本機設定（launch.json 等），因人而異、不進版控
+.claude/

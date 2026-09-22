@@ -113,6 +113,53 @@ check("keyframe 不足回空清單", keyframes.derive_bounds([1.0], [0], 6) == [
 check("沒給 duration 就不補尾巴",
       keyframes.derive_bounds(T, P, 6)[-1][1] == 12.8)
 
+
+# ============================================================ 退格補償
+head("[J 0] -ss 的退格補償（seek_start_for）")
+
+# copy 模式下 ffmpeg 一律退到前一個 keyframe 才起頭，**即使 start 本身就是
+# keyframe**（實測 file 360：邊界 600.600 是貨真價實的 K__，-ss 600.600 的
+# 落點仍然是 598.598）。所以 -ss 要餵下一格，讓它退回來剛好落在邊界上。
+check("start 落在 keyframe 上 → 回下一格（不是 start 自己）",
+      keyframes.seek_start_for(T, 6.4) == 9.6)
+check("start 落在兩格中間 → 回後面那一格",
+      keyframes.seek_start_for(T, 7.0) == 9.6)
+check("start 是 0 → 回第一個大於 0 的 keyframe",
+      keyframes.seek_start_for(T, 0.0) == 3.2)
+
+# **最後一段沒有下一格可推。**回 start 本身：這時候退格補償不了，但也不會更糟
+# —— 後面沒有下一段，沒有接縫會重疊。
+check("start 是最後一個 keyframe → 回 start 本身",
+      keyframes.seek_start_for(T, 12.8) == 12.8)
+check("start 在所有 keyframe 之後（尾巴段）→ 回 start 本身",
+      keyframes.seek_start_for(T, 14.0) == 14.0)
+check("只有一個 keyframe 也不能炸", keyframes.seek_start_for([0.0], 0.0) == 0.0)
+check("空表也不能炸", keyframes.seek_start_for([], 5.0) == 5.0)
+
+# **只跨一個 keyframe 的短段不能推。**下一格就是這一段的結尾，推過去等於
+# `-ss X -to X`：實測分段從 415,668 位元組掉到 18,424（兩個封包），畫面整個
+# 不見。重疊只是瑕疵，空段是整段播不出來 —— 兩者不是同一個量級。
+check("短段（下一格就是 end）不推",
+      keyframes.seek_start_for(T, 6.4, 9.6) == 6.4)
+check("跨兩格的段照推（下一格還在段內）",
+      keyframes.seek_start_for(T, 6.4, 12.8) == 9.6)
+check("下一格剛好等於 end 也算短段（浮點要留餘裕）",
+      keyframes.seek_start_for([0.0, 3.2, 6.4], 3.2, 6.4 + 1e-12) == 3.2)
+check("沒給 end 就照舊推（呼叫端沒傳不代表段很短）",
+      keyframes.seek_start_for(T, 6.4) == 9.6)
+
+# 浮點：邊界值是從同一份 times 取出來的，== 比較會踩到 1e-9 級的誤差，
+# 那會讓它回傳「自己」而不是下一格 —— 補償就整個失效。
+check("start 與 keyframe 只差浮點誤差時，仍然回下一格",
+      keyframes.seek_start_for([0.0, 3.2, 6.4], 3.2 + 1e-12) == 6.4)
+
+# **間距不均勻是常態**（全庫 172 個會發上階的檔案裡 96 個 gap_max-gap_min>0.5）。
+# 查表才能在稀疏處也對；用 start + gap_med 算的話會跳過好幾格。
+UNEVEN = [0.0, 0.5, 1.0, 11.4, 21.8]
+check("稀疏處回的是真正的下一格，不是平均間距推算的",
+      keyframes.seek_start_for(UNEVEN, 1.0) == 11.4)
+check("密集處也回真正的下一格", keyframes.seek_start_for(UNEVEN, 0.0) == 0.5)
+
 # 峰值 vs 平均
 uneven = [(0.0, 6.0, 1_000_000), (6.0, 12.0, 15_000_000)]
 peak, avg = keyframes.bandwidth_for(uneven)
