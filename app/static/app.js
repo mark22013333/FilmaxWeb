@@ -1,6 +1,21 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+// 目前在哪個入口。'shared' 是一般片庫，'vault' 是保險庫（受限資料夾）。
+// 受限資料夾**不會**混進一般片庫，連被授權的人也一樣 —— 見 app/acl.py 開頭。
+let viewScope = 'shared';
+
+// 只有清單／統計類的 GET 要帶 scope。單筆讀取（play、stream、image、hls…）
+// 刻意不帶：那些端點用 ANY 判斷，從哪個入口進來都一樣能讀，
+// 否則從保險庫點進去的播放頁會變成點得到卻播不出來。
+const SCOPED = /^\/api\/(library|continue|stats|genres|photos|documents)(\?|$)/;
+
 const api = async (url, opt = {}) => {
+  // 保險庫的 scope 在這裡統一補上，不是讓每個呼叫點自己記得帶 ——
+  // 二十個呼叫點各帶一次，漏掉的那個會安靜地去查一般片庫，
+  // 而畫面上只會看到「保險庫裡混進了不該有的東西」。
+  if (viewScope === 'vault' && SCOPED.test(url)) {
+    url += (url.includes('?') ? '&' : '?') + 'scope=vault';
+  }
   // 有 body 就一定要帶 Content-Type: application/json —— FastAPI 的 Pydantic
   // 是看這個標頭決定要不要解析 body 的，少了它會回 422 而不是「欄位錯」，
   // 而 422 的訊息看起來完全不像「你忘了設標頭」。
@@ -1371,9 +1386,66 @@ function showView(kind) {
   $('#q').placeholder = other ? '搜尋檔名或資料夾…' : '搜尋片名或檔名…';
 }
 
-$$('nav button').forEach(b => b.onclick = () => {
+// 保險庫入口：**只有真的有授權的人才會看到這顆按鈕**。
+// 沒有授權時 /api/vault 回的是 {has_vault:false}，連有幾個受限資料夾都不會說 ——
+// 受限資料夾的存在本身就是資訊（見 acl.py 的「為什麼回 404 而不是 403」）。
+async function initVault() {
+  let v;
+  try { v = await api('/api/vault'); } catch { return; }
+  if (!v.has_vault) return;
+  const nav = document.querySelector('nav');
+  if (!nav || nav.querySelector('[data-kind="vault"]')) return;
+  const b = document.createElement('button');
+  b.dataset.kind = 'vault';
+  b.className = 'vault-btn';
+  b.title = v.folders && v.folders.length ? v.folders.join('、') : '';
+  b.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none"'
+    + ' stroke="currentColor" stroke-width="2.4" aria-hidden="true">'
+    + '<rect x="4" y="10" width="16" height="11" rx="2"/>'
+    + '<path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>'
+    + `私人${v.items ? ` <small style="opacity:.6">${v.items}</small>` : ''}`;
+  nav.appendChild(b);
+  wireNav(b);
+}
+
+// 換入口之後要重畫的「不是主清單」的區塊。
+//
+// 這些區塊各自有自己的 DOM，主清單重畫**不會**動到它們 —— 所以換入口時
+// 一定要一起叫，否則上一個入口的內容會原封不動留在畫面上。
+// 實際踩到的：從保險庫按「全部」回來，保險庫的「繼續觀看」（含片名與海報）
+// 還留在一般片庫上。那不只是畫面沒更新，那是私人的東西留在共用畫面上。
+//
+// 立刻清空再重新載入：載入是非同步的，中間那段空窗如果還掛著舊內容，
+// 就等於「按了全部、私人的東西還在那裡」—— 只是時間短一點而已。
+function refreshScopeBoxes() {
+  const c = $('#continue'); if (c) c.innerHTML = '';
+  const g = $('#genres'); if (g) g.innerHTML = '';
+  loadContinue().catch(() => {});
+  loadGenres().catch(() => {});
+}
+
+function wireNav(b) {
+  b.onclick = () => {
   $$('nav button').forEach(x => x.classList.remove('on'));
   b.classList.add('on');
+  // 換入口等於換一整個片庫：分頁、搜尋字串、分類都要歸零，
+  // 否則會帶著「上一個入口的第 3 頁」去查另一個入口而看到空白。
+  const wantVault = b.dataset.kind === 'vault';
+  const switched = wantVault !== (viewScope === 'vault');
+  if (switched) {
+    viewScope = wantVault ? 'vault' : 'shared';
+    state.page = 1; state.genre = ''; state.q = '';
+    const q = $('#q'); if (q) q.value = '';
+    document.body.classList.toggle('in-vault', wantVault);
+    // 先清掉舊入口的內容，再往下走 —— 不管接下來是影片、相片還是文件分頁。
+    refreshScopeBoxes();
+  }
+  if (wantVault) {
+    state.kind = '';
+    showView('video');
+    loadLibrary();
+    return;
+  }
   if (b.dataset.kind === 'photo') {
     showView('photo');
     loadFolders(); loadPhotos();
@@ -1386,7 +1458,10 @@ $$('nav button').forEach(b => b.onclick = () => {
   }
   showView('video');
   state.kind = b.dataset.kind; state.page = 1; loadLibrary();
-});
+  };
+}
+
+$$('nav button').forEach(wireNav);
 let qTimer;
 $('#q').oninput = e => {
   clearTimeout(qTimer);
@@ -1409,6 +1484,7 @@ $('#sort').onchange = e => {
   await loadLibrary();
   loadGenres().catch(() => {});
   loadContinue().catch(() => {});
+  initVault().catch(() => {});   // 沒有授權就什麼也不會長出來
   const s = await api('/api/scan/status').catch(() => null);
   if (s && s.running) { $('#scanPanel').classList.add('show'); pollScan(); }
 })();

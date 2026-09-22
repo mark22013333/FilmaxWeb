@@ -116,8 +116,12 @@ def titles(cl):
     return sorted(i["title"] for i in cl.get("/api/library").json()["items"])
 
 
-check("管理員看得到全部 3 部", titles(admin) == ["片1", "片2", "片3"], titles(admin))
-check("被授權的帳號看得到全部 3 部", titles(granted) == ["片1", "片2", "片3"], titles(granted))
+# 一般入口（shared）：受限資料夾對**所有人**都不出現，管理員與被授權的人也一樣。
+# 這是刻意的 —— 受限資料夾只在保險庫入口裡，見 acl.py 開頭「另一個入口」那一段。
+check("管理員在一般入口只看得到 2 部（受限的不混進來）",
+      titles(admin) == ["片1", "片3"], titles(admin))
+check("被授權的帳號在一般入口也只看得到 2 部",
+      titles(granted) == ["片1", "片3"], titles(granted))
 check("沒被授權的帳號只看得到 2 部", titles(denied) == ["片1", "片3"], titles(denied))
 check("密碼登入的 viewer 也只看得到 2 部（沒有身分可以判斷）",
       titles(pw) == ["片1", "片3"], titles(pw))
@@ -141,12 +145,60 @@ st = denied.get("/api/stats").json()
 check(f"統計數字跟著縮（電影 {st['movies']}、檔案 {st['files']}）",
       st["movies"] == 2 and st["files"] == 2, st)
 check("相片統計跟著縮", denied.get("/api/photos/stats").json()["total"] == 2)
+sg = granted.get("/api/stats").json()
+check(f"被授權的人在一般入口，統計數字也不含受限的（電影 {sg['movies']}）",
+      sg["movies"] == 2 and sg["files"] == 2, sg)
 check("「繼續看」不會漏出受限的片",
       [x["file_id"] for x in denied.get("/api/continue").json()["items"]] == [],
       denied.get("/api/continue").json()["items"])
-check("被授權的人在「繼續看」裡看得到",
-      [x["file_id"] for x in granted.get("/api/continue").json()["items"]] == [2])
+# 改掉的行為：被授權的人在**一般入口**的「繼續看」也不該看到受限的片 ——
+# 那一排就掛在首頁上，旁邊的人會看到。要看得到就進保險庫。
+check("被授權的人在一般入口的「繼續看」也看不到受限的片",
+      [x["file_id"] for x in granted.get("/api/continue").json()["items"]] == [],
+      granted.get("/api/continue").json()["items"])
+check("被授權的人在保險庫的「繼續看」裡看得到",
+      [x["file_id"] for x in
+       granted.get("/api/continue?scope=vault").json()["items"]] == [2],
+      granted.get("/api/continue?scope=vault").json()["items"])
 check("搜尋也搜不到", denied.get("/api/library?q=片2").json()["total"] == 0)
+check("被授權的人在一般入口也搜不到受限的片",
+      granted.get("/api/library?q=片2").json()["total"] == 0)
+
+print("\n[2b] 保險庫入口")
+
+
+def vtitles(cl):
+    return sorted(i["title"] for i in
+                  cl.get("/api/library?scope=vault").json()["items"])
+
+
+check("保險庫裡只有受限的那一部（不是第二個完整片庫）",
+      vtitles(granted) == ["片2"], vtitles(granted))
+check("管理員的保險庫裡也只有受限的那一部", vtitles(admin) == ["片2"], vtitles(admin))
+# 最容易寫錯、而且錯了不會有錯誤訊息的一行：沒有授權時 vault 條件若回
+# 「不必過濾」，這裡就會變成整個片庫。
+check("沒被授權的人硬帶 scope=vault 也是空的（不是整個片庫）",
+      vtitles(denied) == [], vtitles(denied))
+check("密碼登入硬帶 scope=vault 也是空的", vtitles(pw) == [], vtitles(pw))
+check("保險庫的統計數字只算受限的",
+      granted.get("/api/stats?scope=vault").json()["movies"] == 1,
+      granted.get("/api/stats?scope=vault").json())
+
+print("\n[2c] /api/vault：有沒有入口")
+check("被授權的人有保險庫", granted.get("/api/vault").json()["has_vault"] is True)
+check("被授權的人看得到筆數", granted.get("/api/vault").json()["items"] == 1,
+      granted.get("/api/vault").json())
+vd = denied.get("/api/vault").json()
+check("沒被授權的人沒有保險庫", vd["has_vault"] is False, vd)
+check("而且不附任何規則資訊（存在本身就是資訊）",
+      "folders" not in vd and "items" not in vd, vd)
+check("密碼登入沒有保險庫", pw.get("/api/vault").json()["has_vault"] is False)
+
+print("\n[2d] 單筆讀取不看入口（否則保險庫點得到卻播不出來）")
+check("被授權的人打得開受限的條目詳情",
+      granted.get("/api/items/2").status_code == 200,
+      granted.get("/api/items/2").status_code)
+check("沒被授權的人條目詳情還是 404", denied.get("/api/items/2").status_code == 404)
 
 print("\n[3] 直接猜 id：要 404，不能 403")
 for path in ("/api/items/2", "/api/play/2", "/api/photos/2", "/api/documents/2",
@@ -174,10 +226,17 @@ check("但受限的那個檔案被濾掉了",
       [f["filename"] for f in d["files"]] == ["片1.mp4"], [f["filename"] for f in d["files"]])
 
 print("\n[5] 授權改動即時生效，不用重新登入")
+# 受限資料夾只在保險庫裡，所以「有沒有授權」要從保險庫入口看 ——
+# 一般清單對有沒有授權的人都長一樣，用它判斷不出授權有沒有生效。
 acl.set_grants(rule["id"], [u_ok["id"], u_no["id"]])
-check("加了授權立刻看得到", titles(denied) == ["片1", "片2", "片3"], titles(denied))
+# 片1 在 [4] 被塞了一個受限資料夾裡的檔案，所以它也算「保險庫裡有東西的條目」——
+# 條目只要還有一個看得到的檔案就看得到，這是既有規則。
+check("加了授權立刻看得到（保險庫）",
+      vtitles(denied) == ["片1", "片2"], vtitles(denied))
+check("但一般入口還是看不到（授權不等於混進共用清單）",
+      titles(denied) == ["片1", "片3"], titles(denied))
 acl.set_grants(rule["id"], [u_ok["id"]])
-check("收回授權立刻看不到", titles(denied) == ["片1", "片3"], titles(denied))
+check("收回授權立刻看不到（保險庫）", vtitles(denied) == [], vtitles(denied))
 
 print("\n[6] 走過 route table：每一條非管理員路由都要經過閘門")
 # 明列的例外，每一條都要有理由。新增端點時如果沒有接閘門，
@@ -193,7 +252,10 @@ EXEMPT = {
     "/api/openapi.json": "整支端點是 admin-only（內嵌 auth.is_admin 檢查）",
     "/api/docs": "整支端點是 admin-only（內嵌 auth.is_admin 檢查）",
 }
-GATE = ("acl.filter_sql", "acl.assert_can_read", "acl.visible_item", "admin_only")
+# acl.has_vault / acl._vault_only_sql 也是閘門：兩者都是從 granted_prefixes
+# 算出來的，沒有授權就分別回 False 與恆假條件。保險庫入口靠它們把關。
+GATE = ("acl.filter_sql", "acl.assert_can_read", "acl.visible_item", "admin_only",
+        "acl.has_vault", "acl._vault_only_sql")
 
 from app.routers import api as api_mod, stream as stream_mod   # noqa: E402
 
@@ -234,8 +296,8 @@ adm_cl = TestClient(app, client=("127.0.0.1", 1))
 adm_cl.cookies.set(auth.COOKIE, auth.make_user_token(u_adm["id"]))
 
 acl.set_grants(rule["id"], [u_ok["id"]])        # 管理員刻意不給授權
-check("管理員沒有任何授權也看得到全部（角色就夠了）",
-      titles(adm_cl) == ["片1", "片2", "片3"], titles(adm_cl))
+check("管理員沒有任何授權也進得了保險庫（角色就夠了）",
+      vtitles(adm_cl) == ["片1", "片2"], vtitles(adm_cl))
 
 payload = admin.get("/api/folders/acl").json()
 who = {u["name"]: u.get("is_admin") for u in payload["users"]}
@@ -257,18 +319,18 @@ acl.invalidate()
 check("改角色會讓舊 token 立刻失效（降權不能等過期）",
       adm_cl.get("/api/library").status_code == 401)
 adm_cl.cookies.set(auth.COOKIE, auth.make_user_token(u_adm["id"]))
-check("降回一般帳號之後，靠那筆授權仍然看得到",
-      titles(adm_cl) == ["片1", "片2", "片3"], titles(adm_cl))
+check("降回一般帳號之後，靠那筆授權仍然進得了保險庫",
+      vtitles(adm_cl) == ["片1", "片2"], vtitles(adm_cl))
 
 users.set_role(u_no["id"], users.OWNER)
 acl.invalidate()
 denied.cookies.set(auth.COOKIE, auth.make_user_token(u_no["id"]))
-check("沒有授權的人升成管理員 → 立刻看得到（不需要補授權）",
-      titles(denied) == ["片1", "片2", "片3"], titles(denied))
+check("沒有授權的人升成管理員 → 立刻進得了保險庫（不需要補授權）",
+      vtitles(denied) == ["片1", "片2"], vtitles(denied))
 users.set_role(u_no["id"], "viewer")
 acl.invalidate()
 denied.cookies.set(auth.COOKIE, auth.make_user_token(u_no["id"]))
-check("降回來就看不到了（權限不會殘留）", titles(denied) == ["片1", "片3"], titles(denied))
+check("降回來就看不到了（權限不會殘留）", vtitles(denied) == [], vtitles(denied))
 acl.set_grants(rule["id"], [u_ok["id"]])
 
 
@@ -297,10 +359,15 @@ check("受限資料夾不出現在樹的節點裡",
       not any(n == "私人" or n.startswith("私人/") for n in deny_names), deny_names)
 check("名字相近的資料夾沒有被一起擋掉（樹也要正規化前綴）",
       any("私人物品" in n for n in deny_names), deny_names)
+# 一般入口對管理員與沒權限的人現在是同一份（受限的都不算進來），
+# 所以這裡比的是「一般入口」與「保險庫」：受限的份數要落在保險庫那邊。
 sum_adm = sum(i["c"] for i in t_adm)
 sum_deny = sum(i["c"] for i in t_deny)
-check(f"節點的遞迴份數跟著縮（管理員 {sum_adm}、沒權限 {sum_deny}）",
-      sum_deny < sum_adm, (sum_adm, sum_deny))
+check(f"一般入口的遞迴份數不含受限的（管理員 {sum_adm}、沒權限 {sum_deny}）",
+      sum_adm == sum_deny, (sum_adm, sum_deny))
+t_vault = admin.get("/api/documents/folders", params={"scope": "vault"}).json()["items"]
+sum_vault = sum(i["c"] for i in t_vault)
+check(f"受限的份數落在保險庫裡（{sum_vault} 份）", sum_vault > 0, sum_vault)
 check("單鏈穿透：只有一條路可走的層會併成一個節點（A / 深）",
       any(i["name"] == "A / 深" for i in tree(denied, OPEN)),
       [i["name"] for i in tree(denied, OPEN)])

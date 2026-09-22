@@ -212,6 +212,27 @@ def genres(request: Request):
                        for k, v in sorted(counts.items(), key=lambda x: -x[1])]}
 
 
+@router.get("/vault")
+def vault_info(request: Request):
+    """這個人有沒有保險庫可以進，以及裡面有幾部。
+
+    前端靠這個決定要不要顯示那個入口。**沒有授權的人回 has_vault=false，
+    而且不附任何規則資訊** —— 受限資料夾的存在本身就是資訊，回一份空的
+    prefixes 清單跟回「有 3 個你進不去的資料夾」是兩件完全不同的事。
+
+    數量是用 `scope=vault` 的同一份條件算的，所以它跟入口裡真的列得出來的
+    筆數一致 —— 對不上的數字會讓人以為東西不見了。
+    """
+    if not acl.has_vault(request):
+        return {"has_vault": False}
+    frag, args = acl._vault_only_sql(request, "f2.ftp_path")
+    n = db.q1(f"""SELECT COUNT(*) c FROM media_item i
+                  WHERE EXISTS(SELECT 1 FROM media_file f2
+                               WHERE f2.item_id=i.id AND {frag})""", args)["c"]
+    return {"has_vault": True, "items": n,
+            "folders": [p.rsplit("/", 1)[-1] for p in acl.granted_prefixes(request)]}
+
+
 @router.get("/stats")
 def stats(request: Request):
     def c(sql, p=()):
@@ -429,7 +450,9 @@ def play_info(file_id: int, request: Request,
     # 全部在 app/episodes.py，前端與之後的自動播放都問同一份答案。
     next_ep = None
     if f.get("kind") == "tv" and f.get("item_id"):
-        nff, nfa = acl.filter_sql(request, "f.ftp_path")
+        # ANY：下一集是這一筆播放的延伸，跟「從哪個入口進來」無關。
+        # 用 shared 的話保險庫裡的影集會沒有下一集可以接（自動播放斷掉）。
+        nff, nfa = acl.filter_sql_any(request, "f.ftp_path")
         next_ep = episodes.next_episode(f["item_id"], f.get("season"), f.get("episode"),
                                         nff, nfa)
         if next_ep:
