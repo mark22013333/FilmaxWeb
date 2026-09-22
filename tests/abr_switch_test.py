@@ -72,7 +72,12 @@ subprocess.run([
     "-t", "120",
     "-vf", "drawtext=text='%{eif\\:t\\:d}':fontsize=64:fontcolor=white:x=20:y=20",
     "-c:v", "libx264", "-preset", "veryfast",
-    "-g", "87", "-keyint_min", "87", "-sc_threshold", "0",
+    # **GOP 要除得盡 HLS_SEGMENT_SECONDS。**25fps × 50 格 = 2.00 秒，
+    # 6 秒剛好三個 keyframe —— 上階才切得出跟下階一樣的格線，
+    # 也才進得了 ABR master（`abr_alignable()` 容許 0.25 秒）。
+    # 原本的 87 格 = 3.48 秒除不盡 6，上階會被擋在 ABR 之外，
+    # 於是 master 只剩一階、這支測試要驗的「切階」根本不會發生。
+    "-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
     "-pix_fmt", "yuv420p", "-profile:v", "high",
     "-c:a", "aac", "-ac", "2", "-shortest", "-y", str(src)], check=True)
 dur = float(subprocess.run([fp, "-v", "error", "-show_entries", "format=duration",

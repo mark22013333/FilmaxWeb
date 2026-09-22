@@ -143,29 +143,56 @@ head("[J 0] master playlist")
 
 m_remote = hls.build_master(fid, lower, remote=True, duration=DUR)
 m_lan = hls.build_master(fid, lower, remote=False, duration=DUR)
-# 遠端只允許固定格線的 transcode rendition 互切；remux 的 keyframe 邊界
-# 只要中途漏一個格線，seg-N 就會整段錯位。MKV 在區網也先走 transcode，
-# 避免 Matroska 單一 remux 的 PTS/DTS 仍把舊畫格送回播放器。
-check("遠端仍發完整轉碼階梯", m_remote.count("#EXT-X-STREAM-INF") >= 2, m_remote)
-check("遠端不混 remux 上階", "_m1" not in m_remote, m_remote)
-check("MKV 區網暫停 remux，改發單一轉碼階", m_lan.count("#EXT-X-STREAM-INF") == 1, m_lan)
-check("MKV 區網那一階是 transcode", "_m1" not in m_lan and "_m0" in m_lan, m_lan)
+# 上階 ＋ 一條轉碼階梯（J 章第 1 層）。上階的峰值 21.7 Mbps 行動網路選不到，
+# 所以「上階＋單一轉碼階」等於遠端只有一階可用、卡頓時無階可降。
+check("遠端發上階＋整條階梯（不只兩階）", m_remote.count("#EXT-X-STREAM-INF") >= 3, m_remote)
+check("區網只發一階（零轉碼路徑）", m_lan.count("#EXT-X-STREAM-INF") == 1, m_lan)
+check("區網那一階是上階", f"?p={upper}" in m_lan and f"?p={lower}" not in m_lan, m_lan)
 
-# 非 MKV 的區網 fast path 保留，避免把所有可安全 remux 的片源一起退化。
+# **容器不再影響發不發上階。**曾經有一版連區網的 mkv 都改走轉碼，
+# 理由是「單一 remux rendition 也可能畫格回退」—— 那個回退的根因是
+# copy 模式 `-ss` 的退格沒有被補償（見 media.build_remux_cmd），已經修掉。
 fid_mp4 = add_file(ext="mp4")
 m_lan_mp4 = hls.build_master(fid_mp4, lower, remote=False, duration=DUR)
-check("MP4 區網仍保留單一 remux 零轉碼路徑",
+check("mp4 區網一樣發上階（零轉碼路徑）",
       f"?p={upper}" in m_lan_mp4 and m_lan_mp4.count("#EXT-X-STREAM-INF") == 1,
       m_lan_mp4)
+check("mkv 區網也照發上階（容器不是判準）", f"?p={upper}" in m_lan, m_lan)
 
-first = [l for l in m_remote.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
+# 上階那一行的屬性要驗，就得用一個**真的進得了 ABR** 的片源 ——
+# 預設那組 fixture 的 keyframe 是 3.625 秒，除不盡 6 秒（偏差 1.5 秒），
+# 嚴格規則會把它擋在 ABR 之外，於是 master 的第一行變成轉碼階，
+# 拿它來驗「上階的 CODECS」等於什麼都沒驗到。
+def _aligned_file(**kw):
+    """keyframe 剛好 2 秒（除得盡 6 秒）的片源，上階進得了 ABR master。"""
+    f = add_file(gap=2.0, **kw)
+    t = [round(i * 2.0, 3) for i in range(31)]
+    db.execute("UPDATE media_keyframe SET times=?, positions=?, count=? WHERE file_id=?",
+               (json.dumps(t), json.dumps([i * 1_000_000 for i in range(len(t))]),
+                len(t), f))
+    db.execute("UPDATE media_file SET duration=? WHERE id=?", (60.0, f))
+    return f
+
+
+fid_al = _aligned_file()
+m_al = hls.build_master(fid_al, lower, remote=True, duration=60.0)
+check("對得齊的片源，遠端 master 有上階", "_m1" in m_al, m_al)
+first = [l for l in m_al.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
 bw = int(first.split("BANDWIDTH=")[1].split(",")[0])
-check("遠端第一階仍有有效 BANDWIDTH", bw > 0, first)
+avg = int(first.split("AVERAGE-BANDWIDTH=")[1].split(",")[0])
+# 邊界是均勻的，所以峰值≈平均＋音訊；重點是「兩個都有、峰值不小於平均」
+check("上階有 BANDWIDTH 與 AVERAGE-BANDWIDTH 兩個", bw > 0 and avg > 0, first)
+check("BANDWIDTH 是峰值，不小於平均", bw >= avg, (bw, avg))
+check("兩個都含音訊碼率", avg > 192_000, avg)
+check("上階的解析度是片源原本的（不縮放）", "RESOLUTION=1920x960" in first, first)
+check("上階的 CODECS 照片源的 profile／level 填（不是寫死的 64001f）",
+      'CODECS="avc1.640029,mp4a.40.2"' in first, first)
 
-fid_np = add_file(profile=None, level=None)
-m_np = hls.build_master(fid_np, lower, remote=True, duration=DUR)
-check("遠端即使片源 profile／level 不明，也不會因此把 remux 混進 ABR",
-      "_m1" not in m_np, m_np)
+fid_np = _aligned_file(profile=None, level=None)
+m_np = hls.build_master(fid_np, lower, remote=True, duration=60.0)
+up_np = [l for l in m_np.splitlines() if l.startswith("#EXT-X-STREAM-INF")][0]
+check("推不出 profile／level 就整個省略 CODECS（規格允許；填錯會被 Safari 拒收）",
+      "CODECS" not in up_np, up_np)
 
 # 主階（使用者選的那一檔）在階梯裡，但**不保證是第 1 行** —— 自動模式下
 # 上面還有一階高畫質頂階。用碼率去找它，不要用位置。
@@ -368,11 +395,31 @@ check("上階切得出分段", len(_spans) > 1, len(_spans))
 _worst = max(abs(s0 - i * _seg) for i, (s0, _e, _b) in enumerate(_spans))
 check("舊的寬鬆檢查確實可能只看到『沒有累積到幾百秒』",
       _worst < _seg * 1.5, (_worst, [round(s0, 2) for s0, _, _ in _spans]))
+# 3.625 除不盡 6，所以邊界最多只能貼到 1.5 秒 —— 那是肉眼看得到的錯位，
+# 嚴格規則（0.25 秒）要擋下來。**這不是 remux 壞了**，是這個片源的
+# keyframe 密度拼不出跟下階一樣的格線。
 check("嚴格 ABR 驗證不接受肉眼可見的 sub-segment 偏差",
       hls.abr_alignable(fid, DUR)[0] is False, hls.abr_alignable(fid, DUR))
 
 _m = hls.build_master(fid, lower, remote=True, duration=DUR)
-check("即使邊界看起來接近，遠端也一律不混 remux", "_m1" not in _m, _m)
+check("對不齊 → 遠端 master 不發上階", "_m1" not in _m, _m)
+# **但區網照發**：只有一個 rendition，沒有另一階可以切過去，
+# `abr_alignable()` 要擋的那種失效在這裡不存在。對不齊不該讓它失去零轉碼。
+check("對不齊的片源在區網仍然發上階（單一 rendition 切不到別階）",
+      f"?p={upper}" in hls.build_master(fid, lower, remote=False, duration=DUR))
+
+# 真的對得齊的片源要進得了 ABR —— 否則「嚴格」就等於「全部擋掉」，
+# 那跟直接關掉遠端上階沒有分別。2 秒的 keyframe 除得盡 6 秒。
+_even = add_file(gap=2.0)
+_even_times = [round(i * 2.0, 3) for i in range(31)]
+db.execute("UPDATE media_keyframe SET times=?, positions=? WHERE file_id=?",
+           (json.dumps(_even_times),
+            json.dumps([i * 1_000_000 for i in range(len(_even_times))]), _even))
+db.execute("UPDATE media_file SET duration=? WHERE id=?", (60.0, _even))
+_even_ok, _even_why = hls.abr_alignable(_even, 60.0)
+check("keyframe 除得盡分段長度 → 對得齊，進得了 ABR", _even_ok, (_even_ok, _even_why))
+check("而且遠端 master 真的有發上階",
+      "_m1" in hls.build_master(_even, lower, remote=True, duration=60.0))
 
 # **片源的 keyframe 比分段長度還疏**就對不齊，而且不是理論上的：
 # 實測 file 297 的 `gap_med` 是 4.67 秒（看起來很安全），但那個中位數是被
@@ -406,18 +453,21 @@ db.execute("UPDATE media_file SET duration=? WHERE id=?", (60.0, _long))
 _long_ok, _long_why = hls.abr_alignable(_long, 60.0)
 check("中途 long GOP 漏掉一個 6 秒格線 → 必須判定不能混 ABR",
       not _long_ok, (_long_ok, _long_why))
-check("long GOP 的遠端 master 仍是 transcode-only",
+check("long GOP 的遠端 master 不發上階（只剩轉碼階梯）",
       "_m1" not in hls.build_master(_long, lower, remote=True, duration=60.0))
+# 但區網照發：單一 rendition 切不到別階，long GOP 不影響它。
+check("long GOP 在區網仍然發上階",
+      "_m1" in hls.build_master(_long, lower, remote=False, duration=60.0))
 
 _m2 = hls.build_master(_odd, lower, remote=True, duration=_odd_dur)
 check("對不齊 → 遠端 master 不發上階（寧可少一階，也不要壞掉的時間軸）",
       "_m1" not in _m2, _m2)
 check("但轉碼階梯照發，播放不中斷", _m2.count("index.m3u8") >= 2, _m2)
-# MKV 的單一 remux 也先停用：使用者回報的 Reacher 類型就是 Matroska/H.264，
-# 而畫面回退不一定伴隨 LEVEL_SWITCHED，所以不能只修遠端混階。
+# **區網那條路不受影響**：它只發一個 rendition，沒有另一階可以切過去。
 _lan = hls.build_master(_odd, lower, remote=False, duration=_odd_dur)
-check("MKV 區網也不發 remux", "_m1" not in _lan, _lan)
-check("區網仍有單一轉碼 rendition 可播", _lan.count("index.m3u8") == 1, _lan)
+check("區網仍然發上階（單一 rendition，對不齊也切不到別階）",
+      "_m1" in _lan, _lan)
+check("而且區網只有那一階（零轉碼路徑）", _lan.count("index.m3u8") == 1, _lan)
 
 
 # ============================================================ remux 指令
@@ -635,7 +685,9 @@ check("unknown 推不出 CODECS（所以那個屬性會被省略）",
 db.execute("UPDATE media_file SET kf_state='ok', seek_backoff=NULL WHERE id=?", (fid,))
 check("有退格要量", keyframes.seek_backfill_count() >= 1,
       keyframes.seek_backfill_count())
-keyframes.backfill_seek_backoff(limit=5)
+# 不給 limit：要驗的是「排完之後佇列真的空了」，
+# 而這個檔案裡有幾個 fixture 會隨著測試增減 —— 寫死一個數字遲早會對不上。
+keyframes.backfill_seek_backoff()
 check("量過之後不會再排進來（量不出來也要寫 0，不然每次啟動都重跑）",
       keyframes.seek_backfill_count() == 0, keyframes.seek_backfill_count())
 _bk = db.q1("SELECT seek_backoff FROM media_file WHERE id=?", (fid,))["seek_backoff"]
