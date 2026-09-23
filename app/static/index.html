@@ -12,14 +12,18 @@
 
 <header>
   <div class="brand"><i>F</i>FilmaxWeb</div>
+  <!-- 媒體類型導覽。data-media 是維度（video/photo/doc），data-kind 是影片底下的細分；
+       相片與文件的 data-kind 沒有作用，留著是給 E2E 測試當選擇器用。
+       「私人」不在這裡：它是範圍（scope），由 app.js 的 initVault() 在有授權時
+       另外長出一個開關插在這排前面。 -->
   <nav>
-    <button data-kind="" class="on">全部</button>
-    <button data-kind="movie">電影</button>
-    <button data-kind="tv">影集</button>
-    <button data-kind="jav">JAV</button>
-    <button data-kind="home">錄影</button>
-    <button data-kind="photo">相片</button>
-    <button data-kind="doc">文件</button>
+    <button data-media="video" data-kind="" class="on">全部</button>
+    <button data-media="video" data-kind="movie">電影</button>
+    <button data-media="video" data-kind="tv">影集</button>
+    <button data-media="video" data-kind="jav">JAV</button>
+    <button data-media="video" data-kind="home">錄影</button>
+    <button data-media="photo" data-kind="photo">相片</button>
+    <button data-media="doc" data-kind="doc">文件</button>
   </nav>
   <div class="spacer"></div>
   <div class="search">

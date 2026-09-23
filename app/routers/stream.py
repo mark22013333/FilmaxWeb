@@ -35,7 +35,7 @@ def _file_or_404(file_id: int, request: Request) -> dict:
     row = db.q1("SELECT * FROM media_file WHERE id=?", (file_id,))
     if not row:
         raise HTTPException(404, "找不到檔案")
-    acl.assert_can_read(request, row["ftp_path"])
+    acl.assert_can_read(request, row["ftp_path"], kind="video")
     return db.row_to_dict(row)  # type: ignore[return-value]
 
 
@@ -211,7 +211,7 @@ def photo_thumb(photo_id: int, request: Request):
     r = db.q1("SELECT thumb, folder FROM photo WHERE id=?", (photo_id,))
     if not r or not r["thumb"]:
         raise HTTPException(404, "沒有縮圖")
-    acl.assert_can_read(request, r["folder"])
+    acl.assert_can_read(request, r["folder"], kind="photo")
     # thumb 是我們自己產生的 ph_<id>.jpg，不是使用者輸入，但還是擋一下路徑字元
     name = str(r["thumb"])
     if "/" in name or "\\" in name or ".." in name:
@@ -232,7 +232,7 @@ def _photo_row(photo_id: int, request: Request) -> dict:
                  FROM photo WHERE id=?""", (photo_id,))
     if not r:
         raise HTTPException(404, "找不到相片")
-    acl.assert_can_read(request, r["folder"])
+    acl.assert_can_read(request, r["folder"], kind="photo")
     return db.row_to_dict(r)  # type: ignore[return-value]
 
 
@@ -415,7 +415,7 @@ def document_file(doc_id: int, request: Request):
               (doc_id,))
     if not r:
         raise HTTPException(404, "找不到文件")
-    acl.assert_can_read(request, r["folder"])
+    acl.assert_can_read(request, r["folder"], kind="document")
     d = db.row_to_dict(r)
     size = int(d.get("size") or 0)
     if size > DOC_MAX_BYTES:

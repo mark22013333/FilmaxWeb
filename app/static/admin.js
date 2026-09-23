@@ -915,7 +915,17 @@ function wireAcl(el, ac) {
         body: JSON.stringify({ prefix, note: el.querySelector('#aclNote').value }) });
       toast('已設為受限');
       render('library');
-    } catch (e) { toast(e.message, true); }
+    } catch (e) {
+      // 409：跟既有規則上下重疊。detail 是物件（{message, conflicts_with, relation}），
+      // api() 對物件只會給一句籠統的訊息，所以這裡自己拿 message 出來 ——
+      // 管理員要知道的是「跟哪一條」，不是「有東西不能儲存」。
+      // 挑選器已經擋掉「在受限資料夾底下」的情況，會走到這裡的通常是
+      // 「底下已經有規則的上層資料夾」，或另一個分頁剛好先加了同一條。
+      if (e.status === 409 && e.detail && e.detail.message) {
+        toast(e.detail.message, true);
+        render('library');          // 這份畫面已經過期了，重畫才看得到那一條規則
+      } else toast(e.message, true);
+    }
   };
 
   el.querySelectorAll('.acl-rule').forEach(card => {
