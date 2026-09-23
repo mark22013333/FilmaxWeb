@@ -296,8 +296,11 @@ def item_detail(item_id: int, request: Request):
     item = _item_row(row)
     item["cast"] = db.row_to_dict(row).get("cast_json") or []
 
-    # 而看不到的那幾個檔案要從檔案清單裡濾掉 —— 條目看得到不代表底下每個檔案都看得到
-    ff, fa = acl.filter_sql(request, "f.ftp_path")
+    # 而看不到的那幾個檔案要從檔案清單裡濾掉 —— 條目看得到不代表底下每個檔案都看得到。
+    # **要用 any，跟 visible_item 同一個範圍**：詳情頁是單筆讀取，`/api/items/N`
+    # 不在前端 SCOPED 裡、身上沒有 scope。用 filter_sql 會落到 shared，把受限資料夾
+    # 整個排除 —— 從保險庫點進去的條目打得開，檔案清單卻是空的（「沒有檔案」）。
+    ff, fa = acl.filter_sql_any(request, "f.ftp_path")
     files = [db.row_to_dict(r) for r in db.q(
         f"""SELECT f.*, p.position, p.duration AS watched_duration, p.finished
            FROM media_file f LEFT JOIN play_state p ON p.file_id=f.id

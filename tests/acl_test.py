@@ -198,6 +198,9 @@ print("\n[2d] 單筆讀取不看入口（否則保險庫點得到卻播不出來
 check("被授權的人打得開受限的條目詳情",
       granted.get("/api/items/2").status_code == 200,
       granted.get("/api/items/2").status_code)
+g2 = granted.get("/api/items/2").json()
+check("而且檔案清單不是空的（詳情的檔案也要用 any，否則畫面只剩「沒有檔案」）",
+      len(g2.get("files") or []) > 0, g2.get("files"))
 check("沒被授權的人條目詳情還是 404", denied.get("/api/items/2").status_code == 404)
 
 print("\n[3] 直接猜 id：要 404，不能 403")
