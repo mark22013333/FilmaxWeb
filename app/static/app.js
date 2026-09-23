@@ -1,19 +1,39 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-// 目前在哪個入口。'shared' 是一般片庫，'vault' 是保險庫（受限資料夾）。
+// 畫面狀態是兩個**獨立**的維度（見 docs/規格/L-目錄權限.md 的「二維模型」）：
+//
+//   scope      從哪個入口看：'shared' 一般片庫／'vault' 保險庫（受限資料夾）
+//   media      看哪一種東西：'video'／'photo'／'doc'
+//   videoKind  media='video' 底下的細分：''（全部）／movie／tv／jav／home
+//
+// 之前三件事擠在同一組導覽裡：「私人」是一個 data-kind，跟「電影」「相片」並列。
+// 於是進保險庫只能看影片，而從保險庫點「相片」就會被切回一般片庫 —— 後端早就
+// 支援保險庫裡的相片與 PDF，是前端沒有路可以走過去。拆開之後換媒體不會動到
+// scope，換 scope 也不會動到 media。
+//
 // 受限資料夾**不會**混進一般片庫，連被授權的人也一樣 —— 見 app/acl.py 開頭。
-let viewScope = 'shared';
-
-// 只有清單／統計類的 GET 要帶 scope。單筆讀取（play、stream、image、hls…）
-// 刻意不帶：那些端點用 ANY 判斷，從哪個入口進來都一樣能讀，
-// 否則從保險庫點進去的播放頁會變成點得到卻播不出來。
-const SCOPED = /^\/api\/(library|continue|stats|genres|photos|documents)(\?|$)/;
+const viewState = { scope: 'shared', media: 'video', videoKind: '' };
+// 每換一次 scope 就 +1。api() 用它認出「換 scope 之前發出去的請求」，見下面。
+let scopeEpoch = 0;
 
 const api = async (url, opt = {}) => {
-  // 保險庫的 scope 在這裡統一補上，不是讓每個呼叫點自己記得帶 ——
-  // 二十個呼叫點各帶一次，漏掉的那個會安靜地去查一般片庫，
-  // 而畫面上只會看到「保險庫裡混進了不該有的東西」。
-  if (viewScope === 'vault' && SCOPED.test(url)) {
+  const method = (opt.method || 'GET').toUpperCase();
+  const epoch = scopeEpoch;
+  // 保險庫裡的 GET **一律**帶 scope=vault，不挑端點。
+  //
+  // 以前這裡是一條端點名稱的正則（library|continue|stats|genres|photos|documents），
+  // 只有列在裡面的才帶。那份清單是一個安靜的漂移點：新增一支清單類端點卻忘了
+  // 加進去，它在保險庫裡就會去查一般片庫，而畫面上只看得到「這裡怎麼是空的」。
+  // 現在反過來：全部都帶，用不到的端點自己忽略。
+  //
+  // 全部都帶是安全的，因為 **scope 不是權限**：單筆讀取（/items/N、/photos/N、
+  // /play…）在後端一律用 ANY 判斷，帶不帶 scope 結果都一樣；清單類端點則正好
+  // 需要它。沒有任何端點會因為帶了 scope=vault 而讓人多看到東西。
+  //
+  // 不用 cookie 記 scope：cookie 是整個瀏覽器共用的，一個分頁進了保險庫，
+  // 另一個分頁的一般片庫就會被汙染。scope 只活在這一頁的 viewState 裡。
+  if (viewState.scope === 'vault' && method === 'GET' && url.startsWith('/api/')
+      && !/[?&]scope=/.test(url)) {
     url += (url.includes('?') ? '&' : '?') + 'scope=vault';
   }
   // 有 body 就一定要帶 Content-Type: application/json —— FastAPI 的 Pydantic
@@ -22,13 +42,26 @@ const api = async (url, opt = {}) => {
   const opts = opt.body && !opt.headers
     ? { ...opt, headers: { 'Content-Type': 'application/json' } } : opt;
   const r = await fetch(url, opts);
+  // 換過 scope 之後才回來的 GET 回應**直接丟掉**（回一個永遠不會完成的 promise）。
+  //
+  // 不丟的話：在保險庫裡點了相片、還沒載完就切回共用 —— 保險庫的相片晚一步回來，
+  // 照樣畫進已經是「共用」的畫面。那就是私人內容出現在共用畫面上，只是晚了
+  // 幾百毫秒；換 scope 時先清空畫面也擋不住這個（清完之後它才到）。
+  // 不用丟例外：呼叫端的 catch 大多會把錯誤畫到畫面上（「載入失敗：…」），
+  // 而這種「錯誤」不該被任何人看到。
+  // opt.crossScope 只給「回應跟 scope 無關、而且被丟掉會卡住」的呼叫用（掃描進度輪詢）。
+  const stale = () => method === 'GET' && !opt.crossScope && epoch !== scopeEpoch;
+  if (stale()) return new Promise(() => {});
   if (!r.ok) {
     let msg = (await r.text()).slice(0, 300);
     try { const j = JSON.parse(msg); if (j.detail) msg = typeof j.detail === 'string'
       ? j.detail : JSON.stringify(j.detail); } catch (e) { /* 不是 JSON 就用原文 */ }
+    if (stale()) return new Promise(() => {});
     throw new Error(msg || r.status);
   }
-  return r.json();
+  const data = await r.json();
+  if (stale()) return new Promise(() => {});
+  return data;
 };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const gb = b => !b ? '-' : (b >= 1024 ** 3 ? (b / 1024 ** 3).toFixed(2) + ' GB' : (b / 1024 ** 2).toFixed(0) + ' MB');
@@ -194,14 +227,15 @@ function toast(msg) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
-const state = { kind: '', genre: '', q: '', sort: 'added', page: 1 };
+// 影片清單的篩選。影片類型（videoKind）不在這裡，在 viewState —— 它是導覽的一部分。
+const state = { genre: '', q: '', sort: 'added', page: 1 };
 
 /* ------------------------- 媒體庫 ------------------------- */
 async function loadLibrary() {
   const grid = $('#grid');
   grid.innerHTML = '<div class="loading">載入中…</div>';
   const p = new URLSearchParams({ sort: state.sort, page: state.page, page_size: 60 });
-  if (state.kind) p.set('kind', state.kind);
+  if (viewState.videoKind) p.set('kind', viewState.videoKind);
   if (state.genre) p.set('genre', state.genre);
   if (state.q) p.set('q', state.q);
   let data;
@@ -210,10 +244,15 @@ async function loadLibrary() {
 
   $('#libCount').textContent = data.total ? `共 ${data.total} 部` : '';
   if (!data.items.length) {
+    const filtered = state.q || state.genre;
+    // 保險庫裡的空白不是「媒體庫是空的」，也不該叫人去掃描 —— 私人範圍裡
+    // 可能本來就只有相片或文件。
+    const vault = viewState.scope === 'vault';
     grid.innerHTML = `<div class="empty" style="grid-column:1/-1">
-      <h3>${state.q || state.genre ? '沒有符合的結果' : '媒體庫是空的'}</h3>
-      <p>${state.q || state.genre ? '換個關鍵字或分類試試' : '按右上角「掃描媒體庫」開始從 FTP 建立索引'}</p>
-      ${state.q || state.genre || !me.is_admin ? '' : '<button class="btn primary" onclick="startScan()">開始掃描</button>'}
+      <h3>${filtered ? '沒有符合的結果' : vault ? '這裡沒有影片' : '媒體庫是空的'}</h3>
+      <p>${filtered ? '換個關鍵字或分類試試' : vault ? '可以切到相片或文件看看'
+        : '按右上角「掃描媒體庫」開始從 FTP 建立索引'}</p>
+      ${filtered || vault || !me.is_admin ? '' : '<button class="btn primary" onclick="startScan()">開始掃描</button>'}
     </div>`;
     $('#pager').innerHTML = ''; return;
   }
@@ -443,7 +482,8 @@ $('#btnHideScan').onclick = () => $('#scanPanel').classList.remove('show');
 async function pollScan() {
   clearTimeout(scanTimer);
   let s;
-  try { s = await api('/api/scan/status'); } catch { return; }
+  // crossScope：掃描進度跟 scope 無關，被當成過期回應丟掉的話輪詢就停了
+  try { s = await api('/api/scan/status', { crossScope: true }); } catch { return; }
   const phase = { listing: '掃描 FTP 目錄', indexing: '建立索引', scraping: 'TMDB 刮削',
     probing: '分析影片格式', photos: '讀取相片', done: '掃描完成', error: '發生錯誤',
     cancelled: '已停止', idle: '待機' }[s.phase] || s.phase;
@@ -892,7 +932,9 @@ async function loadPhotos() {
     grid.innerHTML = searching
       ? `<div class="empty"><h3>找不到「${esc(state.q)}」</h3>
          <p>換個關鍵字試試，或清空搜尋框回到相簿瀏覽。</p></div>`
-      : `<div class="empty"><h3>沒有相片</h3>
+      : viewState.scope === 'vault'
+        ? '<div class="empty"><h3>這裡沒有相片</h3></div>'
+        : `<div class="empty"><h3>沒有相片</h3>
          <p>把圖片放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
     $('#ppager').innerHTML = ''; return;
   }
@@ -1289,7 +1331,9 @@ async function loadDocs() {
     grid.innerHTML = searching
       ? `<div class="empty"><h3>找不到「${esc(state.q)}」</h3>
          <p>換個關鍵字試試，或清空搜尋框回到資料夾瀏覽。</p></div>`
-      : `<div class="empty"><h3>沒有文件</h3>
+      : viewState.scope === 'vault'
+        ? '<div class="empty"><h3>這裡沒有文件</h3></div>'
+        : `<div class="empty"><h3>沒有文件</h3>
          <p>把 PDF 放進 .env 的 LIBRARY_ROOTS 底下，再按「掃描媒體庫」即可。</p></div>`;
     $('#dpager').innerHTML = ''; return;
   }
@@ -1365,8 +1409,8 @@ const SORTS = {
   doc: [['name', '檔名'], ['time', '檔案時間'], ['size', '大小'], ['added', '最近加入']],
 };
 
-function showView(kind) {
-  const photo = kind === 'photo', doc = kind === 'doc';
+function showView(media) {
+  const photo = media === 'photo', doc = media === 'doc';
   const other = photo || doc;
   $('#photoView').hidden = !photo;
   $('#docView').hidden = !doc;
@@ -1386,26 +1430,60 @@ function showView(kind) {
   $('#q').placeholder = other ? '搜尋檔名或資料夾…' : '搜尋片名或檔名…';
 }
 
-// 保險庫入口：**只有真的有授權的人才會看到這顆按鈕**。
-// 沒有授權時 /api/vault 回的是 {has_vault:false}，連有幾個受限資料夾都不會說 ——
-// 受限資料夾的存在本身就是資訊（見 acl.py 的「為什麼回 404 而不是 403」）。
+/* ------------------------- 範圍（共用／私人） -------------------------
+
+   「私人」是 **scope**，不是一種媒體分類 —— 它跟「電影」「相片」不並列，
+   而是跟整排分類垂直：私人範圍裡一樣有全部／電影／…／相片／文件。
+   所以它是 header 裡一個獨立的小開關，不是 nav 裡的第八顆按鈕。
+
+   **只有真的有授權的人才會長出這個開關**（DOM 是在拿到 has_vault=true 之後
+   才建的，靜態 HTML 裡沒有它）。沒有授權時 /api/vault 回的是 {has_vault:false}，
+   連有幾個受限資料夾都不會說 —— 受限資料夾的存在本身就是資訊
+   （見 acl.py 的「為什麼回 404 而不是 403」）。 */
+const LOCK_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none"'
+  + ' stroke="currentColor" stroke-width="2.4" aria-hidden="true">'
+  + '<rect x="4" y="10" width="16" height="11" rx="2"/>'
+  + '<path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>';
+const scopeButtons = [];
+
 async function initVault() {
   let v;
   try { v = await api('/api/vault'); } catch { return; }
-  if (!v.has_vault) return;
-  const nav = document.querySelector('nav');
-  if (!nav || nav.querySelector('[data-kind="vault"]')) return;
-  const b = document.createElement('button');
-  b.dataset.kind = 'vault';
-  b.className = 'vault-btn';
-  b.title = v.folders && v.folders.length ? v.folders.join('、') : '';
-  b.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none"'
-    + ' stroke="currentColor" stroke-width="2.4" aria-hidden="true">'
-    + '<rect x="4" y="10" width="16" height="11" rx="2"/>'
-    + '<path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>'
-    + `私人${v.items ? ` <small style="opacity:.6">${v.items}</small>` : ''}`;
-  nav.appendChild(b);
-  wireNav(b);
+  if (!v.has_vault || scopeButtons.length) return;
+  const header = $('header');
+  const nav = $('header nav');
+  if (!header || !nav) return;
+  const sw = document.createElement('div');
+  sw.className = 'scope-switch';
+  sw.setAttribute('role', 'group');
+  sw.setAttribute('aria-label', '範圍');
+  const c = v.counts || {};
+  // 數量只放在滑鼠提示裡，不印在按鈕上：這塊畫面常常有別人在旁邊看，
+  // 「私人 313」比「私人」多說了一件事。
+  const tip = [['影片', c.videos], ['相片', c.photos], ['文件', c.documents]]
+    .filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(' · ');
+  for (const [scope, label, title] of [['shared', '共用', ''], ['vault', '私人', tip]]) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.scope = scope;
+    b.innerHTML = (scope === 'vault' ? LOCK_SVG : '') + label;
+    // 明寫 aria-label：有 title 時部分瀏覽器會把提示（「影片 3 · 相片 3…」）當成按鈕名稱
+    b.setAttribute('aria-label', label);
+    if (title) b.title = title;
+    b.onclick = () => setScope(scope);
+    sw.appendChild(b);
+    scopeButtons.push(b);
+  }
+  header.insertBefore(sw, nav);
+  paintScopeSwitch();
+}
+
+function paintScopeSwitch() {
+  for (const b of scopeButtons) {
+    const on = b.dataset.scope === viewState.scope;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
 }
 
 // 換入口之後要重畫的「不是主清單」的區塊。
@@ -1414,9 +1492,6 @@ async function initVault() {
 // 一定要一起叫，否則上一個入口的內容會原封不動留在畫面上。
 // 實際踩到的：從保險庫按「全部」回來，保險庫的「繼續觀看」（含片名與海報）
 // 還留在一般片庫上。那不只是畫面沒更新，那是私人的東西留在共用畫面上。
-//
-// 立刻清空再重新載入：載入是非同步的，中間那段空窗如果還掛著舊內容，
-// 就等於「按了全部、私人的東西還在那裡」—— 只是時間短一點而已。
 function refreshScopeBoxes() {
   const c = $('#continue'); if (c) c.innerHTML = '';
   const g = $('#genres'); if (g) g.innerHTML = '';
@@ -1424,44 +1499,83 @@ function refreshScopeBoxes() {
   loadGenres().catch(() => {});
 }
 
-function wireNav(b) {
-  b.onclick = () => {
-  $$('nav button').forEach(x => x.classList.remove('on'));
-  b.classList.add('on');
-  // 換入口等於換一整個片庫：分頁、搜尋字串、分類都要歸零，
-  // 否則會帶著「上一個入口的第 3 頁」去查另一個入口而看到空白。
-  const wantVault = b.dataset.kind === 'vault';
-  const switched = wantVault !== (viewScope === 'vault');
-  if (switched) {
-    viewScope = wantVault ? 'vault' : 'shared';
-    state.page = 1; state.genre = ''; state.q = '';
-    const q = $('#q'); if (q) q.value = '';
-    document.body.classList.toggle('in-vault', wantVault);
-    // 先清掉舊入口的內容，再往下走 —— 不管接下來是影片、相片還是文件分頁。
-    refreshScopeBoxes();
+/* 換 scope 時，把**所有**可能帶著上一個 scope 內容的東西清掉：狀態與畫面都要。
+   立刻清空、不等新內容載入：載入是非同步的，中間那段空窗如果還掛著舊內容，
+   就等於「切回共用了、私人的片名還在那裡」—— 只是時間短一點而已。
+
+   目前不在畫面上的檢視（例如人在影片、相片牆藏著）也要清：它的 DOM 還在，
+   下一次切過去時會先露出舊內容，直到新的一頁載入完為止。 */
+function clearScopedUI() {
+  // 篩選、分頁、選取 —— 帶著「上一個入口的第 3 頁／那個相簿」去查另一個入口，
+  // 看到的是空白，而且那個相簿名本身就是私人的資訊。
+  state.page = 1; state.genre = ''; state.q = '';
+  Object.assign(pstate, { folder: '', page: 1, items: [], total: 0, loading: false, done: false });
+  pfilter.q = ''; pfilter.items = [];
+  Object.assign(dstate, { folder: '', page: 1, items: [], total: 0 });
+  dtree.open.clear(); dtree.kids.clear(); dtree.root = ''; dtree.q = '';
+  window.__openItemId = null;
+  for (const id of ['#q', '#photoFolderQ', '#docFolderQ']) {
+    const el = $(id); if (el) el.value = '';
   }
-  if (wantVault) {
-    state.kind = '';
-    showView('video');
-    loadLibrary();
-    return;
+  for (const id of ['#grid', '#pager', '#continue', '#genres',
+                    '#pgrid', '#ppager', '#pmore', '#folderBar',
+                    '#docTreeBody', '#dgrid', '#dpager', '#docCrumbs']) {
+    const el = $(id); if (el) el.innerHTML = '';
   }
-  if (b.dataset.kind === 'photo') {
-    showView('photo');
-    loadFolders(); loadPhotos();
-    return;
+  for (const id of ['#libCount', '#photoCount', '#docCount']) {
+    const el = $(id); if (el) el.textContent = '';
   }
-  if (b.dataset.kind === 'doc') {
-    showView('doc');
-    loadDocFolders(); loadDocs();
-    return;
-  }
-  showView('video');
-  state.kind = b.dataset.kind; state.page = 1; loadLibrary();
-  };
+  const lab = $('#albumToggleLabel'); if (lab) lab.textContent = '所有相簿';
+  _pagerLast.clear();
+  // 詳情彈窗可能正開著一部私人的片
+  if ($('#overlay').classList.contains('show')) closeModal();
+  $('#modal').innerHTML = '';
 }
 
-$$('nav button').forEach(wireNav);
+function setScope(scope) {
+  scope = scope === 'vault' ? 'vault' : 'shared';
+  if (scope === viewState.scope) return;
+  viewState.scope = scope;
+  scopeEpoch++;             // 換之前發出去、還沒回來的請求從這一刻起全部作廢
+  clearScopedUI();
+  document.body.classList.toggle('in-vault', scope === 'vault');
+  paintScopeSwitch();
+  refreshScopeBoxes();
+  // media 不變：在相片牆切到私人，看到的就是私人的相片牆
+  loadCurrentMedia();
+}
+
+/* ------------------------- 媒體類型 ------------------------- */
+function loadCurrentMedia() {
+  showView(viewState.media);
+  if (viewState.media === 'photo') { loadFolders(); loadPhotos(); }
+  else if (viewState.media === 'doc') { loadDocFolders(); loadDocs(); }
+  else loadLibrary();
+}
+
+// 換媒體類型**不碰 scope**。以前的 bug 就在這裡：點「相片」會順手把 scope 設回
+// shared，於是保險庫裡的相片永遠看不到。
+function setMedia(media, kind = '') {
+  viewState.media = media === 'photo' || media === 'doc' ? media : 'video';
+  viewState.videoKind = viewState.media === 'video' ? (kind || '') : '';
+  if (viewState.media === 'video') state.page = 1;
+  paintMediaNav();
+  loadCurrentMedia();
+}
+
+// 選擇器寫成 header nav：#docCrumbs 也是一個 <nav>，不能讓它的按鈕被當成分類。
+const mediaButtons = () => $$('header nav [data-media]');
+
+function paintMediaNav() {
+  for (const b of mediaButtons()) {
+    const on = b.dataset.media === viewState.media
+      && (viewState.media !== 'video' || (b.dataset.kind || '') === viewState.videoKind);
+    b.classList.toggle('on', on);
+  }
+}
+
+mediaButtons().forEach(b => { b.onclick = () => setMedia(b.dataset.media, b.dataset.kind); });
+
 let qTimer;
 $('#q').oninput = e => {
   clearTimeout(qTimer);
@@ -1469,22 +1583,23 @@ $('#q').oninput = e => {
     state.q = e.target.value.trim();
     // 搜尋會蓋過「選中的相簿／資料夾」，所以那兩塊導覽的選取標示要跟著重畫，
     // 不然畫面上會同時說「你在看這個相簿」與「這是全庫搜尋結果」。
-    if (!$('#photoView').hidden) { pstate.page = 1; paintFolderBar(); loadPhotos(); }
-    else if (!$('#docView').hidden) { dstate.page = 1; paintCrumbs(); loadDocs(); }
+    if (viewState.media === 'photo') { pstate.page = 1; paintFolderBar(); loadPhotos(); }
+    else if (viewState.media === 'doc') { dstate.page = 1; paintCrumbs(); loadDocs(); }
     else { state.page = 1; loadLibrary(); }
   }, 320);
 };
 $('#sort').onchange = e => {
-  if (!$('#docView').hidden) { dstate.sort = e.target.value; dstate.page = 1; loadDocs(); }
+  if (viewState.media === 'doc') { dstate.sort = e.target.value; dstate.page = 1; loadDocs(); }
   else { state.sort = e.target.value; state.page = 1; loadLibrary(); }
 };
 
 (async function init() {
   await loadMe();               // 先知道身分，才知道要不要畫出下載與管理按鈕
+  paintMediaNav();
   await loadLibrary();
   loadGenres().catch(() => {});
   loadContinue().catch(() => {});
   initVault().catch(() => {});   // 沒有授權就什麼也不會長出來
-  const s = await api('/api/scan/status').catch(() => null);
+  const s = await api('/api/scan/status', { crossScope: true }).catch(() => null);
   if (s && s.running) { $('#scanPanel').classList.add('show'); pollScan(); }
 })();

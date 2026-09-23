@@ -126,13 +126,21 @@ def user_patch(uid: int, p: UserPatch, request: Request, _: str = Depends(admin_
 
 
 @router.delete("/users/{uid}")
-def user_delete(uid: int, _: str = Depends(admin_only)):
-    if not users.by_id(uid):
+def user_delete(uid: int, request: Request, _: str = Depends(admin_only)):
+    rec = users.by_id(uid)
+    if not rec:
         raise HTTPException(404, "找不到這個帳號")
     if _last_owner(uid):
         raise HTTPException(400, "這是最後一個管理員，不能刪除")
-    users.delete(uid)
-    return {"ok": True}
+    # users.delete 會一併收回受限資料夾的授權（acl.revoke_user）——
+    # 帳號與授權在不同的資料庫，沒有外鍵可以串聯刪除。
+    revoked = users.delete(uid)
+    who = auth.identity(request)
+    audit.record("user_delete", ip=auth.client_ip(request.scope),
+                 loc=geo.from_scope(request.scope), email=rec.get("email"), user_id=uid,
+                 detail=f"by {who}; folder grants revoked={revoked}",
+                 ip_source=geo.ip_source(request.scope))
+    return {"ok": True, "grants_revoked": revoked}
 
 
 @router.get("/library")
@@ -220,16 +228,33 @@ def vault_info(request: Request):
     而且不附任何規則資訊** —— 受限資料夾的存在本身就是資訊，回一份空的
     prefixes 清單跟回「有 3 個你進不去的資料夾」是兩件完全不同的事。
 
-    數量是用 `scope=vault` 的同一份條件算的，所以它跟入口裡真的列得出來的
-    筆數一致 —— 對不上的數字會讓人以為東西不見了。
+    數量是用 `scope=vault` 的同一份條件算的（`acl.filter_sql(..., scope=VAULT)`，
+    跟 `/library?scope=vault`、`/photos?scope=vault`、`/documents?scope=vault`
+    是同一個函式），所以它跟入口裡真的列得出來的筆數一致 —— 對不上的數字會讓
+    人以為東西不見了。範圍在這裡是**寫死**的而不是從查詢字串讀：這支是在
+    一般入口裡問「保險庫裡有什麼」，請求本身不帶 scope。
+
+    三種媒體分開算，不是只算影片：一個受限資料夾裡可能只有相片或 PDF，
+    只算 media_item 的話它會顯示「0」，看起來像保險庫是空的。
+      videos     條目數（跟 /library 一樣以 media_item 計；同一部片有多個檔案只算一次）
+      photos     跟 /photos 一樣只算 probe_state='ok'（列得出來的那些）
+      documents  跟 /documents 一樣只算 probe_state='ok'
+    `items` 是舊欄位（= videos），留給還沒更新的前端快取。
     """
     if not acl.has_vault(request):
         return {"has_vault": False}
-    frag, args = acl._vault_only_sql(request, "f2.ftp_path")
-    n = db.q1(f"""SELECT COUNT(*) c FROM media_item i
-                  WHERE EXISTS(SELECT 1 FROM media_file f2
-                               WHERE f2.item_id=i.id AND {frag})""", args)["c"]
-    return {"has_vault": True, "items": n,
+    vf, va = acl.filter_sql(request, "f2.ftp_path", scope=acl.VAULT)
+    videos = db.q1(f"""SELECT COUNT(*) c FROM media_item i
+                       WHERE EXISTS(SELECT 1 FROM media_file f2
+                                    WHERE f2.item_id=i.id AND {vf})""", va)["c"]
+    ff, fa = acl.filter_sql(request, "folder", scope=acl.VAULT)
+    photos = db.q1(f"SELECT COUNT(*) c FROM photo WHERE probe_state='ok' AND {ff}", fa)["c"]
+    documents = db.q1(f"SELECT COUNT(*) c FROM document WHERE probe_state='ok' AND {ff}",
+                      fa)["c"]
+    return {"has_vault": True,
+            "counts": {"videos": videos, "photos": photos, "documents": documents},
+            "total": videos + photos + documents,
+            "items": videos,
             "folders": [p.rsplit("/", 1)[-1] for p in acl.granted_prefixes(request)]}
 
 
@@ -297,9 +322,10 @@ def item_detail(item_id: int, request: Request):
     item["cast"] = db.row_to_dict(row).get("cast_json") or []
 
     # 而看不到的那幾個檔案要從檔案清單裡濾掉 —— 條目看得到不代表底下每個檔案都看得到。
-    # **要用 any，跟 visible_item 同一個範圍**：詳情頁是單筆讀取，`/api/items/N`
-    # 不在前端 SCOPED 裡、身上沒有 scope。用 filter_sql 會落到 shared，把受限資料夾
-    # 整個排除 —— 從保險庫點進去的條目打得開，檔案清單卻是空的（「沒有檔案」）。
+    # **要用 any，跟 visible_item 同一個範圍**：詳情頁是單筆讀取，不看入口
+    # （請求身上可能帶 scope=vault、也可能什麼都沒帶，結果都要一樣）。用 filter_sql
+    # 會照請求的 scope 走，沒帶就落到 shared、把受限資料夾整個排除 —— 從保險庫
+    # 點進去的條目打得開，檔案清單卻是空的（「沒有檔案」）。
     ff, fa = acl.filter_sql_any(request, "f.ftp_path")
     files = [db.row_to_dict(r) for r in db.q(
         f"""SELECT f.*, p.position, p.duration AS watched_duration, p.finished
@@ -350,7 +376,7 @@ def play_info(file_id: int, request: Request,
         raise HTTPException(404, "找不到檔案")
     f = db.row_to_dict(row) or {}
     # 播放資訊會回檔名、路徑、字幕清單與可播網址 —— 受限的片子擋在這裡
-    acl.assert_can_read(request, f.get("ftp_path"))
+    acl.assert_can_read(request, f.get("ftp_path"), kind="video")
     mode = f.get("play_mode") or ("direct" if (f.get("ext") or "").lower() == "mp4" else "hls")
 
     audio_tracks = f.get("audio_tracks") or []
@@ -1141,7 +1167,7 @@ def photo_detail(photo_id: int, request: Request):
     r = db.q1("SELECT * FROM photo WHERE id=?", (photo_id,))
     if not r:
         raise HTTPException(404, "找不到相片")
-    acl.assert_can_read(request, r["folder"])
+    acl.assert_can_read(request, r["folder"], kind="photo")
     d = db.row_to_dict(r) or {}
     d["download_url"] = f"/api/photo/{photo_id}/full"
     d["thumb_url"] = f"/api/photo/{photo_id}/thumb.jpg" if d.get("thumb") else None
@@ -1316,7 +1342,7 @@ def document_detail(doc_id: int, request: Request):
     r = db.q1("SELECT * FROM document WHERE id=?", (doc_id,))
     if not r:
         raise HTTPException(404, "找不到文件")
-    acl.assert_can_read(request, r["folder"])
+    acl.assert_can_read(request, r["folder"], kind="document")
     d = db.row_to_dict(r) or {}
     d["file_url"] = f"/api/document/{doc_id}/file.pdf"
     return d
@@ -1344,7 +1370,8 @@ def folder_acl(_: str = Depends(admin_only)):
     for u in users.listing():
         id_to_name[u["id"]] = u.get("display_name") or u.get("email") or f"#{u['id']}"
     return {
-        "rules": [{**r, "user_names": [id_to_name.get(i, f"#{i}") for i in r["user_ids"]]}
+        "rules": [{**r.as_dict(),
+                   "user_names": [id_to_name.get(i, f"#{i}") for i in sorted(r.user_ids)]}
                   for r in rules],
         "folders": acl.folder_counts(),
         # 只有 approved 的帳號可以被授權：pending／rejected／disabled 的人
@@ -1365,13 +1392,26 @@ def folder_acl(_: str = Depends(admin_only)):
 
 @router.post("/folders/acl")
 def folder_acl_add(body: RuleIn, request: Request, _: str = Depends(admin_only)):
+    """新增規則。路徑格式、重疊、資料夾存不存在都由 acl.add_rule 判斷 ——
+    後台的挑選器已經擋掉大部分情況，但那是提示，這裡才是防線。
+
+    400  路徑不合法（`..`、連續斜線、根目錄…）或掃描結果裡沒有這個資料夾
+    409  跟既有規則上下重疊或重複；detail 帶 {message, prefix, conflicts_with, relation}
+    """
     try:
         r = acl.add_rule(body.prefix, body.note)
-    except ValueError as e:
+    except acl.RuleConflict as e:
+        # 被擋下的嘗試也記：兩個管理員各自在改規則時，這是事後唯一的線索
+        audit.record("folder_rule_conflict", role=auth.role_of(request),
+                     ip=auth.client_ip(request.scope), loc={},
+                     email=auth.user_email(request),
+                     detail=f"{e.prefix} vs #{e.existing_id} {e.existing_prefix} ({e.relation})")
+        raise HTTPException(409, e.detail())
+    except ValueError as e:          # InvalidFolderPath / UnknownFolder
         raise HTTPException(400, str(e))
     audit.record("folder_rule_add", role=auth.role_of(request),
                  ip=auth.client_ip(request.scope), loc={},
-                 email=auth.user_email(request), detail=body.prefix)
+                 email=auth.user_email(request), detail=r.get("prefix"))
     return r
 
 
@@ -1393,16 +1433,26 @@ def folder_acl_grants(rule_id: int, body: GrantIn, request: Request,
     row = db.q1("SELECT prefix FROM folder_rule WHERE id=?", (rule_id,))
     if not row:
         raise HTTPException(404, "沒有這條規則")
-    ok = {u["id"] for u in users.listing() if u.get("status") == "approved"}
+    known = {u["id"]: u for u in users.listing(None, 1000)}
+    ok = {i for i, u in known.items() if u.get("status") == "approved"}
     bad = [u for u in body.user_ids if u not in ok]
     if bad:
         raise HTTPException(400, f"這些帳號不存在或未核准：{bad}")
-    acl.set_grants(rule_id, body.user_ids)
+    # 儲存是「整份取代」，而勾選清單只列 approved 的帳號 —— 所以被停權（或待審核）
+    # 的人身上的授權，前端**不可能**帶回來。不在這裡補的話，管理員任何一次儲存
+    # 都會安靜地洗掉它們，對方恢復之後就少了原本的權限，沒有人記得他原本被勾了什麼。
+    # 停權是暫時的狀態，授權要原封不動留著；真的刪除帳號才收回（acl.revoke_user）。
+    # 已經不存在的帳號不補 —— 那是孤兒，順手清掉。
+    current = next((r for r in acl.rules() if r.id == rule_id), None)
+    kept = sorted(i for i in (current.user_ids if current else ())
+                  if i in known and i not in ok)
+    final = sorted(set(int(u) for u in body.user_ids) | set(kept))
+    acl.set_grants(rule_id, final)
     audit.record("folder_grant_set", role=auth.role_of(request),
                  ip=auth.client_ip(request.scope), loc={},
                  email=auth.user_email(request),
-                 detail=f"{row['prefix']} → {sorted(body.user_ids)}")
-    return {"ok": True, "user_ids": sorted(body.user_ids)}
+                 detail=f"{row['prefix']} → {final}" + (f" (kept inactive {kept})" if kept else ""))
+    return {"ok": True, "user_ids": final, "kept_inactive": kept}
 
 
 @router.get("/audit/logins")

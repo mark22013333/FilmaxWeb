@@ -188,9 +188,19 @@ def set_note(uid: int, note: str) -> Optional[Dict[str, Any]]:
     return by_id(uid)
 
 
-def delete(uid: int) -> None:
+def delete(uid: int) -> int:
+    """刪除帳號，並收回他在受限資料夾上的授權。回傳收回的授權筆數。
+
+    **先收回授權、再刪帳號。** 兩者在不同的資料庫裡（MSSQL 模式下根本是
+    不同的伺服器），沒有辦法包成一個交易。順序決定了中途失敗時留下什麼：
+    先刪帳號的話，失敗會留下一批沒有主人的授權（孤兒）；先收回授權的話，
+    失敗只會留下一個「還在、但沒有授權」的帳號 —— 往安全的那一邊倒。
+    """
+    from . import acl          # acl → auth → users，放在這裡才不會循環匯入
+    revoked = acl.revoke_user(int(uid))
     _backend().delete(int(uid))
     invalidate(uid)
+    return revoked
 
 
 # ---------------------------------------------------------------- session 用的快取

@@ -794,14 +794,23 @@ nav{flex-wrap:wrap;min-width:0}
   }
 }
 
-/* ---- 保險庫（受限資料夾的獨立入口）----
-   這顆按鈕只有被授權的人才會長出來（見 app.js 的 initVault）。
-   刻意跟其他分頁用同一個形狀、只換顏色：它是「另一個入口」，
-   不是一個需要大聲強調的特殊模式。 */
-nav button.vault-btn{display:inline-flex;align-items:center;gap:5px}
-nav button.vault-btn svg{opacity:.75}
-nav button.vault-btn.on{background:var(--panel-2);color:var(--blue)}
-nav button.vault-btn.on svg{opacity:1}
+/* ---- 範圍開關：共用／私人（受限資料夾的獨立入口）----
+   這個開關只有被授權的人才會長出來（見 app.js 的 initVault）。
+   它是**範圍**，不是分類：跟右邊那排「全部／電影／…／相片／文件」垂直，
+   所以做成一個獨立的小分段控制，而不是那排裡的第八顆按鈕。
+   刻意用跟分類按鈕同一套字級與圓角、只在選中「私人」時換顏色：
+   它是「另一個入口」，不是一個需要大聲強調的特殊模式。 */
+.scope-switch{display:inline-flex;gap:2px;padding:2px;border-radius:9px;
+  border:1px solid var(--line);flex:none}
+.scope-switch button{
+  display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border-radius:7px;
+  color:var(--muted);font-weight:600;font-size:12.5px;transition:.15s;
+}
+.scope-switch button:hover{color:var(--text)}
+.scope-switch button svg{opacity:.75}
+.scope-switch button.on{background:var(--panel-2);color:var(--text)}
+.scope-switch button[data-scope="vault"].on{color:var(--blue)}
+.scope-switch button[data-scope="vault"].on svg{opacity:1}
 
 /* 進到保險庫時給一條細線當背景提示。
    用的是「看得見但不吵」的強度：使用者要知道自己在哪個入口
