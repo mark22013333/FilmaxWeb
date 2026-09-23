@@ -44,6 +44,29 @@ class FtpError(RuntimeError):
     pass
 
 
+_REPLY_RE = re.compile(r"(?<!\d)([1-5]\d\d)(?!\d)")
+
+
+def describe_error(exc: BaseException) -> Tuple[str, Optional[str], str]:
+    """把一個 FTP 失敗拆成 (例外類別, FTP 回覆碼, 訊息) —— 給伺服器端 log 用。
+
+    `FtpError` 是包裝，真正的原因在 `__cause__`（`ftplib.error_perm('550 ...')`、
+    `ConnectionResetError`、`socket.timeout`…）。**回覆碼是分辨處方的那個數字**：
+    550 = 檔案不在（DB 過期、檔案被搬走），421 = 連線太多或逾時，
+    502/504 = 伺服器不支援 REST。只看得到「502 Bad Gateway」的話這三種長得一樣。
+
+    訊息只來自 ftplib 的回覆與例外字串，不含帳密（`_new_ftp()` 的錯誤訊息
+    只帶 host:port）。
+    """
+    root = exc.__cause__ or exc
+    msg = str(root)
+    code: Optional[str] = None
+    if isinstance(root, ftplib.Error):
+        m = _REPLY_RE.match(msg.strip())
+        code = m.group(1) if m else None
+    return type(root).__name__, code, msg[:200]
+
+
 def _new_ftp() -> ftplib.FTP:
     s = settings
     cls = ftplib.FTP_TLS if s.ftp_tls else ftplib.FTP

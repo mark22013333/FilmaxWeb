@@ -12,7 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, hlscache,
-                media, mssql, params, paramstore, purge, scanner, streamstat, users)
+                keyframes, media, mssql, params, paramstore, purge, scanner,
+                streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -1712,6 +1713,19 @@ def diagnostics(_: str = Depends(admin_only)):
     failed = db.q1("SELECT COUNT(*) c FROM media_file WHERE probe_state='failed'")["c"]
     sample = db.q1("SELECT probe_error FROM media_file WHERE probe_state='failed' "
                    "AND probe_error IS NOT NULL LIMIT 1")
+    # 本機直讀的覆蓋率。有設 LIBRARY_LOCAL_ROOTS 卻有檔案對不到時列成問題：
+    # 那些檔案會安靜地退回 FTP loopback，而檔案不見時只會變成看不出原因的 502。
+    try:
+        coverage = media.local_coverage(sample=10)
+    except Exception as e:
+        coverage = {"error": str(e)}
+    if coverage.get("enabled") and coverage.get("miss"):
+        tops = "、".join(f"{k}（{v}）" for k, v in
+                        sorted(coverage["miss_by_top_folder"].items(),
+                               key=lambda kv: -kv[1])[:5])
+        problems.append(f"{coverage['miss']} 支影片對不到本機路徑，改走 FTP：{tops}"
+                        "　→ 檢查 LIBRARY_LOCAL_ROOTS 是否涵蓋這些 FTP mount，"
+                        "或檔案已被搬走（重新掃描）")
     return {
         "ok": not problems,
         "degraded": degraded,
@@ -1722,9 +1736,35 @@ def diagnostics(_: str = Depends(admin_only)):
         "tmdb_enabled": tmdb.enabled,
         "probe_failed": failed,
         "probe_error_sample": sample["probe_error"] if sample else None,
+        "local_source": coverage,
         "user_db": user_db,
         "problems": problems,
     }
+
+
+@router.get("/diagnostics/source/{file_id}")
+def diagnostics_source(file_id: int, _: str = Depends(admin_only)):
+    """這支檔案的 ffmpeg 來源是本機直讀還是 FTP，以及為什麼。
+
+    回傳含本機與 FTP 路徑，所以**只給管理員**。
+    """
+    info = media.source_info(file_id)
+    if info is None:
+        raise HTTPException(404, "找不到檔案")
+    return info
+
+
+@router.post("/diagnostics/keyframes/retry")
+def diagnostics_keyframes_retry(_: str = Depends(admin_only)):
+    """讓 kf_state='failed' 的檔案現在就再試一次（不等冷卻期）。
+
+    每個檔案在這一輪仍然最多試一次 —— 修好來源（補 LIBRARY_LOCAL_ROOTS、
+    重新掃描）之後按一次就好，不會變成重試風暴。
+    """
+    cleared = keyframes.clear_failed_cooldown()
+    started = keyframes.start_background()
+    return {"ok": True, "cooldown_cleared": cleared, "started": started,
+            "pending": keyframes.pending_count()}
 
 
 @router.get("/diagnostics/encoder/{name}")

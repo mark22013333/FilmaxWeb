@@ -232,10 +232,96 @@ def input_args(file_id: int) -> List[str]:
     """
     row = db.q1("SELECT ftp_path FROM media_file WHERE id=?", (file_id,))
     if row:
-        local = localfs.resolve_local(row["ftp_path"] or "")
-        if local is not None:
-            return ["-i", str(local)]
+        info = localfs.resolve_local_info(row["ftp_path"] or "")
+        if info["reason"] == "ok":
+            return ["-i", str(info["path"])]
+        _warn_fallback_once(file_id, info["reason"])
     return [*source_headers(), "-rw_timeout", "30000000", "-i", source_url(file_id)]
+
+
+_fallback_warned: set = set()
+
+
+def _warn_fallback_once(file_id: int, reason: str) -> None:
+    """有設本機直讀、這支卻對不到時留一行紀錄（每支檔案每個行程一次）。
+
+    沒設 LIBRARY_LOCAL_ROOTS 是刻意的部署（遠端 FTP），不記。
+    有設卻對不到才是要看的：新增了 FTP mount 卻沒補對應、檔案被搬走 ——
+    原本這兩種都只能從 ffmpeg 的輸入變成 HTTP 網址間接猜。
+    """
+    if reason == "disabled" or file_id in _fallback_warned:
+        return
+    _fallback_warned.add(file_id)
+    log.warning("本機直讀對不到 file=%s reason=%s（%s），ffmpeg 改走 HTTP→FTP",
+                file_id, reason, localfs.REASONS.get(reason, reason))
+
+
+def source_info(file_id: int) -> Optional[Dict[str, Any]]:
+    """這支檔案的 ffmpeg 來源會是哪一條（後台診斷用，**只給管理員**）。
+
+    回傳裡有本機路徑與 FTP 路徑 —— 那是伺服器的檔案配置，不能給一般使用者。
+    """
+    row = db.q1("""SELECT id, ftp_path, filename, ext, video_codec, audio_codec,
+                          play_mode, probe_state, kf_state, kf_error, size
+                   FROM media_file WHERE id=?""", (file_id,))
+    if not row:
+        return None
+    r = db.row_to_dict(row)
+    info = localfs.resolve_local_info(r.get("ftp_path") or "")
+    ok = info["reason"] == "ok"
+    out: Dict[str, Any] = {
+        "file_id": r["id"],
+        "ftp_path": r.get("ftp_path"),
+        "play_mode": r.get("play_mode"),
+        "video_codec": r.get("video_codec"),
+        "audio_codec": r.get("audio_codec"),
+        "probe_state": r.get("probe_state"),
+        "kf_state": r.get("kf_state"),
+        "kf_error": r.get("kf_error"),
+        "size": r.get("size"),
+        "source": "local" if ok else "ftp",
+        "local_match": info["prefix"] is not None,
+        "local_prefix": info["prefix"],
+        "local_path": str(info["path"]) if ok else info.get("candidate"),
+        "local_exists": ok or info["reason"] in ("unreadable", "not_file"),
+        "reason": info["reason"],
+        "reason_text": localfs.REASONS.get(info["reason"], info["reason"]),
+    }
+    if not ok:
+        out["ffmpeg_input"] = source_url(file_id)
+    return out
+
+
+def local_coverage(sample: int = 20) -> Dict[str, Any]:
+    """整個片庫有多少支走得到本機直讀（後台診斷用）。
+
+    **為什麼要有這個數字。**本機直讀對不到時不是錯誤，是安靜地退回
+    「ffmpeg → HTTP → FastAPI → FTP → 同一顆磁碟」—— 播得動，只是慢、
+    吃 FTP 連線，而且檔案不見時錯誤只會變成一個看不出原因的 502。
+    新增一個 FTP mount 卻忘了補 LIBRARY_LOCAL_ROOTS 時，這裡的 miss 會跳起來。
+
+    每支檔案一次 stat，幾千支是一秒內的事 —— 所以只在後台診斷時算，不快取。
+    """
+    total = hit = 0
+    reasons: Dict[str, int] = {}
+    by_top: Dict[str, int] = {}
+    samples: List[Dict[str, Any]] = []
+    for row in db.q("SELECT id, ftp_path FROM media_file"):
+        total += 1
+        info = localfs.resolve_local_info(row["ftp_path"] or "")
+        if info["reason"] == "ok":
+            hit += 1
+            continue
+        reasons[info["reason"]] = reasons.get(info["reason"], 0) + 1
+        top = "/" + ((row["ftp_path"] or "").strip("/").split("/") or [""])[0]
+        by_top[top] = by_top.get(top, 0) + 1
+        if len(samples) < sample:
+            samples.append({"file_id": row["id"], "ftp_path": row["ftp_path"],
+                            "reason": info["reason"]})
+    return {"enabled": localfs.enabled(), "total": total, "hit": hit,
+            "miss": total - hit, "miss_by_reason": reasons,
+            "miss_by_top_folder": by_top, "miss_sample": samples,
+            "roots": [p for p, _ in settings.library_local_roots]}
 
 
 def source_headers() -> List[str]:

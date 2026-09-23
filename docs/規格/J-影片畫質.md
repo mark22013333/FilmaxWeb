@@ -505,6 +505,75 @@ remux 會遇到非單調 DTS 與時間戳問題（Jellyfin 有一整串同類 is
 不是只退那一段 —— 一份播放清單裡混著 copy 與重編的分段是更糟的失效。
 退線要進 `audit`，後台看得到清單，才敢把這條路開起來。
 
+#### 邊界表失敗的重試語意（2026-09-23 事故之後）
+
+**症狀。**兩支手機錄影播不動：file 3357（mp4／h264，direct）的
+`/api/stream/3357?raw=1` 回 502；file 3428（mov／hevc，hls）的 `seg-0.ts` 回 500，
+ffmpeg 印 `Error opening input … Server returned 5XX`。同一秒裡
+`keyframe 掃描失敗 file=3357` 重複出現好幾次。
+
+**根因有三層，而 codec 不在其中**（錯在「開啟輸入」，還沒碰到解碼器）：
+
+1. **檔案被搬走，DB 過期。**`D:\Yu\手機照片\…` 在當天被搬到 `D:\Yu\Home\手機照片\…`
+   （另有 117APPLE、118APPLE 等 5 個資料夾，共 163 支）。DB 還記著舊路徑，
+   FTP 對 `RETR` 回 **550 No such file or directory**，`/api/stream` 把它包成 502。
+2. **`/Yu` 整個 FTP mount 沒有本機對應。**FileZilla 掛了三個 mount
+   （`/`→`D:\1.FTP`、`/pic`→`D:\pic`、`/Yu`→`D:\Yu`），`LIBRARY_LOCAL_ROOTS`
+   只寫了前兩個 —— 片庫 2945 支裡 **2761 支（94%，含全部手機錄影）**
+   安靜地走「ffmpeg → HTTP → FastAPI → FTP loopback → 同一顆磁碟」。
+   這跟 O-0 補 `/pic` 是同一種失效，第二次發生。
+3. **keyframe 佇列的 hot retry。**`_next_row()` 把 `failed` 跟 `pending` 一視同仁、
+   `ORDER BY id LIMIT 1`：掃失敗 → 標 failed → 下一輪又挑到它 → 再失敗。
+   沒有任何延遲，只受限於 ffprobe 開行程的時間。FileZilla log：3357 從 03:13Z 起
+   被 `RETR` **45,014 次**，約 475 次／分鐘、每次一條新 FTP 連線，連續兩個多小時；
+   **排在它後面的檔案一個都輪不到**。開播時 `request_soon()` 又會把 failed 插回
+   最前面，每一次 master 請求都是一次新的重試。沒有撞到 `421 Too many connections`
+   （那段時間的 421 都是 `Activity timeout`），但那只是這台 FTP 的上限夠高 ——
+   處方是消掉風暴，不是調高上限。
+
+**一個背景最佳化為什麼能拖垮前景播放。**邊界表只是上階的前置條件，
+下階（轉碼）完全不需要它 —— `rungs_for()` 在 `kf_state != 'ok'` 時只回下階。
+但兩者**共用同一條來源**：走不到本機的檔案，keyframe 掃描與使用者正在等的
+`seg-0.ts` 都要去 `/api/stream` → FTP 開一條連線。背景那條每秒開好幾條、
+而且永遠不停，前景就跟它搶同一個 FTP 伺服器、同一條 FastAPI 執行緒池。
+
+**新的語意（`keyframes.py`）：**
+
+| 情況 | 行為 |
+|---|---|
+| 同一輪 `run_queue()` 裡 | **每個 file id 最多嘗試一次**（`_Round`：一般掃描用 id 遞增的游標、插隊用 `attempted` 集合）。一輪一定走得完，一支壞檔不擋後面的檔案。 |
+| `scan_one()` 丟例外（逾時、ffprobe 不見） | 記成這支 failed、繼續下一支（原本整個佇列中斷）。 |
+| 失敗之後 | 進冷卻期 `FAILED_RETRY_COOLDOWN = 1800` 秒（記憶體）。冷卻中的 failed：一般掃描跳過、開播不插隊（`runnable()`）。 |
+| 冷卻期過了 | 下一輪會再試一次。 |
+| 重新掃描 | `start_background(retry_failed=True)`：清掉冷卻期，每支 failed 在那一輪各試一次。 |
+| 管理員手動 | `POST /api/diagnostics/keyframes/retry`：同上。 |
+| 服務重啟 | 冷卻期在記憶體裡，重啟後每支 failed 各試一次（原本的語意，不加 migration）。 |
+
+HEVC 維持 `kf_state='skipped'`（沒有 remux 上階可給），照樣走下階轉碼 ——
+沒有邊界表不代表不能播。回歸測試在 `tests/source_fallback_test.py`
+（A／B：重試風暴；E：`kf_state='failed'` 時下階 `seg-0.ts` 照樣 200）。
+
+**來源的可觀測性。**
+
+* `/api/stream` 的 FTP 失敗在伺服器端留一行 `raw source failed file=… source=ftp
+  op=RETR start=… range=… path=… error=<例外類別> code=<FTP 回覆碼>`。
+  回給客戶端的只有「來源讀取失敗（FTP 550）」—— 不含 FTP 路徑，也不含帳密。
+  回覆碼是分辨處方的那個數字：550 = DB 過期／檔案被搬走，421 = 連線太多或逾時，
+  502/504 = 伺服器不支援 REST。
+* `localfs.resolve_local_info()` 回傳**為什麼**對不到（`no_prefix`／`not_found`／
+  `unreadable`／`escape`／`invalid`／`disabled`）；`resolve_local()` 行為不變。
+* `media.input_args()` 有設 `LIBRARY_LOCAL_ROOTS` 卻對不到時，每支檔案記一次
+  `本機直讀對不到 file=… reason=…`。
+* 後台 `GET /api/diagnostics` 多了 `local_source`（total／hit／miss、依原因與
+  頂層資料夾分組）；miss > 0 會列進 `problems`。單支看
+  `GET /api/diagnostics/source/{file_id}`（admin-only：回傳含本機與 FTP 路徑）。
+
+**新增 FTP mount 時的檢查清單：**對照 FileZilla 的
+`C:\ProgramData\filezilla-server\users.xml`（`<mount_point tvfs_path native_path>`），
+每一個放影片的 mount 都要在 `LIBRARY_LOCAL_ROOTS` 有一條；改完重啟服務，
+看 `/api/diagnostics` 的 `local_source.miss_by_reason` —— `no_prefix` 應該是 0。
+`not_found` 不為 0 代表檔案被搬過、要重新掃描。
+
 #### 刻意不做
 
 * **三階以上。** 即時轉碼多一階就多一份算力，而 v5 量到 2.8→12 Mbps 的

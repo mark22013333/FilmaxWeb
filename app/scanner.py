@@ -110,7 +110,9 @@ def _run(full: bool, reparse: bool = False, remanual: bool = False) -> None:
         # 從幾分鐘變成 45 分鐘，性質完全不同。它自己可取消、可續跑
         # （狀態欄留在 media_file.kf_state，所以中斷了下一次接著跑）。
         try:
-            if keyframes.start_background(cancel=_cancel):
+            # 重新掃描是明確的「再試一次」—— failed 的檔案不受冷卻期限制
+            # （每個檔案在這一輪仍然最多試一次，見 keyframes.run_queue）。
+            if keyframes.start_background(cancel=_cancel, retry_failed=True):
                 status.note(f"分段邊界表在背景計算中（待辦 {keyframes.pending_count()} 個）")
         except Exception as e:
             log.warning("keyframe 佇列啟動失敗：%s", e)
