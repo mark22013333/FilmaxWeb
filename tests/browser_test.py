@@ -76,6 +76,36 @@ for _s in (1, 2):
 db.execute("INSERT INTO login_audit(at,event,role,ip) VALUES(?,'success','admin','10.0.0.1')",
            (now,))
 
+# L 受限資料夾的 picker 要有東西可測：有深度（展開／收合）、有同名（/Movies/2024 與
+# /HomeVideo/2024）、有已受限與被涵蓋、有一個長到會撐破版面的名字。
+# 掛在「刮不到的片」底下，不新增條目 —— 海報牆的分頁數不能被這裡影響。
+from app import acl, users
+users.init()
+_holder = db.q1("SELECT id FROM media_item WHERE guess_key='tv::x::0'")["id"]
+for _p in ("/HBO/Westworld/Season 01/e1.mkv", "/HBO/Westworld/Season 02/e2.mkv",
+           "/HBO/House of the Dragon/h1.mkv", "/Movies/2024/m1.mkv", "/HomeVideo/2024/v1.mkv",
+           "/Private/Stuff/p1.mkv", "/Private/Stuff/Deep/p2.mkv",
+           "/Long/" + "一個非常非常長的資料夾名稱用來測試手機上會不會把版面撐破" * 2 + "/l1.mkv"):
+    db.execute("INSERT INTO media_file(item_id,ftp_path,filename,size,ext,probe_state,seen_at,added_at)"
+               " VALUES(?,?,?,1024,'mkv','ok',?,?)", (_holder, _p, _p.rsplit("/", 1)[1], now, now))
+ACL_RULE = acl.add_rule("/Private", "測試規則")["id"]
+
+
+def _mkuser(sub, name, owner=False):
+    u = users.upsert_from_google({"sub": sub, "email": f"{sub}@example.com", "name": name},
+                                 "127.0.0.1", {})
+    users.set_status(u["id"], "approved")
+    users.set_role(u["id"], users.OWNER if owner else "viewer")
+    return u["id"]
+
+
+U_MARK, U_ALICE = _mkuser("u-mark", "Mark"), _mkuser("u-alice", "Alice")
+# 「先被授權、後來升管理員」的那一個 —— 別人按儲存時他的授權不能被收回
+U_ADMIN = _mkuser("u-john", "John")
+acl.set_grants(ACL_RULE, [U_MARK, U_ADMIN])
+users.set_role(U_ADMIN, users.OWNER)
+acl.invalidate()
+
 import uvicorn
 from app.main import app
 
@@ -477,34 +507,8 @@ async def main():
         check("FTP 瀏覽器連不上時給的是說明不是空白", len(ftp_txt.strip()) > 0, ftp_txt[:60])
         check("有上一層按鈕", await pg2.locator("#ftpUp").count() == 1)
 
-        # L：受限資料夾。UI 的關鍵不變量是「不讓人手打路徑」——
-        # 手打就會拼錯，而拼錯的規則等於沒有保護、畫面上還顯示已設定。
-        # 挑選介面是資料夾樹（原本是 <select>，dropdown 藏不住縮排也修不了篩選）：
-        # 每一列是一顆按鈕，點了才進「已選」，再按「加入限制」才送出。
-        aclui = await pg2.evaluate("""() => {
-            const tree = document.querySelector('#aclTree');
-            const rows = tree ? [...tree.querySelectorAll('.ftree-row')] : [];
-            return {
-                pick: !!tree,
-                rows: rows.length,
-                allButtons: rows.length > 0
-                            && rows.every(r => r.tagName === 'BUTTON'),
-                confirm: !!document.querySelector('#aclPicked')
-                         && !!document.querySelector('#aclAdd'),
-                freeText: [...document.querySelectorAll('#tab-library input')]
-                            .some(i => i.id === 'aclPrefix'),
-                filter: !!document.querySelector('#aclFilter'),
-                note: (document.querySelector('#tab-library').textContent || '')
-                        .includes('密碼登入沒有帳號身分'),
-            };
-        }""")
-        check("受限資料夾是從掃到的資料夾樹裡挑，不是自己想一個",
-              aclui["pick"] and aclui["allButtons"], aclui)
-        check("挑完要先看到「已選哪一個」再按加入，不會點一下就直接生效",
-              aclui["confirm"], aclui)
-        check("而且沒有可以手打路徑的輸入框", not aclui["freeText"], aclui)
-        check("資料夾多的時候可以篩選", aclui["filter"], aclui)
-        check("畫面上講明「密碼登入沒有身分、無法授權」", aclui["note"], aclui)
+        # L：受限資料夾。另開一頁跑（會真的建規則、改授權），見 acl_ui()
+        await acl_ui(ctx)
 
         await pg2.click(".sidenav button[data-tab='playback']")
         await pg2.wait_for_selector("#encSel", timeout=8000)
@@ -708,6 +712,408 @@ async def main():
         real = [e for e in errs if "Failed to load resource" not in e and "ERR_" not in e]
         check("沒有 JS 錯誤", not real, real[:3])
         await b.close()
+
+
+async def acl_ui(ctx):
+    """L：受限資料夾的 picker 與規則卡。
+
+    UI 的關鍵不變量是「**不讓人手打路徑**」—— 手打就會拼錯，而拼錯的規則等於
+    沒有保護、畫面上還顯示已設定。挑選介面原本是 <select>（藏不住縮排也修不了篩選），
+    後來是永遠攤開的資料夾清單；現在是點了才出現的 picker。
+    不管長什麼樣子，以下幾件事不能變：
+      - 只能從掃到的資料夾挑，沒有任何可以打路徑的欄位
+      - 點資料夾不會直接生效：暫選 →「選擇」→「加入限制」→ confirmBox → POST
+      - 已受限／被涵蓋的列得找得到（知道為什麼不能選），但選不了
+      - 授權的 checkbox 不會一勾就打 API；存的時候把管理員原有的授權帶回去
+    """
+    import json
+    print("\n[L] 受限資料夾：folder picker 與規則卡")
+    pg = await ctx.new_page()
+    errs = []
+    pg.on("pageerror", lambda e: errs.append(str(e)))
+    reqs = []
+    pg.on("request", lambda r: reqs.append((r.method, r.url, r.post_data))
+          if "/api/folders/acl" in r.url and r.method != "GET" else None)
+    await pg.set_viewport_size({"width": 1280, "height": 800})
+    await pg.goto(BASE + "/admin#library", wait_until="networkidle")
+    await pg.wait_for_selector("#aclPick-btn", timeout=8000)
+    await pg.wait_for_timeout(300)
+
+    POP = "#aclPick-pop"
+    ROWS = """() => [...document.querySelectorAll('#aclPick-tree [role=treeitem]')].map(r => ({
+        f: r.dataset.folder, lv: +r.getAttribute('aria-level'),
+        exp: r.getAttribute('aria-expanded'), off: r.getAttribute('aria-disabled') === 'true',
+        sel: r.getAttribute('aria-selected') === 'true',
+        name: r.querySelector('.ftree-name').textContent,
+        ctx: (r.querySelector('.ftree-ctx') || {}).textContent || '',
+        tag: (r.querySelector('.ftree-tag') || {}).textContent || '',
+        mark: !!r.querySelector('mark'), label: r.getAttribute('aria-label') }))"""
+
+    async def rows():
+        return await pg.evaluate(ROWS)
+
+    async def row(folder):
+        return next((r for r in await rows() if r["f"] == folder), None)
+
+    def rsel(folder):
+        return f'#aclPick-tree [role=treeitem][data-folder="{folder}"]'
+
+    async def focused():
+        return await pg.evaluate(
+            "() => document.activeElement && document.activeElement.dataset.folder")
+
+    async def is_open():
+        return not await pg.evaluate("() => document.querySelector('#aclPick-pop').hidden")
+
+    # ---- 關著的時候不佔版面
+    closed = await pg.evaluate("""() => {
+        const b = document.querySelector('#aclPick-btn');
+        const pop = document.querySelector('#aclPick-pop');
+        const form = document.querySelector('.acl-form');
+        return { hidden: pop.hidden, popH: pop.offsetHeight, formH: form.offsetHeight,
+                 expanded: b.getAttribute('aria-expanded'), haspopup: b.getAttribute('aria-haspopup'),
+                 name: (b.getAttribute('aria-labelledby') || '').split(' ')
+                          .map(id => (document.getElementById(id) || {}).textContent || '')
+                          .join(' ').replace(/\\s+/g, ' ').trim(),
+                 treeRows: document.querySelectorAll('#aclPick-tree [role=treeitem]').length };
+    }""")
+    check("picker 關著時資料夾樹不在畫面上（不佔主要頁面高度）",
+          closed["hidden"] and closed["popH"] == 0 and closed["treeRows"] == 0, closed)
+    check(f"新增限制的整個表單很矮（{closed['formH']}px；原本光清單就 320px）",
+          closed["formH"] < 260, closed)
+    check("trigger 有 accessible name、aria-haspopup=dialog、aria-expanded=false",
+          "資料夾" in closed["name"] and "選擇要限制的資料夾" in closed["name"]
+          and closed["haspopup"] == "dialog" and closed["expanded"] == "false", closed)
+
+    # ---- 不能手打路徑
+    inputs = await pg.evaluate("""() => [...document.querySelectorAll('#tab-library .acl input')]
+        .map(i => ({ id: i.id, type: i.type }))""")
+    check("沒有 aclPrefix", not any(i["id"] == "aclPrefix" for i in inputs), inputs)
+    check("ACL 區塊的文字欄位只有備註與 picker 內的搜尋（沒有任何可以打路徑的欄位）",
+          all(i["type"] == "checkbox" or i["id"] in ("aclNote", "aclPick-q") for i in inputs),
+          inputs)
+    check("畫面上講明「密碼登入沒有身分、無法授權」",
+          "密碼登入沒有帳號身分" in await pg.locator("#tab-library .acl").inner_text())
+
+    # ---- 打開
+    await pg.click("#aclPick-btn")
+    await pg.wait_for_timeout(250)
+    op = await pg.evaluate("""() => {
+        const b = document.querySelector('#aclPick-btn'), pop = document.querySelector('#aclPick-pop');
+        const br = b.getBoundingClientRect(), pr = pop.getBoundingClientRect();
+        return { open: !pop.hidden, expanded: b.getAttribute('aria-expanded'),
+                 role: pop.getAttribute('role'), tree: !!pop.querySelector('[role=tree]'),
+                 below: pr.top >= br.bottom - 1, wide: pr.width >= br.width - 1, h: pr.height,
+                 focus: document.activeElement && document.activeElement.id };
+    }""")
+    check("點 trigger → 浮層打開、aria-expanded=true、role=dialog 內有 role=tree",
+          op["open"] and op["expanded"] == "true" and op["role"] == "dialog" and op["tree"], op)
+    check("桌機：浮層在 trigger 下方、至少跟 trigger 一樣寬、不超過 520px 高",
+          op["below"] and op["wide"] and op["h"] <= 521, op)
+    check("桌機打開時焦點在搜尋框", op["focus"] == "aclPick-q", op)
+    r0 = await rows()
+    check("初始只顯示最上層", r0 and all(r["lv"] == 1 for r in r0), r0)
+    check("最上層有 HBO／Movies／HomeVideo／Private",
+          {"/HBO", "/Movies", "/HomeVideo", "/Private"} <= {r["f"] for r in r0},
+          [r["f"] for r in r0])
+    pr = await row("/Private")
+    check("已受限的列有狀態、而且 aria-disabled",
+          pr and pr["off"] and "已受限" in pr["tag"] and "已受限" in pr["label"], pr)
+
+    # ---- 展開／收合
+    await pg.click(rsel("/HBO") + " [data-toggle]")
+    await pg.wait_for_timeout(120)
+    after = await rows()
+    check("展開 HBO → 子資料夾出現在第 2 層",
+          any(r["f"] == "/HBO/Westworld" and r["lv"] == 2 for r in after)
+          and (await row("/HBO"))["exp"] == "true", [r["f"] for r in after])
+    await pg.click(rsel("/HBO") + " [data-toggle]")
+    await pg.wait_for_timeout(120)
+    check("再按一次收合", not any(r["f"].startswith("/HBO/") for r in await rows())
+          and (await row("/HBO"))["exp"] == "false")
+
+    # ---- 被涵蓋：找得到、選不了
+    await pg.click(f"{POP} [data-show=covered]")
+    await pg.wait_for_timeout(100)
+    # aria-disabled 在 Playwright 眼裡是「不能點」，但滑鼠點得到 —— 要測的正是點了會怎樣
+    await pg.click(rsel("/Private"), force=True)   # 不能選的列，點了是展開
+    await pg.wait_for_timeout(120)
+    cv = await row("/Private/Stuff")
+    check("打開「被涵蓋」、點 /Private 展開 → /Private/Stuff 標著「被 /Private 涵蓋」",
+          cv and cv["off"] and "/Private" in cv["tag"], cv)
+    await pg.click(rsel("/Private/Stuff"), force=True)
+    await pg.wait_for_timeout(120)
+    check("被涵蓋的列點了不會被選", not (await row("/Private/Stuff"))["sel"]
+          and await pg.evaluate("() => document.querySelector('[data-fp-ok]').disabled"))
+    await pg.click(f"{POP} [data-show=covered]")
+    await pg.wait_for_timeout(100)
+
+    # ---- 同名消歧義
+    await pg.click(rsel("/Movies") + " [data-toggle]")
+    await pg.click(rsel("/HomeVideo") + " [data-toggle]")
+    await pg.wait_for_timeout(120)
+    m24, h24 = await row("/Movies/2024"), await row("/HomeVideo/2024")
+    check("同名資料夾各自帶上層脈絡（Movies / 2024、HomeVideo / 2024）",
+          m24 and h24 and m24["ctx"] == "Movies / 2024" and h24["ctx"] == "HomeVideo / 2024",
+          (m24, h24))
+    check("完整路徑在 aria-label 裡", m24 and m24["label"].startswith("/Movies/2024"), m24)
+
+    # ---- 搜尋
+    await pg.fill("#aclPick-q", "season")
+    await pg.wait_for_timeout(150)
+    sr = await rows()
+    fs_ = [r["f"] for r in sr]
+    check("搜深層資料夾：命中的列出現", "/HBO/Westworld/Season 01" in fs_, fs_)
+    check("祖先也顯示而且展開", "/HBO" in fs_ and "/HBO/Westworld" in fs_
+          and all(r["exp"] == "true" for r in sr if r["f"] in ("/HBO", "/HBO/Westworld")), sr)
+    check("命中字有標亮", any(r["mark"] for r in sr if r["f"] == "/HBO/Westworld/Season 01"), sr)
+    check("不相干的列不出現", "/Movies" not in fs_, fs_)
+    await pg.fill("#aclPick-q", "stuff")
+    await pg.wait_for_timeout(150)
+    hid = await pg.evaluate("() => document.querySelector('#aclPick-pop .fp-msg').textContent")
+    check("命中的只有被藏起來的 → 說「有但沒顯示」而不是「找不到」", "目前沒顯示" in hid, hid)
+    await pg.press("#aclPick-q", "Escape")
+    await pg.wait_for_timeout(150)
+    back = await pg.evaluate("() => document.querySelector('#aclPick-q').value")
+    check("搜尋中按 Escape 先清字、不關浮層", back == "" and await is_open(), back)
+    fs2 = [r["f"] for r in await rows()]
+    check("清掉搜尋 → 回到搜尋前的展開狀態（Movies、HomeVideo 開著、HBO 收著）",
+          "/Movies/2024" in fs2 and "/HomeVideo/2024" in fs2 and "/HBO/Westworld" not in fs2, fs2)
+
+    # ---- 暫選 → 確認：點一下不會送出
+    await pg.click(rsel("/HBO") + " [data-toggle]")
+    await pg.wait_for_timeout(100)
+    n0 = len(reqs)
+    await pg.click(rsel("/HBO/Westworld"))
+    await pg.wait_for_timeout(150)
+    st = await pg.evaluate("""() => ({
+        staged: document.querySelector('#aclPick-pop .fp-staged').textContent,
+        ok: !document.querySelector('[data-fp-ok]').disabled,
+        add: !document.querySelector('#aclAdd').disabled })""")
+    check("點資料夾只是暫選：浮層還開著、footer 顯示已選、「加入限制」還不能按",
+          await is_open() and "/HBO/Westworld" in st["staged"] and st["ok"] and not st["add"], st)
+    check("點資料夾不會送出任何請求", len(reqs) == n0, reqs[n0:])
+    await pg.click(f"{POP} [data-fp-ok]")
+    await pg.wait_for_timeout(150)
+    tg = await pg.evaluate("""() => { const b = document.querySelector('#aclPick-btn');
+        return { main: (b.querySelector('.folder-pick-main') || {}).textContent || '',
+                 sub: (b.querySelector('.folder-pick-sub') || {}).textContent || '',
+                 add: !document.querySelector('#aclAdd').disabled,
+                 focus: document.activeElement === b, expanded: b.getAttribute('aria-expanded') }; }""")
+    check("按「選擇」→ 浮層關起來、焦點回 trigger",
+          not await is_open() and tg["focus"] and tg["expanded"] == "false", tg)
+    check("trigger 主行是名稱（HBO / Westworld）、次行是完整路徑",
+          "Westworld" in tg["main"] and tg["sub"].strip() == "/HBO/Westworld", tg)
+    check("這時才能按「加入限制」，而且還沒送出", tg["add"] and len(reqs) == n0, tg)
+
+    # ---- Escape 關閉不丟掉已確認的選擇；點外面也會關
+    await pg.click("#aclPick-btn")
+    await pg.wait_for_timeout(150)
+    check("重開時已確認的那一列是暫選狀態", (await row("/HBO/Westworld") or {}).get("sel"),
+          await row("/HBO/Westworld"))
+    await pg.keyboard.press("Escape")
+    await pg.wait_for_timeout(150)
+    es = await pg.evaluate("""() => ({
+        sub: (document.querySelector('#aclPick-btn .folder-pick-sub') || {}).textContent || '',
+        focus: document.activeElement && document.activeElement.id })""")
+    check("Escape 關閉、焦點回 trigger、已選的還在",
+          not await is_open() and es["focus"] == "aclPick-btn" and "/HBO/Westworld" in es["sub"], es)
+    await pg.click("#aclPick-btn")
+    await pg.wait_for_timeout(150)
+    await pg.mouse.click(1270, 20)
+    await pg.wait_for_timeout(150)
+    check("點外面會關閉", not await is_open())
+
+    # ---- 全程鍵盤：從 trigger 選到 /Movies/2024
+    await pg.focus("#aclPick-btn")
+    await pg.keyboard.press("ArrowDown")
+    await pg.wait_for_timeout(150)
+    check("trigger 上按 ArrowDown 打開", await is_open())
+    await pg.keyboard.press("ArrowDown")          # 搜尋框 → 樹
+    await pg.wait_for_timeout(80)
+    role = await pg.evaluate("() => document.activeElement.getAttribute('role')")
+    check("搜尋框按 ArrowDown 進到樹裡（焦點在 treeitem 上）", role == "treeitem", role)
+    await pg.keyboard.press("Home")
+    for _ in range(20):
+        if await focused() == "/Movies":
+            break
+        await pg.keyboard.press("ArrowDown")
+    check("↓ 可以一列一列移動", await focused() == "/Movies", await focused())
+    if (await row("/Movies"))["exp"] == "true":
+        await pg.keyboard.press("ArrowLeft")
+        await pg.wait_for_timeout(60)
+    check("← 收合", (await row("/Movies"))["exp"] == "false", await row("/Movies"))
+    await pg.keyboard.press("ArrowRight")
+    await pg.wait_for_timeout(60)
+    check("→ 展開", (await row("/Movies"))["exp"] == "true", await row("/Movies"))
+    await pg.keyboard.press("ArrowRight")
+    await pg.wait_for_timeout(60)
+    check("已展開時再按 → 移到子資料夾", await focused() == "/Movies/2024", await focused())
+    await pg.keyboard.press("ArrowLeft")
+    await pg.wait_for_timeout(60)
+    check("子資料夾上按 ← 回到父層", await focused() == "/Movies", await focused())
+    await pg.keyboard.press("ArrowDown")
+    await pg.keyboard.press("Enter")
+    await pg.wait_for_timeout(80)
+    check("Enter 暫選（不送出）", (await row("/Movies/2024"))["sel"] and len(reqs) == n0,
+          await row("/Movies/2024"))
+    await pg.keyboard.press("Enter")              # 同一列再 Enter = 確認
+    await pg.wait_for_timeout(150)
+    sub = await pg.evaluate(
+        "() => (document.querySelector('#aclPick-btn .folder-pick-sub') || {}).textContent || ''")
+    check("再按一次 Enter 確認：浮層關閉、選到 /Movies/2024（全程只用鍵盤）",
+          not await is_open() and sub.strip() == "/Movies/2024", sub)
+
+    # ---- 加入限制：confirm 之後才 POST
+    await pg.fill("#aclNote", "瀏覽器測試")
+    await pg.click("#aclAdd")
+    await pg.wait_for_timeout(200)
+    check("按「加入限制」先跳確認框、還沒送出",
+          not await pg.evaluate("() => document.querySelector('#modal').hidden") and len(reqs) == n0)
+    await pg.click("#modal [data-no]")
+    await pg.wait_for_timeout(200)
+    check("確認框按取消 → 什麼都沒送", len(reqs) == n0, reqs[n0:])
+    await pg.click("#aclAdd")
+    await pg.wait_for_timeout(200)
+    await pg.click("#modal [data-yes]")
+    await pg.wait_for_timeout(1200)
+    posts = [r for r in reqs[n0:] if r[0] == "POST"]
+    body = json.loads(posts[0][2]) if posts else {}
+    check("確認之後才 POST，prefix 是從清單挑的那一個",
+          len(posts) == 1 and body.get("prefix") == "/Movies/2024"
+          and body.get("note") == "瀏覽器測試", (posts, body))
+    await pg.wait_for_selector(".acl-rule", timeout=8000)
+    await pg.wait_for_timeout(300)
+
+    # ---- 規則卡：摘要
+    cards = await pg.evaluate("""() => [...document.querySelectorAll('.acl-rule')].map(c => ({
+        path: c.querySelector('.acl-rule-path').textContent, who: c.querySelector('.acl-who').textContent,
+        warn: !!c.querySelector('.acl-warn'), text: c.textContent,
+        editHidden: c.querySelector('.acl-edit').hidden,
+        visibleChecks: [...c.querySelectorAll('input[type=checkbox]')].filter(i => i.offsetParent).length,
+        rm: c.querySelector('[data-aclrm]').className }))""")
+    cp = next((c for c in cards if c["path"] == "/Private"), None)
+    cn = next((c for c in cards if c["path"] == "/Movies/2024"), None)
+    check("規則卡預設收合：看不到任何 checkbox",
+          cards and all(c["editHidden"] and c["visibleChecks"] == 0 for c in cards), cards)
+    check("/Private 顯示「1 人可看」（管理員不算在裡面）", cp and cp["who"] == "1 人可看", cp)
+    check("剛建的規則顯示「尚未授權任何一般帳號／管理員仍可存取」",
+          cn and cn["warn"] and "尚未授權任何一般帳號" in cn["text"]
+          and "管理員仍可存取" in cn["text"], cn)
+    check("「移除限制」是次要的危險樣式", cp and "subtle-danger" in cp["rm"], cp)
+    check("涵蓋的子資料夾預設不攤開", await pg.evaluate(
+        "() => [...document.querySelectorAll('.acl-covers')].every(x => x.hidden)"))
+    await pg.click("#aclPick-btn")
+    await pg.click(rsel("/Movies") + " [data-toggle]")
+    await pg.wait_for_timeout(120)
+    dup = await row("/Movies/2024")
+    check("建好之後 /Movies/2024 變成已受限、不能再選一次",
+          dup and dup["off"] and "已受限" in dup["tag"], dup)
+    await pg.keyboard.press("Escape")
+    await pg.wait_for_timeout(100)
+
+    # ---- 授權：dirty state、儲存、管理員授權保留
+    card = '.acl-rule[data-rule="%d"]' % ACL_RULE
+    await pg.click(card + " [data-acledit]")
+    await pg.wait_for_timeout(120)
+    ed = await pg.evaluate("""(sel) => { const c = document.querySelector(sel);
+        return { open: !c.querySelector('.acl-edit').hidden,
+                 exp: c.querySelector('[data-acledit]').getAttribute('aria-expanded'),
+                 ids: [...c.querySelectorAll('[data-aclu]')].map(i => +i.dataset.aclu),
+                 saveDisabled: c.querySelector('[data-aclsave]').disabled,
+                 dirtyHidden: c.querySelector('.acl-dirty').hidden }; }""", card)
+    check("按「管理授權」才展開 checkbox（aria-expanded=true）", ed["open"] and ed["exp"] == "true", ed)
+    check("管理員不在勾選清單裡", U_ADMIN not in ed["ids"] and U_MARK in ed["ids"], ed)
+    check("沒改之前「儲存授權」是停用的、沒有未儲存標記", ed["saveDisabled"] and ed["dirtyHidden"], ed)
+    n1 = len(reqs)
+    alice = f'{card} [data-aclu="{U_ALICE}"]'
+    await pg.click(alice)
+    await pg.wait_for_timeout(120)
+    dt = await pg.evaluate("""(sel) => { const c = document.querySelector(sel);
+        return { dirty: c.classList.contains('is-dirty') && !c.querySelector('.acl-dirty').hidden,
+                 save: !c.querySelector('[data-aclsave]').disabled }; }""", card)
+    check("勾一個 → 卡片顯示「尚未儲存」、儲存變成可按", dt["dirty"] and dt["save"], dt)
+    check("勾選不會立刻打 API", len(reqs) == n1, reqs[n1:])
+    await pg.click(alice)
+    await pg.wait_for_timeout(80)
+    check("勾回原狀 → 不再是未儲存", await pg.evaluate(
+        "(sel) => document.querySelector(sel + ' [data-aclsave]').disabled", card))
+    await pg.click(alice)
+    await pg.click(card + " [data-aclcancel]")
+    await pg.wait_for_timeout(100)
+    cc = await pg.evaluate("""([sel, id]) => { const c = document.querySelector(sel);
+        return { checked: c.querySelector(`[data-aclu="${id}"]`).checked,
+                 closed: c.querySelector('.acl-edit').hidden,
+                 dirty: c.classList.contains('is-dirty') }; }""", [card, U_ALICE])
+    check("取消 → 恢復原本的勾選、收起來、沒有未儲存",
+          not cc["checked"] and cc["closed"] and not cc["dirty"] and len(reqs) == n1, cc)
+    await pg.click(card + " [data-acledit]")
+    await pg.click(alice)
+    await pg.click(card + " [data-aclsave]")
+    await pg.wait_for_timeout(1200)
+    puts = [r for r in reqs[n1:] if r[0] == "PUT"]
+    sent = sorted(json.loads(puts[0][2])["user_ids"]) if puts else []
+    check("儲存才 PUT，一次送整份名單",
+          len(puts) == 1 and f"/folders/acl/{ACL_RULE}/grants" in puts[0][1], puts)
+    check("送出的名單包含先前授權、後來升管理員的那個 id（不會被安靜地收回）",
+          sent == sorted([U_MARK, U_ALICE, U_ADMIN]), sent)
+    kept = await pg.evaluate("""async (rid) => (await (await fetch('/api/folders/acl')).json())
+        .rules.find(r => r.id === rid).user_ids""", ACL_RULE)
+    check("存完之後後端的授權裡仍有那位管理員", U_ADMIN in kept and U_ALICE in kept, kept)
+
+    # ---- 移除限制：仍然要 confirm，而且警告還在
+    await pg.wait_for_selector(card, timeout=8000)
+    await pg.wait_for_timeout(200)
+    await pg.click(card + " [data-aclrm]")
+    await pg.wait_for_timeout(200)
+    mt = await pg.evaluate("() => document.querySelector('#modal').textContent")
+    check("移除限制要確認，並警告「所有登入者都看得到」", "所有登入者都看得到" in mt, mt[:80])
+    await pg.click("#modal [data-no]")
+    await pg.wait_for_timeout(150)
+    check("取消就什麼都沒刪", not any(r[0] == "DELETE" for r in reqs), reqs)
+
+    # ---- 手機：bottom sheet
+    for w in (390, 320):
+        await pg.set_viewport_size({"width": w, "height": 780})
+        await pg.wait_for_timeout(250)
+        await pg.evaluate("() => document.querySelector('#aclPick-btn').scrollIntoView()")
+        await pg.click("#aclPick-btn")
+        await pg.wait_for_timeout(300)
+        await pg.fill("#aclPick-q", "一個非常")
+        await pg.wait_for_timeout(150)
+        mb = await pg.evaluate("""() => {
+            const pop = document.querySelector('#aclPick-pop');
+            const r = pop.getBoundingClientRect();
+            const ok = pop.querySelector('[data-fp-ok]').getBoundingClientRect();
+            const bd = document.querySelector('.folder-pick-backdrop');
+            const doc = document.documentElement;
+            const rowsOver = [...pop.querySelectorAll('[role=treeitem]')]
+                .some(x => x.getBoundingClientRect().right > innerWidth + 1);
+            return { pos: getComputedStyle(pop).position, left: r.left, right: r.right,
+                     bottom: r.bottom, top: r.top, vw: innerWidth, vh: innerHeight,
+                     okBottom: ok.bottom, okVisible: ok.height > 0,
+                     backdrop: !bd.hidden && getComputedStyle(bd).display !== 'none',
+                     over: doc.scrollWidth - doc.clientWidth, popOver: pop.scrollWidth - pop.clientWidth,
+                     rowsOver, n: pop.querySelectorAll('[role=treeitem]').length,
+                     modal: pop.getAttribute('aria-modal') };
+        }""")
+        check(f"@{w}px picker 是貼底的 bottom sheet（position:fixed、貼齊左右與底部）",
+              mb["pos"] == "fixed" and abs(mb["bottom"] - mb["vh"]) <= 1
+              and mb["left"] <= 0.5 and abs(mb["right"] - mb["vw"]) <= 1, mb)
+        check(f"@{w}px sheet 不超過 85% 高、有 backdrop、aria-modal",
+              mb["top"] >= mb["vh"] * 0.15 - 1 and mb["backdrop"] and mb["modal"] == "true", mb)
+        check(f"@{w}px「選擇」按鈕在畫面內", mb["okVisible"] and mb["okBottom"] <= mb["vh"] + 0.5, mb)
+        check(f"@{w}px 長路徑不會造成水平爆版（{mb['n']} 列）",
+              mb["n"] > 0 and mb["over"] <= 1 and mb["popOver"] <= 1 and not mb["rowsOver"], mb)
+        await pg.click(".folder-pick-backdrop", position={"x": 10, "y": 10})
+        await pg.wait_for_timeout(200)
+        check(f"@{w}px 點 backdrop 關閉", not await is_open())
+    over = await pg.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    check(f"手機上整個 /admin#library 不橫捲（溢出 {over}px）", over <= 1, over)
+    check("ACL 頁沒有 JS 錯誤", not errs, errs[:3])
+    await pg.close()
+
 
 asyncio.run(main())
 shutil.rmtree(TMP, ignore_errors=True)
