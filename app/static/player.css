@@ -83,7 +83,77 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
   border-radius:50%;animation:sp .9s linear infinite;margin:0 auto 14px}
 @keyframes sp{to{transform:rotate(360deg)}}
 
-.tapzone{position:absolute;inset:0;z-index:10;cursor:pointer}
+/* 影片畫面那一層：觸控手勢只在這裡判定（player.js 的「觸控手勢」段）。
+   `touch-action:manipulation` 關掉瀏覽器自己的「雙擊放大」—— 不關的話
+   iOS 會把雙擊快轉的第二下拿去放大頁面。兩指縮放仍然保留。
+   長按不要跳出選取放大鏡與系統選單（長按是 2×）。 */
+.tapzone{position:absolute;inset:0;z-index:10;cursor:pointer;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+
+/* ---------------- 手勢與播放狀態的回饋 ----------------
+   全部 pointer-events:none、固定 DOM 重複使用（見 player.html 的說明）。
+   z-index 14：蓋在字幕（12）上面，但在「緩衝中」的卡片（15）底下。 */
+.flash,.seek-fb,.hold-fb,.replay-hint{position:absolute;z-index:14;pointer-events:none}
+
+/* 播放／暫停：中央半透明圓，淡入 → 放大一點淡出，約 0.7 秒 */
+.flash{
+  left:50%;top:50%;width:76px;height:76px;margin:-38px 0 0 -38px;border-radius:50%;
+  display:grid;place-items:center;background:rgba(0,0,0,.5);color:#fff;opacity:0;
+}
+.flash .fi{display:none;width:34px;height:34px;fill:currentColor}
+.flash .fi.line{fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.flash[data-kind="play"] .fi-play,.flash[data-kind="pause"] .fi-pause,
+.flash[data-kind="replay"] .fi-replay{display:block}
+.flash.show{animation:flash-pop .7s ease-out forwards}
+@keyframes flash-pop{
+  0%{opacity:0;transform:scale(.8)}
+  18%{opacity:1;transform:scale(1)}
+  60%{opacity:1}
+  100%{opacity:0;transform:scale(1.12)}
+}
+
+/* 左右快轉：出現在按的那一邊（左右各 35% 區域的中心），不蓋整部影片 */
+.seek-fb{
+  top:50%;width:112px;height:112px;margin-top:-56px;border-radius:50%;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+  background:rgba(0,0,0,.42);color:#fff;opacity:0;transition:opacity .18s ease-out;
+}
+.seek-fb.left{left:calc(17.5% - 56px)}
+.seek-fb.right{left:calc(82.5% - 56px)}
+.seek-fb b{font-size:26px;line-height:1;letter-spacing:-3px}
+.seek-fb span{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.seek-fb.show{opacity:1}
+.seek-fb.pulse b{animation:seek-pop .28s ease-out}
+@keyframes seek-pop{0%{transform:scale(.75)}60%{transform:scale(1.15)}100%{transform:scale(1)}}
+
+/* 長按 2×：畫面上方中央的小膠囊 */
+.hold-fb{
+  left:50%;top:14%;transform:translateX(-50%);padding:6px 14px;border-radius:18px;
+  background:rgba(0,0,0,.62);color:#fff;font-size:14px;font-weight:800;
+  opacity:0;transition:opacity .15s;white-space:nowrap;
+}
+.hold-fb b{font-weight:800;margin-left:2px}
+.hold-fb.show{opacity:1}
+
+/* 播完：中央常駐的重播圖示（點擊落在底下的 #tap） */
+.replay-hint{
+  left:50%;top:50%;width:84px;height:84px;margin:-42px 0 0 -42px;border-radius:50%;
+  display:none;place-items:center;background:rgba(0,0,0,.55);color:#fff;
+}
+.replay-hint svg{width:40px;height:40px;fill:none;stroke:currentColor;stroke-width:2.2;
+  stroke-linecap:round;stroke-linejoin:round}
+.pl.ended .replay-hint{display:grid}
+/* 重播圖示常駐時，那一下的 ↻ 閃光就多餘了（兩個圓疊在一起） */
+.pl.ended .flash{visibility:hidden}
+
+@media(max-width:640px){
+  .flash{width:64px;height:64px;margin:-32px 0 0 -32px}
+  .flash .fi{width:28px;height:28px}
+  .seek-fb{width:92px;height:92px;margin-top:-46px}
+  .seek-fb.left{left:calc(17.5% - 46px)}
+  .seek-fb.right{left:calc(82.5% - 46px)}
+}
 
 /* 控制列 */
 .ctl{
@@ -140,6 +210,10 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
   transition:.15s;flex:none;
 }
 .ib:hover{background:rgba(255,255,255,.14)}
+/* 按壓回饋（player.js 在 pointerdown 掛 .pressed 約 140ms）：只縮一下再回來，
+   讓手機使用者知道「有按到」。不做彈跳、不做漣漪。 */
+.ib.pressed,.next-ep.pressed{animation:press .14s ease-out}
+@keyframes press{50%{transform:scale(.9)}}
 .ib.on{color:var(--accent)}
 .ib svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;
   stroke-linecap:round;stroke-linejoin:round}
@@ -286,7 +360,14 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 @media (prefers-reduced-motion:reduce){
   .busy::before{animation:none}
   .ctl,.pl-top,.busy{transition:none}
+  /* 回饋照樣要有（那是資訊，不是裝飾），但只用短暫的透明度、不縮放 */
+  .flash.show{animation:flash-fade .45s linear forwards}
+  .seek-fb{transition:none}
+  .seek-fb.pulse b{animation:none}
+  .hold-fb{transition:none}
+  .ib.pressed,.next-ep.pressed{animation:none;background:rgba(255,255,255,.18)}
 }
+@keyframes flash-fade{0%,70%{opacity:1}100%{opacity:0}}
 
 /* 設定面板裡的說明文字 */
 .panel .hint{font-size:11.5px;line-height:1.55;color:var(--dim,#8b93a7);
@@ -334,6 +415,9 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
 
 /* 控制列收起來時往下移（那塊空間空出來了），但不淡出 —— 見上方說明 */
 .pl.idle .next-ep{bottom:calc(28px + env(safe-area-inset-bottom))}
+/* 播完了：這顆是使用者最可能的下一步，換成強調色、放大一點 */
+.pl.ended .next-ep{background:var(--accent);color:#191919;font-size:15px;
+  min-height:48px;padding:12px 20px 12px 16px;box-shadow:0 6px 24px rgba(0,0,0,.6)}
 
 @media(max-width:640px){
   .next-ep{

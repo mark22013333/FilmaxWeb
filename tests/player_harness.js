@@ -203,6 +203,9 @@ function load(opts) {
     console: { log() {}, info() {}, warn() {}, error() {} },
     globalThis: env.window,
   });
+  // 有些東西 player.js 在載入的那一刻就讀（例如 navigator.mediaSession 的
+  // handler 是頂層註冊的），測試要在那之前放好 —— 事後再塞就接不上了。
+  if (opts && opts.beforeRun) opts.beforeRun(sandbox, env);
   vm.createContext(sandbox);
 
   const psSrc = fs.readFileSync(path.join(ROOT, 'app/static/playback-state.js'), 'utf8');
