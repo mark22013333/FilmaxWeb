@@ -797,6 +797,11 @@ function play(which, startAt) {
   $('#modePill').className = 'badge-mode ' + (which === 'direct' ? 'direct' : '');
 
   teardownHls(hlsObj); hlsObj = null;
+  // 換來源會讓 <video> 自己發 play/pause —— 那不是使用者按的，不能閃中央的圖示。
+  // 真的開始播（playing）之後才恢復（見 feedbackMuted）。
+  feedbackMuted = true;
+  // 手上還沒落地的手勢（累加中的雙擊快轉、2× 長按）是對著上一個來源的，一起收掉
+  resetGestures();
   // 這一支的所有非同步 callback 都要帶著 gen 回來比對。舊的那一代
   // 一律丟掉 —— 上一部片、上一階、上一個模式的事件都走這道閘。
   const gen = resetPlaybackState(which);
@@ -1288,35 +1293,86 @@ async function switchQuality(height) {
 /* ------------------------------------------------ 控制列 ------------------------------------------------ */
 const ICON_PLAY = '<path d="M7 4l13 8-13 8z"/>';
 const ICON_PAUSE = '<path d="M6 4h4v16H6zM14 4h4v16h-4z"/>';
+// 播完之後播放鍵改成「重播」。它是 stroke 圖示（跟其他 .ib 一樣），
+// 所以要把 .solid 的 fill 關掉，不然會畫成一坨實心。
+const ICON_REPLAY = '<path d="M3 12a9 9 0 1 0 2.64-6.36" fill="none" stroke="currentColor" stroke-width="2.2"'
+  + ' stroke-linecap="round"/><path d="M3 4v5h5" fill="none" stroke="currentColor" stroke-width="2.2"'
+  + ' stroke-linecap="round" stroke-linejoin="round"/>';
 
-function syncPlayBtn() { $('#icPlay').innerHTML = v.paused ? ICON_PLAY : ICON_PAUSE; }
+function syncPlayBtn() {
+  $('#icPlay').innerHTML = v.ended ? ICON_REPLAY : v.paused ? ICON_PLAY : ICON_PAUSE;
+  $('#btnPlay').title = v.ended ? '重播 (空白鍵)' : '播放 / 暫停 (空白鍵)';
+}
+
+/* 使用者要播／要停。**所有來源都走這兩支**（播放鍵、畫面、快捷鍵、Media Session）——
+   userPaused 決定控制列要不要一直留著，feedbackMuted 決定中央要不要閃圖示，
+   兩者都只該被「人」改到，所以集中在這裡而不是散在每個 handler 裡。 */
+function userPlay() { userPaused = false; feedbackMuted = false; v.play().catch(() => {}); }
+function userPause() { userPaused = true; feedbackMuted = false; v.pause(); }
 const togglePlay = () => {
-  if (v.paused) { userPaused = false; v.play().catch(() => {}); }
-  else { userPaused = true; v.pause(); }
+  // 播完了再按「播放」語意是重播 —— 走 replay() 才會經過 Seek 與進度的正確流程
+  if (v.ended) replay();
+  else if (v.paused) userPlay();
+  else userPause();
 };
-
 $('#btnPlay').onclick = togglePlay;
-// 觸控裝置：控制列藏起來時，第一下只負責叫醒控制列，不要誤按成暫停
-$('#tap').addEventListener('pointerup', e => {
-  if (e.pointerType === 'touch' && pl.classList.contains('idle')) { wake(); return; }
-  if (e.pointerType !== 'touch') return;   // 滑鼠交給 click 處理，避免觸發兩次
-  togglePlay();
-});
-$('#tap').onclick = e => { if (e.pointerType === 'touch') return; togglePlay(); };
-$('#tap').ondblclick = () => toggleFull();
-// 跳秒數也要走 clamp —— 在片尾按「快轉 10 秒」不該把 currentTime 頂到
-// duration 而直接觸發 ended。
-// **跳秒是我們自己發動的 seek，要標記起來。**不標的話「倒退 10 秒」會被
-// startFrameMonitor() 記成一次 FRAME REGRESSION（它只看 mediaTime 有沒有變小），
-// 於是驗收用的 `Frame regress` 數字會被自己的操作灌水，看起來比實際嚴重。
-const skipBy = n => {
+
+/* ---------------- Seek：唯一一條路 ----------------
+
+   **按鈕、鍵盤、觸控手勢、進度條、重播、Media Session 全部從這裡出去。**
+   原本進度條（commitScrub）與跳秒（skipBy）各寫一份 currentTime 指派，
+   兩邊對「seek 中」的定義不一樣：跳秒不設 pendingSeekTarget，於是跳秒期間
+   圓點會先回到舊位置、進度照樣被寫進資料庫。收成一支之後，
+   seekingByUs／pendingSeekTarget／逾時保險對每一種 seek 都成立。
+
+     seekTo(t, source)      絕對位置 —— 真正寫 currentTime 的只有這裡
+     skipBy(n)              相對位置
+     seekBy(delta, source)  相對位置 ＋ 依來源給回饋（按鈕／鍵盤用 toast，
+                            手勢有自己的空間回饋，所以不 toast） */
+function seekTo(t, source) {
+  const target = clampSeekTarget(t);
+  // **我們自己發動的 seek 要標記起來。**不標的話「倒退 10 秒」會被
+  // startFrameMonitor() 記成一次 FRAME REGRESSION（它只看 mediaTime 有沒有變小），
+  // 於是驗收用的 `Frame regress` 數字會被自己的操作灌水，看起來比實際嚴重。
   seekingByUs = true;
-  v.currentTime = clampSeekTarget(v.currentTime + n);
-};
+  // 還沒有 metadata（readyState 0）時指派 currentTime 只是設「起播位置」，
+  // 不會有 seeked —— 那時候掛 pending 會讓進度條與進度寫入白白卡 30 秒。
+  if (v.readyState !== 0) {
+    pendingSeekTarget = target;
+    // **一定要有逾時放行。**seeked 是唯一會把 pendingSeekTarget 清掉的事件，
+    // 而它不保證一定來（fragment 抓不到、MediaSource 被重建、瀏覽器把這次
+    // seek 丟掉）。沒有這道保險的話，進度條會永遠停在使用者選的位置不動，
+    // 看起來像整個播放器當掉 —— 比 seek 失敗本身更糟。
+    clearTimeout(seekTimeoutTimer);
+    seekTimeoutTimer = setTimeout(() => {
+      if (pendingSeekTarget == null) return;
+      if (debugPlayer)
+        console.warn('[seek] 逾時未收到 seeked，放行 UI（目標 ' + target.toFixed(2) + '）');
+      pendingSeekTarget = null;
+      busy('');
+      syncBar();
+    }, SEEK_TIMEOUT_MS);
+  }
+  if (debugPlayer) console.info('[seek] requested:', target.toFixed(2), source || '');
+  try { v.currentTime = target; } catch {}
+  syncBar();
+  return target;
+}
+// 跳秒數也要走 clamp（在 seekTo 裡）—— 在片尾按「快轉 10 秒」不該把
+// currentTime 頂到 duration 而直接觸發 ended。
+const skipBy = n => seekTo(v.currentTime + n, 'skip');
+function seekBy(delta, source = 'button') {
+  if (!delta || !isFinite(delta)) return;
+  skipBy(delta);
+  if (source === 'button' || source === 'keyboard') {
+    const n = Math.abs(delta);
+    toast(delta > 0 ? `${n} 秒 ▶` : `◀ ${n} 秒`);
+  }
+}
 // seeked 一定會來（同一個位置的 seek 也會），所以旗標不會卡住。
 v.addEventListener('seeked', () => { seekingByUs = false; });
-$('#btnBack').onclick = () => { skipBy(-cfg.skip); toast(`◀ ${cfg.skip} 秒`); };
-$('#btnFwd').onclick = () => { skipBy(cfg.skip); toast(`${cfg.skip} 秒 ▶`); };
+$('#btnBack').onclick = () => seekBy(-cfg.skip, 'button');
+$('#btnFwd').onclick = () => seekBy(cfg.skip, 'button');
 function syncSkipLabels() {
   $('#skipBack').textContent = cfg.skip;
   $('#skipFwd').textContent = cfg.skip;
@@ -1494,23 +1550,8 @@ function commitScrub(e) {
   if (ratio == null) return;
   const d = getCanonicalDuration();
   if (!isValidDuration(d)) return;
-  const target = clampSeekTarget(ratio * d, d);
-  pendingSeekTarget = target;
-  if (debugPlayer) console.info('[seek] requested:', target.toFixed(2));
-  // **一定要有逾時放行。**seeked 是唯一會把 pendingSeekTarget 清掉的事件，
-  // 而它不保證一定來（fragment 抓不到、MediaSource 被重建、瀏覽器把這次
-  // seek 丟掉）。沒有這道保險的話，進度條會永遠停在使用者選的位置不動，
-  // 看起來像整個播放器當掉 —— 比 seek 失敗本身更糟。
-  clearTimeout(seekTimeoutTimer);
-  seekTimeoutTimer = setTimeout(() => {
-    if (pendingSeekTarget == null) return;
-    if (debugPlayer)
-      console.warn('[seek] 逾時未收到 seeked，放行 UI（目標 ' + target.toFixed(2) + '）');
-    pendingSeekTarget = null;
-    busy('');
-    syncBar();
-  }, SEEK_TIMEOUT_MS);
-  try { v.currentTime = target; } catch {}
+  // pendingSeekTarget、逾時保險、seekingByUs 都在 seekTo 裡 —— 跟跳秒同一條路
+  seekTo(clampSeekTarget(ratio * d, d), 'scrub');
   // 原本在播就繼續播、原本暫停就維持暫停
   if (wasPlayingBeforeSeek) v.play().catch(() => {});
 }
@@ -1668,24 +1709,398 @@ $('#btnPip').onclick = () => {
 };
 
 /* 閒置隱藏 */
-let idleTimer, pointerOverCtl = false;
-function wake() {
-  pl.classList.remove('idle');
+let idleTimer, pointerOverCtl = false, lastInputTouch = false;
+// 觸控給久一點：手指離開螢幕之後要「看一眼、再伸手」，滑鼠游標一直在畫面上。
+const IDLE_MS = 2800, IDLE_TOUCH_MS = 3500;
+
+/** 現在控制列能不能收起來。**每一條都是「收起來就把使用者手上的東西藏掉」：**
+ *  · userPaused  使用者主動暫停 —— 這時候他要看的就是控制列。
+ *                （不用 v.paused：緩衝/轉碼中 video 是 waiting，用 paused 判斷的話
+ *                 那條漸層會一直蓋在畫面下緣不走。）
+ *  · ended       播完了，下一步一定是按某個東西（重播／下一集）
+ *  · seekingDrag／pendingSeekTarget  拖曳中、或 seek 還沒落地
+ *  · 面板開著    設定與字幕都在這一片裡 */
+function controlsMustStay() {
+  return userPaused || v.ended || pointerOverCtl || seekingDrag || pendingSeekTarget != null
+    || $('#panel').classList.contains('show');
+}
+function armIdle() {
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    // 只要不是「使用者主動暫停」或滑鼠停在控制列上，就收起來。
-    // 之前的條件是 !v.paused，結果緩衝/轉碼中 video 是 waiting 狀態，
-    // 控制列那條漸層就一直蓋在畫面下緣不走。
-    // 正在拖進度條時把控制列藏掉 = 把使用者手上那根圓點藏掉。
-    if (userPaused || pointerOverCtl || seekingDrag ||
-        $('#panel').classList.contains('show')) return;
+    // 條件還在就**重排**而不是放棄 —— 放棄的話條件解除之後（seek 落地、面板關掉）
+    // 沒有人會再把它收起來，控制列就一直掛著直到下一次碰螢幕。
+    if (controlsMustStay()) { armIdle(); return; }
     pl.classList.add('idle');
-  }, 2800);
+  }, lastInputTouch ? IDLE_TOUCH_MS : IDLE_MS);
+}
+function wake() {
+  pl.classList.remove('idle');
+  armIdle();
+}
+/** 手勢「點一下收起控制列」。收不得的時候（暫停中、播完）就維持原樣。 */
+function sleepControls() {
+  if (controlsMustStay()) return;
+  clearTimeout(idleTimer);
+  pl.classList.add('idle');
 }
 let userPaused = false;
 $('#ctl').addEventListener('pointerenter', () => { pointerOverCtl = true; });
 $('#ctl').addEventListener('pointerleave', () => { pointerOverCtl = false; wake(); });
-['pointermove', 'pointerdown', 'keydown', 'wheel'].forEach(ev => document.addEventListener(ev, wake, { passive: true }));
+['pointermove', 'pointerdown', 'keydown', 'wheel'].forEach(ev => document.addEventListener(ev, e => {
+  if (e.pointerType) lastInputTouch = e.pointerType === 'touch';
+  // **#tap 上的觸控由手勢控制器自己決定要不要叫出控制列。**這裡也 wake 的話，
+  // 每一次雙擊快轉都會把整條控制列叫出來 —— 要的是「畫面乾淨地雙擊快轉」。
+  if (e.pointerType === 'touch' && e.target === tapEl) return;
+  wake();
+}, { passive: true }));
+
+/* ------------------------------------------------ 視覺回饋 ------------------------------------------------
+
+   **所有回饋都是 player.html 裡固定的一個元素，重複使用，不新建 DOM。**
+   快速連按十次只是把同一個元素的動畫重新開始十次 —— 每次 createElement
+   一個再等它淡出移除的話，連按會疊一堆半透明圓圈，而且要處理「移除之前
+   又按了一下」的競態。全部 pointer-events:none：它們浮在 #tap 上面，
+   擋到點擊的話手勢就收不到第二下了。 */
+
+/** 讓同一個元素的 CSS 動畫從頭再跑一次。拿掉 class → 強迫 reflow → 加回去。 */
+function restartAnim(el, cls) {
+  el.classList.remove(cls);
+  void el.offsetWidth;
+  el.classList.add(cls);
+}
+
+/* ---- 播放／暫停：中央的 ▶ ❚❚ ↻ ----
+
+   **以 <video> 的 play/pause 事件為準，不是在 togglePlay() 裡顯示。**
+   這樣快捷鍵、畫面、控制列、Media Session、耳機線控全部同一種回饋。
+   但事件不分「人按的」與「播放器自己做的」，所以要另外擋：
+     · feedbackMuted  換來源（play()）、HLS teardown、切下一集之前的 pause。
+                      開頁到第一次 playing 之前也算（自動起播不是使用者按的）。
+                      第一次 playing 或使用者操作（userPlay/userPause）才解除。
+     · v.ended        播完時瀏覽器會先發 pause 再發 ended —— 那不是「暫停」。 */
+let feedbackMuted = true;
+let nextPlayFlash = null;          // 下一次 play 要閃的圖示（重播時是 ↻ 不是 ▶）
+const FLASH_MS = 700;
+let flashTimer = null;
+function flash(kind) {
+  const el = $('#flash');
+  if (!el) return;
+  el.dataset.kind = kind;
+  restartAnim(el, 'show');
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => el.classList.remove('show'), FLASH_MS);
+}
+v.addEventListener('play', () => {
+  const kind = nextPlayFlash || 'play';
+  nextPlayFlash = null;
+  if (!feedbackMuted) flash(kind);
+});
+v.addEventListener('pause', () => {
+  if (!feedbackMuted && !v.ended) flash('pause');
+});
+v.addEventListener('playing', () => { feedbackMuted = false; });
+
+/* ---- 左右快轉：按哪邊，提示就出現在哪邊 ---- */
+// seek 真的送出去之後再留這麼久才淡出 —— 從最後一下算起約 750ms
+const SEEK_FB_TAIL_MS = 300;
+const seekFb = { timer: null, visible: false };
+function showSeekFeedback(dir, secs) {
+  const on = $(dir < 0 ? '#seekL' : '#seekR'), off = $(dir < 0 ? '#seekR' : '#seekL');
+  off.classList.remove('show', 'pulse');
+  $(dir < 0 ? '#seekLText' : '#seekRText').textContent = `${secs} 秒`;
+  on.classList.add('show');
+  restartAnim(on, 'pulse');          // 每加一次跳一下，使用者看得出「有算到這一下」
+  seekFb.visible = true;
+  clearTimeout(seekFb.timer);
+  seekFb.timer = setTimeout(hideSeekFeedback, GESTURE.seekCommitMs + SEEK_FB_TAIL_MS);
+}
+function hideSeekFeedback() {
+  clearTimeout(seekFb.timer);
+  seekFb.visible = false;
+  for (const id of ['#seekL', '#seekR']) $(id).classList.remove('show', 'pulse');
+}
+
+/* ------------------------------------------------ 觸控手勢（#tap）------------------------------------------------
+
+   **所有觸控手勢只在這裡判定**，而且只掛在 #tap（影片畫面那一層）上。
+   控制列、進度條、下一集、設定面板都是 #tap 的**兄弟**而不是子元素 ——
+   事件根本不會傳進來，所以不需要到處 stopPropagation 補洞。唯一跨區的是
+   document 層的 wake()，那裡已經把「#tap 上的觸控」排除（見上面）。
+
+   滑鼠完全不走這裡：click → 播放/暫停、dblclick → 全螢幕，照舊。
+   判斷依據是 pointerdown 的 pointerType，而**不是 click 事件自己的
+   pointerType** —— 舊版 iOS Safari 的 click 不是 PointerEvent，拿不到
+   pointerType，原本的寫法在那裡會「pointerup 切一次、click 又切一次」。
+
+   畫面切三區（左 35%／中 30%／右 35%）：
+
+     單擊   控制列藏著 → 叫出控制列（**不會**跳秒、不會暫停 —— 手機誤觸太多）
+            控制列在   → 中央：播放/暫停；左右：收起控制列
+            播完了     → 中央：重播
+     雙擊   左 → 倒退 cfg.skip、右 → 快轉 cfg.skip、中 → 播放/暫停
+            連續雙擊會**累加**（+10 → +20 → +30），最後只 seek 一次
+     長按   右側：暫時 2×，放開恢復原本的速度
+
+   **單擊一定要等雙擊窗口過了才動作** —— 不然雙擊快轉的第一下會先把
+   控制列叫出來（或先暫停），那正是要避免的。代價是單擊慢 300ms 才反應。 */
+const GESTURE = {
+  doubleMs: 300,        // 第一下放開 → 第二下按下，超過就不算雙擊
+  doubleDist: 40,       // 兩下之間的距離上限（CSS px）—— 左邊一下、右邊一下不算雙擊
+  slop: 12,             // 一下之內手指飄多遠還算「點」（超過就是滑動，不處理）
+  holdMs: 450,          // 按住多久進入 2×；**超過這個時間放開也不算單擊**
+  holdRate: 2,
+  seekCommitMs: 450,    // 最後一次雙擊之後多久才真的 seek（等使用者可能的下一下）
+  zones: [0.35, 0.65],
+};
+const tapEl = $('#tap');
+let tapPointerType = 'mouse';      // 最近一次在 #tap 上按下的是什麼 —— click／dblclick 靠它分流
+const gesture = {
+  down: null,        // 這一下 { id, x, y, t, zone, moved, candidate, consumed }
+  touches: new Set(),// 目前按著的手指。兩根以上 = 捏合縮放，整組作廢
+  lastTap: null,     // 等第二下的那一下 { x, y, t(放開的時間), zone }
+  singleTimer: null,
+  holdTimer: null,
+  hold: null,        // 2× 進行中 { previousPlaybackRate }
+};
+// 累加中的雙擊快轉。**UI 每一下立刻更新，真正的 seek 只在最後做一次** ——
+// 對 HLS 而言每一次 seek 都是「取消 fragment → 重新定位 → 重抓」，
+// 連點三次若各自 seek，就是三輪互相取消的下載（而下階是隨選轉碼的）。
+const gSeek = { delta: 0, dir: 0, timer: null };
+
+const isTouchPointer = e => e.pointerType === 'touch';
+function zoneAt(x) {
+  const r = tapEl.getBoundingClientRect();
+  const p = r.width ? (x - r.left) / r.width : 0.5;
+  return p < GESTURE.zones[0] ? 'left' : p > GESTURE.zones[1] ? 'right' : 'center';
+}
+const distTo = (a, x, y) => Math.hypot(a.x - x, (a.y || 0) - (y || 0));
+
+tapEl.addEventListener('pointerdown', e => {
+  tapPointerType = e.pointerType || 'mouse';
+  if (!isTouchPointer(e)) return;
+  const g = gesture;
+  g.touches.add(e.pointerId);
+  if (g.touches.size > 1) { abortGesture(); return; }
+
+  const t = e.timeStamp, x = e.clientX, y = e.clientY;
+  const last = g.lastTap;
+  const candidate = !!last && t - last.t <= GESTURE.doubleMs
+    && distTo(last, x, y) <= GESTURE.doubleDist;
+  if (candidate) clearTimeout(g.singleTimer);   // 可能是雙擊的第二下：前一下的單擊先別做
+  else if (last) flushSingleTap();              // 太晚／太遠：前一下確定是單擊
+
+  g.down = {
+    id: e.pointerId, x, y, t, zone: zoneAt(x), moved: false, candidate,
+    // 面板開著時點畫面 = 關面板（document 層那支會關），這一下不再兼做別的事
+    consumed: $('#panel').classList.contains('show'),
+  };
+  try { tapEl.setPointerCapture(e.pointerId); } catch {}
+  if (g.down.zone === 'right' && !candidate && !g.down.consumed && canFastHold())
+    g.holdTimer = setTimeout(beginFastHold, GESTURE.holdMs);
+});
+
+tapEl.addEventListener('pointermove', e => {
+  const d = gesture.down;
+  if (!d || e.pointerId !== d.id || d.moved) return;
+  if (distTo(d, e.clientX, e.clientY) > GESTURE.slop) {
+    d.moved = true;
+    // 還沒進 2× 就開始滑 → 不是長按。已經在 2× 的話手指飄一點不算放開。
+    if (!gesture.hold) clearTimeout(gesture.holdTimer);
+  }
+});
+
+tapEl.addEventListener('pointerup', e => {
+  if (!isTouchPointer(e)) return;
+  const g = gesture, d = g.down;
+  g.touches.delete(e.pointerId);
+  if (!d || d.id !== e.pointerId) return;
+  g.down = null;
+  clearTimeout(g.holdTimer);
+  if (g.hold) { endFastHold(); return; }            // 長按放開，不是點擊
+  // 滑動、按太久、關面板的那一下：都不是點擊。等著配對的前一下也一起作廢 ——
+  // 「點一下再按住」不該在放開時被當成單擊補做。
+  const tooLong = e.timeStamp - d.t >= GESTURE.holdMs;
+  if (d.moved || d.consumed || tooLong) { if (d.candidate) g.lastTap = null; return; }
+  if (d.candidate) {
+    const first = g.lastTap;
+    g.lastTap = null;
+    onDoubleTap(first.zone);
+    return;
+  }
+  g.lastTap = { x: d.x, y: d.y, t: e.timeStamp, zone: d.zone };
+  g.singleTimer = setTimeout(flushSingleTap, GESTURE.doubleMs);
+});
+
+// 手勢被瀏覽器中斷（捲動接手、來電、轉向、多指）：什麼都不做，但狀態要清乾淨 ——
+// 尤其 2× 一定要恢復，不然使用者手指早就離開了，影片還在用兩倍速跑。
+function onTapAbort(e) {
+  gesture.touches.delete(e.pointerId);
+  const d = gesture.down;
+  if (!d || d.id !== e.pointerId) return;
+  gesture.down = null;
+  // 被打斷的是雙擊的第二下：等著配對的那一下也作廢，不然它之後會被當成單擊補做
+  if (d.candidate) gesture.lastTap = null;
+  clearTimeout(gesture.holdTimer);
+  endFastHold();
+}
+tapEl.addEventListener('pointercancel', onTapAbort);
+tapEl.addEventListener('lostpointercapture', onTapAbort);
+// Android 長按會跳系統選單。只擋觸控；滑鼠右鍵照舊。
+tapEl.addEventListener('contextmenu', e => { if (tapPointerType === 'touch') e.preventDefault(); });
+
+// 滑鼠：沿用原本的 click → 播放/暫停、dblclick → 全螢幕
+tapEl.onclick = () => { if (tapPointerType !== 'touch') togglePlay(); };
+// 手機瀏覽器有時會把兩下觸控合成 dblclick —— 觸控的雙擊是快轉，不是全螢幕
+tapEl.ondblclick = () => { if (tapPointerType !== 'touch') toggleFull(); };
+
+function flushSingleTap() {
+  clearTimeout(gesture.singleTimer);
+  const tap = gesture.lastTap;
+  gesture.lastTap = null;
+  if (tap) onSingleTap(tap.zone);
+}
+
+/** 手勢全部作廢（多指、離開頁面、全螢幕切換）。還沒落地的累加快轉**不**丟 ——
+ *  那是使用者已經看到「+30 秒」的操作，它有自己的計時器會照常落地。 */
+function abortGesture() {
+  clearTimeout(gesture.singleTimer);
+  clearTimeout(gesture.holdTimer);
+  gesture.lastTap = null;
+  gesture.down = null;
+  endFastHold();
+}
+/** 換來源時用：連累加中的快轉也一起丟（它是對著上一個來源算的）。 */
+function resetGestures() {
+  abortGesture();
+  gesture.touches.clear();
+  clearTimeout(gSeek.timer);
+  gSeek.timer = null; gSeek.delta = 0; gSeek.dir = 0;
+  hideSeekFeedback();
+}
+
+function onSingleTap(zone) {
+  // 連續雙擊快轉之間多出來的一下（沒配成對）：吞掉，不要叫出控制列打斷使用者
+  if (gSeek.timer || seekFb.visible) return;
+  if (v.ended) { zone === 'center' ? replay() : wake(); return; }
+  if (pl.classList.contains('idle')) { wake(); return; }
+  if (zone === 'center') { togglePlay(); wake(); }
+  else sleepControls();
+}
+
+function onDoubleTap(zone) {
+  if (zone === 'center') { togglePlay(); return; }
+  gestureSeekAdd(zone === 'left' ? -1 : 1);
+}
+
+function gestureSeekAdd(dir) {
+  // 換邊：前一段先落地再開新的一段。不做淨額相加 —— 使用者已經看到「+20 秒」，
+  // 接著按左邊時他預期的是「從 +20 那裡再倒退」，不是兩者抵銷。
+  if (gSeek.dir && gSeek.dir !== dir) commitGestureSeek();
+  gSeek.dir = dir;
+  gSeek.delta += dir * cfg.skip;
+  showSeekFeedback(dir, Math.abs(gSeek.delta));
+  clearTimeout(gSeek.timer);
+  gSeek.timer = setTimeout(commitGestureSeek, GESTURE.seekCommitMs);
+}
+function commitGestureSeek() {
+  clearTimeout(gSeek.timer);
+  const d = gSeek.delta;
+  gSeek.timer = null; gSeek.delta = 0; gSeek.dir = 0;
+  if (d) seekBy(d, 'gesture');
+}
+
+/* ---- 長按暫時 2× ----
+   進入時記下**當下的**速度，放開時還原成它 —— 使用者原本是 1.25× 就回 1.25×，
+   不是回 1×。暫停中不啟動：長按不該變成「開始播放」。 */
+function canFastHold() { return !v.paused && !v.ended; }
+function beginFastHold() {
+  gesture.holdTimer = null;
+  const d = gesture.down;
+  if (!d || d.moved || gesture.hold || !canFastHold()) return;
+  gesture.hold = { previousPlaybackRate: v.playbackRate };
+  v.playbackRate = GESTURE.holdRate;
+  $('#holdFb').classList.add('show');
+}
+function endFastHold() {
+  const h = gesture.hold;
+  if (!h) return;
+  gesture.hold = null;
+  v.playbackRate = h.previousPlaybackRate;
+  $('#holdFb').classList.remove('show');
+}
+// 手指還按著但畫面已經不是這個畫面了：切走 App、鎖螢幕、進出全螢幕。
+// 這些時候 pointerup 不保證會來，不收的話 2× 會一直留著。
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') abortGesture();
+});
+window.addEventListener('pagehide', abortGesture);
+document.addEventListener('fullscreenchange', abortGesture);
+document.addEventListener('webkitfullscreenchange', abortGesture);
+v.addEventListener('webkitbeginfullscreen', abortGesture);
+v.addEventListener('webkitendfullscreen', abortGesture);
+
+/* ---------------- 播完：重播 ----------------
+
+   **Replay 要走 seekTo()，不是直接 currentTime = 0。**走同一條路才會有
+   pendingSeekTarget，而 saveProgress 在 seek 落地之前不寫 —— 否則按下重播
+   的那一瞬間，currentTime 還是片尾、狀態卻已經不是 ended，會寫出一筆
+   「片尾、未完成」。
+
+   另外一個洞是**重播之後的第一筆進度**：這一集剛剛才被標成 finished，
+   重播幾秒又關掉的話，節流寫入會把它改回「看到 0:08、未完成」，
+   它就重新出現在「繼續觀看」上。所以重播後要真的看過 REPLAY_KEEP_FINISHED_S
+   秒才開始寫一般進度（那時候才算「在重看」而不是「手滑按到」）。 */
+const REPLAY_KEEP_FINISHED_S = 30;
+let replayGuard = false;
+function replay() {
+  if (v.ended) replayGuard = true;
+  nextPlayFlash = 'replay';
+  seekTo(0, 'replay');
+  userPlay();
+}
+function syncEndedUi() {
+  pl.classList.toggle('ended', !!v.ended);
+  syncPlayBtn();
+}
+v.addEventListener('ended', () => { syncEndedUi(); wake(); });
+['play', 'seeking', 'loadstart', 'emptied'].forEach(ev => v.addEventListener(ev, syncEndedUi));
+
+/* ---------------- 控制元件的按壓回饋 ----------------
+   手機沒有 hover，按下去沒有任何變化的話使用者分不出「沒按到」與「還在處理」。
+   :active 在 iOS 上不可靠（要有 touchstart listener 才會套），而且快速點一下
+   根本來不及畫出來，所以用一個固定 ~140ms 的 class。 */
+pl.addEventListener('pointerdown', e => {
+  const b = e.target?.closest?.('.ib, .next-ep');
+  if (!b) return;
+  restartAnim(b, 'pressed');
+  clearTimeout(b._pressTimer);
+  b._pressTimer = setTimeout(() => b.classList.remove('pressed'), 160);
+}, { passive: true });
+
+/* ---------------- Media Session（鎖定畫面、耳機、藍牙鍵）----------------
+   **跟畫面上的按鈕共用同一套**：play/pause 走 userPlay/userPause，
+   跳秒走 seekBy，指定位置走 seekTo —— 沒有第二套 seek。 */
+function setupMediaSession() {
+  const ms = navigator.mediaSession;
+  if (!ms || typeof ms.setActionHandler !== 'function') return;
+  // 不支援的 action 會丟例外（Safari 舊版沒有 seekto），一個失敗不能讓其他的也掛不上
+  const set = (action, fn) => { try { ms.setActionHandler(action, fn); } catch {} };
+  set('play', () => { v.ended ? replay() : userPlay(); });
+  set('pause', () => userPause());
+  set('seekbackward', d => seekBy(-(d?.seekOffset || cfg.skip), 'media-session'));
+  set('seekforward', d => seekBy(d?.seekOffset || cfg.skip, 'media-session'));
+  set('seekto', d => { if (d && isFinite(d.seekTime)) seekTo(d.seekTime, 'media-session'); });
+}
+function syncMediaMetadata() {
+  const ms = navigator.mediaSession;
+  if (!ms || !info || typeof window.MediaMetadata !== 'function') return;
+  try {
+    ms.metadata = new MediaMetadata({
+      title: info.title || '', artist: info.subtitle_label || '', album: 'FilmaxWeb',
+    });
+  } catch {}
+}
+setupMediaSession();
 
 /* ------------------------------------------------ 設定面板 ------------------------------------------------ */
 let panelTab = 'subtitle';
@@ -2160,6 +2575,11 @@ function saveProgress(finished = false, { force = false } = {}) {
   if (seekingDrag || pendingSeekTarget != null) return;
   const pos = v.currentTime;
   if (!pos && !finished) return;
+  // 剛播完又按了重播：真的重看一段之前不要把 finished 改回未完成（見 replay()）
+  if (replayGuard && !finished) {
+    if (pos < REPLAY_KEEP_FINISHED_S) return;
+    replayGuard = false;
+  }
   const now = Date.now();
   if (!force && !finished) {
     if (now - lastSaveAt < SAVE_EVERY_MS) return;
@@ -2253,6 +2673,8 @@ async function goNextEpisode() {
   if (!n) return;
   const btn = $('#nextEp');
   if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+  // 這個 pause 是「要換頁了」，不是使用者按暫停 —— 不閃 ❚❚
+  feedbackMuted = true;
   try { v.pause(); } catch {}
   await finishCurrentEpisode();
   location.href = n.url || ('/player?file=' + n.file_id);
@@ -2272,8 +2694,8 @@ document.addEventListener('keydown', e => {
   if (e.target.tagName === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
   const k = e.key.toLowerCase();
   if (k === ' ' || k === 'k') { e.preventDefault(); togglePlay(); }
-  else if (e.key === 'ArrowRight') { const n = e.shiftKey ? 60 : cfg.skip; skipBy(n); toast(n + ' 秒 ▶'); }
-  else if (e.key === 'ArrowLeft') { const n = e.shiftKey ? 60 : cfg.skip; skipBy(-n); toast('◀ ' + n + ' 秒'); }
+  else if (e.key === 'ArrowRight') seekBy(e.shiftKey ? 60 : cfg.skip, 'keyboard');
+  else if (e.key === 'ArrowLeft') seekBy(-(e.shiftKey ? 60 : cfg.skip), 'keyboard');
   else if (e.key === 'ArrowUp') { v.volume = clamp(v.volume + .1, 0, 1); toast('音量 ' + Math.round(v.volume*100) + '%'); }
   else if (e.key === 'ArrowDown') { v.volume = clamp(v.volume - .1, 0, 1); toast('音量 ' + Math.round(v.volume*100) + '%'); }
   else if (k === 'f') toggleFull();
@@ -2308,6 +2730,7 @@ async function boot() {
   document.title = info.title + ' — FilmaxWeb';
   $('#ti').textContent = info.title;
   $('#sub').textContent = [info.subtitle_label, info.filename].filter(Boolean).join(' · ');
+  syncMediaMetadata();
 
   if (info.probe_state !== 'ok') {
     center('這個檔案還沒分析過格式，正在分析…');
@@ -2380,6 +2803,12 @@ window.__playerTestHooks = {
   get seekPreviewTime() { return seekPreviewTime; },
   get pendingSeekTarget() { return pendingSeekTarget; },
   get wasPlayingBeforeSeek() { return wasPlayingBeforeSeek; },
+  // 觸控手勢與回饋（tests/player_gesture_test.js）。seekTo／seekBy 要掛出來，
+  // 測試才驗得出「按鈕、鍵盤、手勢走的是同一支」，而不是只看最後的 currentTime。
+  seekTo, seekBy, skipBy, togglePlay, replay, GESTURE,
+  get fastHold() { return gesture.hold; },
+  get feedbackMuted() { return feedbackMuted; },
+  get replayGuard() { return replayGuard; },
 };
 
 boot();

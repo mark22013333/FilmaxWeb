@@ -22,6 +22,21 @@
     <video id="v" playsinline preload="metadata" crossorigin="anonymous"></video>
     <div class="subs bottom" id="subs"></div>
     <div class="tapzone" id="tap"></div>
+    <!-- 手勢與播放狀態的視覺回饋。**全部是固定的元素、重複使用**（player.js 只切
+         class 重播動畫，不新建 DOM），而且全部 pointer-events:none —— 它們浮在
+         #tap 上面，擋到點擊的話雙擊的第二下就收不到了。 -->
+    <div class="flash" id="flash" aria-hidden="true">
+      <svg class="fi fi-play" viewBox="0 0 24 24"><path d="M8 5l12 7-12 7z"/></svg>
+      <svg class="fi fi-pause" viewBox="0 0 24 24"><path d="M6.5 5h3.5v14H6.5zM14 5h3.5v14H14z"/></svg>
+      <svg class="fi fi-replay line" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 2.64-6.36"/><path d="M3 4v5h5"/></svg>
+    </div>
+    <div class="seek-fb left" id="seekL" aria-hidden="true"><b>««</b><span id="seekLText"></span></div>
+    <div class="seek-fb right" id="seekR" aria-hidden="true"><b>»»</b><span id="seekRText"></span></div>
+    <div class="hold-fb" id="holdFb" aria-hidden="true">2× <b>»</b></div>
+    <!-- 播完之後中央常駐的重播圖示。點它其實是點到下面的 #tap（中央單擊 = 重播）。 -->
+    <div class="replay-hint" id="replayHint" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 2.64-6.36"/><path d="M3 4v5h5"/></svg>
+    </div>
     <div class="center" id="center"><div class="pl-card">
       <div class="spin" id="spin"></div><div id="centerText">準備中…</div>
     </div></div>
