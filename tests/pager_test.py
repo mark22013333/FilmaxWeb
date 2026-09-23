@@ -134,11 +134,15 @@ MAIN = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
 check("HTML 進入點帶 no-store", '"Cache-Control": "no-store, must-revalidate"' in MAIN)
 check("四支 HTML 路由都走同一個 helper（各寫一次遲早漏一個）",
       MAIN.count('return _page("') == 4, MAIN.count('return _page("'))
-# 唯一允許的 FileResponse(STATIC_DIR / ...) 是 _page() 自己；
-# 路由裡再出現一次就代表那一支繞過了 no-store。
+# _page() 現在是讀檔 → 補 /static/ 的 ?v= 版本號 → HTMLResponse（見 main.py 的
+# _versioned 註解：Cloudflare 會替 /static/* 補四小時的 max-age）。
+# 路由裡出現 FileResponse(STATIC_DIR / ...) 就代表那一支同時繞過了 no-store 與版本號。
 check("沒有路由繞過 _page() 直接吐檔案（繞過的那一支就會被快取）",
-      MAIN.count("FileResponse(STATIC_DIR /") == 1,
+      MAIN.count("FileResponse(STATIC_DIR /") == 0,
       MAIN.count("FileResponse(STATIC_DIR /"))
+# 送出 HTML 的只有兩處：_page() 與動態組出來的登入頁，兩處都要補版本號
+check("送出的 HTML 都經過 _versioned()（少一處那一頁就會拿到舊的 js/css）",
+      MAIN.count("HTMLResponse(_versioned(") == 2, MAIN.count("HTMLResponse(_versioned("))
 check("index.html 也在裡面", '_page("index.html")' in MAIN)
 
 

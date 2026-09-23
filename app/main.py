@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (audit, auth, db, ftpclient, geo, hls, media, mssql, params,
@@ -303,9 +303,29 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # 而它換到的是「重新整理就一定看得到最新版」。
 _NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
 
+# **只有 HTML 不快取還不夠。**對外走 Cloudflare 時，它會替 /static/* 補上
+# `Cache-Control: max-age=14400` —— 瀏覽器於是四小時內連問都不問，ETag 完全沒機會
+# 派上用場。實際發生過：服務重啟、伺服器上已經是新版 admin.js，使用者看到的還是舊畫面。
+#
+# 所以 HTML 送出前把裡面引用的 /static/ 網址補上 ?v=<檔案修改時間>：檔案一改網址就變，
+# 不管中間哪一層快取了多久，拿到的都是新網址。HTML 本身是 no-store，這一步每次都會重算。
+# 只改寫 src/href 屬性；JS 裡自己 import 的模組（photoview.js、vendor）不在這裡。
+_ASSET_RE = re.compile(r'((?:src|href)=")(/static/([^"?#]+))(")')
 
-def _page(name: str) -> FileResponse:
-    return FileResponse(STATIC_DIR / name, headers=_NO_CACHE)
+
+def _versioned(html: str) -> str:
+    def sub(m: re.Match) -> str:
+        try:
+            v = (STATIC_DIR / m.group(3)).stat().st_mtime_ns
+        except OSError:
+            return m.group(0)       # 檔案不在就原樣留著，不要讓頁面因此壞掉
+        return f"{m.group(1)}{m.group(2)}?v={v:x}{m.group(4)}"
+    return _ASSET_RE.sub(sub, html)
+
+
+def _page(name: str) -> HTMLResponse:
+    html = (STATIC_DIR / name).read_text(encoding="utf-8")
+    return HTMLResponse(_versioned(html), headers=_NO_CACHE)
 
 
 @app.get("/", include_in_schema=False)
@@ -397,7 +417,7 @@ def _login_page(error: str = "", nxt: str = "") -> HTMLResponse:
     html = (html.replace("{{ERROR}}", escape(error, quote=True))
                 .replace("{{NEXT}}", escape(safe_next, quote=True))
                 .replace("{{GOOGLE}}", google))
-    return HTMLResponse(html, status_code=401 if error else 200)
+    return HTMLResponse(_versioned(html), status_code=401 if error else 200)
 
 
 @app.get("/login", include_in_schema=False)
