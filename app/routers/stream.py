@@ -61,7 +61,7 @@ def stream_raw(file_id: int, request: Request, raw: int = 0):
             size = ftpclient.file_size(path)
             db.execute("UPDATE media_file SET size=? WHERE id=?", (size, file_id))
         except ftpclient.FtpError as e:
-            raise HTTPException(502, str(e))
+            raise _source_failed(file_id, path, "SIZE", 0, None, e)
 
     start, end = 0, size - 1
     rng = request.headers.get("range") or request.headers.get("Range")
@@ -77,14 +77,16 @@ def stream_raw(file_id: int, request: Request, raw: int = 0):
             elif g2:  # bytes=-N 取最後 N bytes
                 start = max(0, size - int(g2))
             partial = True
-    if start >= size:
+    # start > end（`bytes=500-100`）跟本機那條路（_ranged_file）一樣回 416 ——
+    # 不擋的話 length 是負的，Content-Length 會是一個負數。
+    if start >= size or start > end:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
 
     length = end - start + 1
     try:
         stream = ftpclient.FtpReadStream(path, start)
     except ftpclient.FtpError as e:
-        raise HTTPException(502, f"FTP 讀取失敗: {e}")
+        raise _source_failed(file_id, path, "RETR", start, rng, e)
 
     headers = {
         "Accept-Ranges": "bytes",
@@ -101,6 +103,22 @@ def stream_raw(file_id: int, request: Request, raw: int = 0):
         headers=headers,
         media_type=mime,
     )
+
+
+def _source_failed(file_id: int, path: str, op: str, start: int,
+                   rng: Optional[str], exc: BaseException) -> HTTPException:
+    """FTP 來源讀不到：伺服器端留完整原因，回給客戶端的只有一句通用訊息。
+
+    **為什麼要分兩邊。**這支端點的客戶端多半是我們自己的 ffmpeg，它只會印
+    `Server returned 5XX Server Error reply` —— 真正的原因（550 檔案不在、
+    421 連線太多、REST 不支援）原本哪裡都看不到。另一方面 FTP 路徑是伺服器的
+    檔案配置，不該回給瀏覽器（一般使用者也打得到這支）。
+    """
+    cls, code, msg = ftpclient.describe_error(exc)
+    log.warning("raw source failed file=%s source=ftp op=%s start=%s range=%r "
+                "path=%r error=%s code=%s msg=%s",
+                file_id, op, start, rng, path, cls, code or "-", msg)
+    return HTTPException(502, f"來源讀取失敗（FTP {code}）" if code else "來源讀取失敗")
 
 
 def _disposition(name: str) -> str:
@@ -159,7 +177,10 @@ def hls_master(file_id: int, request: Request, h: Optional[int] = None, a: Optio
     if settings.hls_two_rung:
         try:
             row = db.q1("SELECT kf_state FROM media_file WHERE id=?", (file_id,))
-            if row and row["kf_state"] in ("pending", "failed"):
+            # failed 只在冷卻期過了才插隊。原本 failed 也一律插隊，於是一支
+            # 壞檔每被開一次（hls.js 重試 master 時一秒好幾次）就重掃一次。
+            # 邊界表只是上階的最佳化：拿不到照樣發下階，播放不受影響。
+            if row and keyframes.runnable(file_id, row["kf_state"]):
                 keyframes.request_soon(file_id)
                 # 佇列是掃描結束時啟動的，那條執行緒早就跑完了 ——
                 # 插了隊沒人處理的話這個插隊永遠不會生效。

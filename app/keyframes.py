@@ -50,6 +50,56 @@ _queue_thread: Optional[threading.Thread] = None
 _priority: List[int] = []          # 開播插隊用
 _priority_lock = threading.Lock()
 
+# 失敗之後多久才可以再試一次（秒）。
+#
+# **為什麼需要它（實際發生過）。**原本 `_next_row()` 把 `failed` 跟 `pending`
+# 一視同仁：掃失敗 → 標 failed → 下一輪又挑到它（ORDER BY id，它還是最小的
+# 那一個）→ 再失敗。沒有任何延遲，速度只受限於 ffprobe 開一次行程的時間：
+# production 上一支已經搬走的檔案（FTP 回 550）被這樣重試了 4.5 萬次，
+# 每分鐘約 475 條新的 FTP 連線，連續兩個多小時 —— 而且因為它永遠排在最前面，
+# **它後面的檔案一個都輪不到**。開播時的 `request_soon()` 也會把 failed
+# 再插回最前面，每一次 master 請求都是一次新的重試。
+#
+# 記在記憶體而不是 DB：重啟之後每個失敗的檔案各重試一次（原本就是這個語意），
+# 不必為了一個時間戳加 migration。明確的重試途徑有兩條：重新掃描
+# （`start_background(retry_failed=True)`）與後台的手動重試。
+FAILED_RETRY_COOLDOWN = 1800.0
+_failed_at: Dict[int, float] = {}  # file_id → 失敗時的 time.monotonic()
+_failed_lock = threading.Lock()
+
+
+def _note_failed(file_id: int) -> None:
+    with _failed_lock:
+        _failed_at[file_id] = time.monotonic()
+
+
+def retry_due(file_id: int, now: Optional[float] = None) -> bool:
+    """這個 failed 的檔案現在可以再試了嗎（冷卻期過了、或這個行程還沒試過）。"""
+    with _failed_lock:
+        t = _failed_at.get(file_id)
+    if t is None:
+        return True
+    return ((time.monotonic() if now is None else now) - t) >= FAILED_RETRY_COOLDOWN
+
+
+def clear_failed_cooldown() -> int:
+    """讓所有 failed 的檔案下一輪就能再試一次。回傳清掉幾筆。
+
+    給「使用者重新掃描」與「管理員手動重試」用 —— 那是明確的意圖，
+    不該被冷卻期擋住。**每個檔案在一輪裡仍然最多試一次**（見 run_queue）。
+    """
+    with _failed_lock:
+        n = len(_failed_at)
+        _failed_at.clear()
+    return n
+
+
+def runnable(file_id: int, kf_state: Optional[str]) -> bool:
+    """開播插隊要不要做：pending 一律要，failed 只在冷卻期過了才要。"""
+    if kf_state == "pending":
+        return True
+    return kf_state == "failed" and retry_due(file_id)
+
 
 # --------------------------------------------------------------------------
 # 掃描一個檔案
@@ -582,22 +632,58 @@ def request_soon(file_id: int) -> None:
             _priority.insert(0, file_id)
 
 
-def _next_row(cancel=None) -> Optional[Dict[str, Any]]:
+class _Round:
+    """一輪 `run_queue()` 的進度。
+
+    **不變量：同一輪裡，每個 file id 最多嘗試一次。**
+    `attempted` 擋插隊來的（插隊不照 id 順序），`after_id` 是一般掃描的游標
+    （照 id 遞增往前走、不回頭）—— 兩者合起來保證這一輪一定走得完：
+    游標單調遞增，插隊的每個 id 也只收一次。不用 `id NOT IN (...)`：
+    SQLite 的參數上限是 999，失敗的檔案一多就爆。
+    """
+
+    def __init__(self) -> None:
+        self.attempted: set = set()
+        self.after_id = 0
+
+
+def _next_row(cancel=None, rnd: Optional[_Round] = None) -> Optional[Dict[str, Any]]:
+    if rnd is None:
+        rnd = _Round()          # 單獨呼叫（測試、除錯）時就是全新的一輪
     with _priority_lock:
         while _priority:
             fid = _priority.pop(0)
-            r = db.q1("""SELECT id, ftp_path, video_codec FROM media_file
+            if fid in rnd.attempted:
+                continue
+            r = db.q1("""SELECT id, ftp_path, video_codec, kf_state FROM media_file
                          WHERE id=? AND kf_state IN ('pending','failed')""", (fid,))
-            if r:
+            if r and runnable(fid, r["kf_state"]):
+                rnd.attempted.add(fid)
                 return dict(r)
-    r = db.q1("""SELECT id, ftp_path, video_codec FROM media_file
-                 WHERE kf_state IN ('pending','failed') AND probe_state='ok'
-                 ORDER BY id LIMIT 1""")
-    return dict(r) if r else None
+    while True:
+        r = db.q1("""SELECT id, ftp_path, video_codec, kf_state FROM media_file
+                     WHERE kf_state IN ('pending','failed') AND probe_state='ok'
+                       AND id > ?
+                     ORDER BY id LIMIT 1""", (rnd.after_id,))
+        if not r:
+            return None
+        fid = int(r["id"])
+        rnd.after_id = fid
+        if fid in rnd.attempted:
+            continue            # 這一輪已經從插隊那邊試過了
+        if r["kf_state"] == "failed" and not retry_due(fid):
+            continue            # 冷卻中：跳過，但不擋住後面的檔案
+        rnd.attempted.add(fid)
+        return dict(r)
 
 
 def run_queue(cancel=None, limit: Optional[int] = None) -> Dict[str, int]:
-    """把待辦排完。**同步、單執行緒** —— 呼叫端自己決定要不要丟到背景。"""
+    """把待辦排完。**同步、單執行緒** —— 呼叫端自己決定要不要丟到背景。
+
+    每個檔案一輪最多試一次（見 `_Round`），失敗的進冷卻期
+    （`FAILED_RETRY_COOLDOWN`），所以一支永遠掃不起來的壞檔
+    **既不會讓這一輪停不下來，也不會擋住排在它後面的檔案**。
+    """
     stats = {"ok": 0, "skipped": 0, "failed": 0}
     # 先補 profile／level：那是毫秒級的檔頭讀取，而下面的掃描是每檔 30 秒。
     # 放在前面，升級之後第一次跑就能讓既有的 97 部拿到 CODECS。
@@ -611,15 +697,28 @@ def run_queue(cancel=None, limit: Optional[int] = None) -> Dict[str, int]:
     except Exception as e:
         log.debug("回填退格整批失敗：%s", e)
     done = 0
+    rnd = _Round()
     while True:
         if cancel is not None and cancel.is_set():
             break
         if limit is not None and done >= limit:
             break
-        row = _next_row(cancel)
+        row = _next_row(cancel, rnd)
         if row is None:
             break
-        state = scan_one(row, cancel=cancel)
+        fid = int(row["id"])
+        try:
+            state = scan_one(row, cancel=cancel)
+        except Exception as e:
+            # 逾時、ffprobe 不見了之類。原本這會讓整個佇列中斷 ——
+            # 一支檔案的問題不該讓後面的全部停擺，記成這支失敗、繼續下一支。
+            msg = media.scrub(str(e))[:400] or type(e).__name__
+            db.execute("UPDATE media_file SET kf_state='failed', kf_error=? WHERE id=?",
+                       (msg, fid))
+            log.warning("keyframe 掃描失敗 file=%s: %s", fid, msg[:160])
+            state = "failed"
+        if state == "failed":
+            _note_failed(fid)
         if state in stats:
             stats[state] += 1
         elif state == "pending":        # 被取消
@@ -628,9 +727,16 @@ def run_queue(cancel=None, limit: Optional[int] = None) -> Dict[str, int]:
     return stats
 
 
-def start_background(cancel=None) -> bool:
-    """掃描結束後叫這個。已經有一條在跑就不重複開。"""
+def start_background(cancel=None, retry_failed: bool = False) -> bool:
+    """掃描結束後叫這個。已經有一條在跑就不重複開。
+
+    `retry_failed=True`：先清掉失敗的冷卻期，讓 failed 的檔案這一輪再試一次
+    （重新掃描、管理員手動重試）。開播插隊不帶這個旗標 —— 那條路徑一秒可以
+    進來好幾次，正是原本 retry storm 的來源之一。
+    """
     global _queue_thread
+    if retry_failed:
+        clear_failed_cooldown()
     with _queue_lock:
         if _queue_thread is not None and _queue_thread.is_alive():
             return False
