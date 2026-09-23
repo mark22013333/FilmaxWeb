@@ -184,19 +184,6 @@ table.t tr:last-child td{border-bottom:none}
 .box.lockhint b{color:var(--text)}
 .box.lockhint code{background:var(--bg-2);padding:1px 5px;border-radius:4px}
 
-/* 受限資料夾（L） */
-.acl-rule{margin-top:10px}
-.acl-rule code{background:var(--bg-2);padding:1px 6px;border-radius:4px;word-break:break-all}
-.acl-users{
-  display:flex;flex-wrap:wrap;gap:6px 14px;margin:8px 0 4px;
-  padding:9px 11px;border-radius:9px;background:var(--bg-2);border:1px solid var(--line);
-}
-.acl-users label{
-  display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
-  min-height:32px;cursor:pointer;
-}
-.acl-users input{width:16px;height:16px}
-.acl-users label:hover{color:var(--text)}
 .param .chk{display:flex;gap:9px;align-items:center;min-height:40px;font-size:12.5px;color:var(--muted)}
 .param .chk input{width:18px;height:18px}
 .param .note code{background:var(--bg-2);padding:1px 5px;border-radius:4px;word-break:break-all}
@@ -257,48 +244,281 @@ table.t tr:last-child td{border-bottom:none}
   .desktop-note{display:none}
 }
 
-/* ---------------------------------------------------------------- 受限資料夾的資料夾樹
-   原本是一個 <select> 塞 52 個 <option>，用全形空格假裝縮排。三個問題：
-   (1) <option> 在 Chrome/Safari 套不了樣式，深色介面裡它是一塊白的；
-   (2) 全形空格的縮排在不同字型下對不齊，看不出父子關係；
-   (3) 篩選用的是 option.hidden —— 那個屬性只有 Firefox 認，
-       Chrome 完全忽略，所以「篩選」看起來是壞的。
-   改成自訂清單之後三件事都能解，而且能顯示「已受限／被上層涵蓋」的狀態。 */
-.ftree{
-  max-height:320px;overflow-y:auto;background:var(--bg-2);
-  border:1px solid var(--line);border-radius:10px;padding:4px;
+/* ---------------------------------------------------------------- 受限資料夾（L）
+   原則：平常只顯示結果與摘要，要操作時才長出細節。
+   原本是「所有東西永遠攤開」—— 每條規則的 checkbox、涵蓋的子資料夾、
+   管理員說明全部同時在畫面上，再加一塊 320px 高、永遠展開的資料夾清單，
+   一個規則不多的頁面就要捲好幾屏。 */
+.acl-intro{font-size:12.5px;color:var(--muted);line-height:1.7}
+.acl-intro b{color:var(--text)}
+/* 密碼登入的說明不能收起來：沒看到這句的人會以為「我設了但他看不到」是壞掉 */
+.acl-pwnote{
+  margin-top:6px;padding:6px 10px;border-radius:8px;font-size:12px;
+  background:var(--bg-2);border:1px dashed var(--line);color:var(--muted);
 }
-.ftree-row{
-  display:flex;align-items:center;gap:8px;width:100%;
-  padding:6px 8px;border-radius:7px;text-align:left;
-  color:var(--text);font-size:12.5px;line-height:1.4;transition:.12s;
+.acl-sec-h{
+  display:flex;align-items:center;gap:8px;margin:18px 0 8px;
+  font-size:12px;font-weight:800;color:var(--muted);letter-spacing:.02em;
 }
-.ftree-row:hover:not(.is-off){background:var(--panel-2)}
-.ftree-row.on{background:var(--accent);color:#1a1a1a;font-weight:600}
-.ftree-row.on .ftree-meta,.ftree-row.on .ftree-tag{color:#1a1a1a;opacity:.75}
-/* 已經受限、或被上層涵蓋的：列出來但不能選 —— 看得到才知道「為什麼這個不在清單裡」 */
-.ftree-row.is-off{color:var(--dim);cursor:default}
-.ftree-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ftree-meta{
-  flex:none;color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums;
+.acl-sec-h span{
+  font-size:11px;padding:0 7px;border-radius:99px;background:var(--panel-2);color:var(--dim);
+  font-variant-numeric:tabular-nums;
 }
-.ftree-tag{
-  flex:none;font-size:10.5px;padding:1px 6px;border-radius:999px;
-  border:1px solid var(--line);color:var(--dim);
+.acl-dim{color:var(--dim)}
+.acl-none{padding:12px;border:1px dashed var(--line);border-radius:10px}
+.linkbtn{
+  background:none;border:0;padding:0 2px;color:var(--blue);font-size:inherit;
+  cursor:pointer;text-decoration:underline;text-underline-offset:2px;
 }
-.ftree-tag.lock{border-color:var(--accent);color:var(--accent)}
-/* 階層用實際的線而不是空白字元 —— 縮排量跟深度綁死，不受字型影響 */
-.ftree-row .ftree-indent{
-  flex:none;align-self:stretch;border-left:1px solid var(--line);
+.linkbtn:hover{color:var(--text)}
+/* 危險但次要：不跟「管理授權」同一個視覺權重，但一眼認得出是會出事的那顆 */
+.btn.subtle-danger{background:none;border-color:transparent;color:#ff8f8f;font-weight:600}
+.btn.subtle-danger:hover{background:#2a1618;border-color:#5a2626}
+
+/* ---- 規則卡 ---- */
+.acl-rule{
+  background:var(--bg-2);border:1px solid var(--line);border-radius:12px;
+  padding:12px 14px;margin-bottom:8px;
 }
-.ftree-empty{padding:14px;text-align:center;color:var(--dim);font-size:12.5px}
-/* 規則卡片裡列出這條規則實際涵蓋到的子目錄 */
+.acl-rule.is-dirty{border-color:rgba(245,197,24,.55)}
+.acl-rule-top{display:flex;align-items:flex-start;gap:10px;min-width:0}
+.acl-rule-ico{
+  flex:none;width:28px;height:28px;border-radius:8px;display:grid;place-items:center;
+  background:rgba(245,197,24,.12);color:var(--accent);margin-top:1px;
+}
+.acl-rule-id{flex:1;min-width:0}
+.acl-rule-name{font-weight:700;font-size:14px;overflow-wrap:anywhere}
+.acl-rule-path{
+  display:block;margin-top:1px;font-size:11.5px;color:var(--dim);
+  overflow-wrap:anywhere;background:none;padding:0;
+}
+.acl-who{
+  flex:none;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:99px;
+  background:#173a2c;color:var(--green);white-space:nowrap;
+}
+.acl-who.none{background:#3a2a17;color:#ffb648}
+.acl-rule-line{margin:6px 0 0 38px;font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+.acl-sep{margin:0 6px;color:var(--dim)}
+.acl-note{color:var(--text);font-style:normal}
+.acl-note::before{content:"備註　";color:var(--dim)}
+.acl-warn{
+  margin:8px 0 0 38px;padding:7px 10px;border-radius:8px;font-size:12.5px;
+  background:#241d10;border:1px solid #5a4520;color:#ffcf7d;
+  display:flex;flex-wrap:wrap;gap:2px 10px;align-items:baseline;
+}
+.acl-warn span{color:#c9a868;font-size:12px}
 .acl-covers{
-  margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;
+  margin:8px 0 0 38px;display:flex;flex-wrap:wrap;gap:4px;
+  max-height:160px;overflow-y:auto;
 }
 .acl-covers code{
-  font-size:11px;padding:1px 6px;border-radius:5px;
-  background:var(--bg-2);border:1px solid var(--line);color:var(--muted);
+  font-size:11px;padding:1px 6px;border-radius:5px;overflow-wrap:anywhere;
+  background:var(--panel);border:1px solid var(--line);color:var(--muted);
+}
+.acl-rule-acts{
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end;
+  margin-top:10px;
+}
+.acl-dirty{margin-right:auto;font-size:11.5px;font-weight:800;color:var(--accent)}
+.acl-edit{
+  margin-top:10px;padding-top:10px;border-top:1px solid var(--line);
+}
+.acl-edit-h{font-size:12px;font-weight:800;color:var(--muted);margin:4px 0 6px}
+.acl-edit-h small{font-weight:500;color:var(--dim);margin-left:6px}
+.acl-users{
+  display:flex;flex-wrap:wrap;gap:4px 16px;margin:0 0 10px;
+  padding:8px 11px;border-radius:9px;background:var(--panel);border:1px solid var(--line);
+}
+.acl-users label{
+  display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
+  min-height:36px;cursor:pointer;
+}
+.acl-users input{width:16px;height:16px;accent-color:var(--accent)}
+.acl-users label:hover{color:var(--text)}
+.acl-users input:checked + span{color:var(--text)}
+.acl-admins{font-size:12.5px;color:var(--text);line-height:1.65}
+.acl-admins .acl-dim{font-size:11.5px;margin-top:3px}
+.acl-edit-acts{display:flex;gap:8px;justify-content:flex-end;margin-top:10px;flex-wrap:wrap}
+
+/* ---- 新增限制的表單 ---- */
+.acl-form{display:flex;flex-direction:column;gap:12px;max-width:720px}
+.acl-field{display:flex;flex-direction:column;gap:5px;min-width:0}
+.acl-lbl{font-size:12px;font-weight:700;color:var(--muted);cursor:default}
+.acl-input{
+  width:100%;padding:9px 11px;border-radius:9px;min-height:40px;
+  background:var(--bg-2);border:1px solid var(--line);color:var(--text);outline:none;
+}
+.acl-input:focus{border-color:var(--accent)}
+.acl-form-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.acl-form-foot .acl-dim{flex:1 1 260px;font-size:11.5px;line-height:1.6}
+.acl-form-foot .btn{margin-left:auto}
+
+/* ---- Folder Picker：trigger ---- */
+.folder-pick{position:relative;min-width:0}
+.folder-pick-trigger{
+  display:flex;align-items:center;gap:10px;width:100%;min-height:44px;
+  padding:7px 10px 7px 12px;border-radius:10px;text-align:left;cursor:pointer;
+  background:var(--bg-2);border:1px solid var(--line);color:var(--text);
+  transition:border-color .15s;
+}
+.folder-pick-trigger:hover{border-color:#39415a}
+.folder-pick-trigger:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.folder-pick[data-open="1"] .folder-pick-trigger{border-color:var(--accent)}
+.folder-pick-icon{flex:none;color:var(--accent);display:grid}
+.folder-pick-value{flex:1;min-width:0;display:flex;flex-direction:column}
+/* 主行先給人眼辨識「資料夾名稱」，完整路徑降到次行 —— 只丟一串 /a/b/c 的等寬字，
+   眼睛得先讀過一堆斜線才找到名字 */
+.folder-pick-main{
+  font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.folder-pick-main.is-ph{color:var(--dim)}
+.folder-pick-parent{color:var(--muted)}
+.folder-pick-sub{
+  font-size:11px;color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.folder-pick-caret{flex:none;color:var(--muted);display:grid;transition:transform .15s}
+.folder-pick[data-open="1"] .folder-pick-caret{transform:rotate(180deg);color:var(--accent)}
+
+/* ---- Folder Picker：浮層（桌機） ----
+   浮層是 absolute，不會把 /admin#library 撐高；清單自己捲，頭尾固定。 */
+.folder-pick-backdrop{display:none}
+.folder-pick-pop{
+  position:absolute;top:calc(100% + 6px);left:0;z-index:45;
+  width:max(100%, min(620px, calc(100vw - 48px)));max-width:720px;
+  max-height:min(520px, 70vh);display:flex;flex-direction:column;
+  background:var(--panel);border:1px solid #2f3648;border-radius:12px;
+  box-shadow:0 14px 38px rgba(0,0,0,.55);overflow:hidden;outline:none;
+  animation:fp-in .15s ease-out;
+}
+@keyframes fp-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.fp-head{flex:none;padding:10px 10px 8px;border-bottom:1px solid var(--line)}
+.fp-title{display:none}
+.fp-search-wrap{
+  display:flex;align-items:center;gap:8px;padding:0 10px;border-radius:9px;
+  background:var(--bg-2);border:1px solid var(--line);color:var(--dim);cursor:text;
+}
+.fp-search-wrap:focus-within{border-color:var(--accent);color:var(--accent)}
+.fp-search{
+  flex:1;min-width:0;min-height:38px;border:0;outline:none;background:none;color:var(--text);
+  font-size:13.5px;
+}
+.fp-search::-webkit-search-cancel-button{filter:invert(.6)}
+.fp-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.fp-chip{
+  display:inline-flex;align-items:center;gap:5px;min-height:28px;padding:0 10px;
+  border-radius:99px;font-size:11.5px;font-weight:600;cursor:pointer;
+  background:none;border:1px solid var(--line);color:var(--dim);
+}
+.fp-chip b{font-variant-numeric:tabular-nums;font-weight:800}
+.fp-chip.is-static{cursor:default;border-color:rgba(245,197,24,.45);color:var(--accent);
+  background:rgba(245,197,24,.08)}
+.fp-chip[aria-pressed="true"]{background:var(--panel-2);border-color:#39415a;color:var(--text)}
+.fp-chip:not(.is-static):hover{color:var(--text)}
+.fp-chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.fp-body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:5px;scrollbar-width:thin;
+  overscroll-behavior:contain}
+.fp-msg{padding:12px;text-align:center;color:var(--dim);font-size:12.5px;line-height:1.7}
+.fp-msg b{color:var(--text)}
+.fp-foot{
+  flex:none;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:9px 10px;border-top:1px solid var(--line);background:var(--bg-2);
+}
+.fp-staged{flex:1 1 220px;min-width:0;display:flex;align-items:baseline;gap:8px;font-size:12.5px}
+.fp-staged-k{flex:none;color:var(--dim);font-size:11.5px}
+.fp-staged-v{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.fp-staged-v b{color:var(--text)}
+.fp-staged-v code{margin-left:6px;font-size:11px;color:var(--dim);background:none;padding:0}
+.fp-acts{display:flex;gap:8px;margin-left:auto}
+.fp-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* ---- 資料夾樹 ----
+   真的可以展開／收合的樹，不是「全部攤平 + 縮排線」。
+   一列的視覺權重：名稱 > 狀態 > 數量。數量不是挑資料夾的主要依據，降成小字。 */
+.ftree{display:flex;flex-direction:column;gap:1px}
+.ftree-row{
+  display:flex;align-items:center;gap:6px;min-height:36px;
+  padding:4px 8px 4px calc(4px + var(--lv, 0) * 18px);
+  border-radius:7px;cursor:pointer;color:var(--text);font-size:13px;line-height:1.35;
+  border:1px solid transparent;outline:none;
+}
+.ftree-row:hover{background:var(--panel-2)}
+.ftree-row:focus-visible{border-color:var(--accent)}
+/* 暫選：左邊黃槓 + 淡黃底，跟檔案選擇器的選中列同一套語言 */
+.ftree-row.is-staged{
+  background:rgba(245,197,24,.12);border-color:rgba(245,197,24,.45);
+  box-shadow:inset 3px 0 0 var(--accent);
+}
+.ftree-row.is-staged .ftree-name{color:var(--accent);font-weight:600}
+/* 不能選的列：列出來但灰掉 —— 看得到才知道「為什麼這個不能選」 */
+.ftree-row.is-restricted,.ftree-row.is-covered{color:var(--dim);cursor:default}
+.ftree-row.is-restricted .ftree-name,.ftree-row.is-covered .ftree-name{color:var(--muted)}
+.ftree-twisty{
+  flex:none;width:22px;height:22px;border-radius:6px;display:grid;place-items:center;
+  color:var(--muted);cursor:pointer;
+}
+.ftree-twisty:empty{cursor:inherit}
+.ftree-twisty svg{transform:rotate(-90deg);transition:transform .12s}
+.ftree-row[aria-expanded="true"] > .ftree-twisty svg{transform:none}
+.ftree-twisty[data-toggle]:hover{background:var(--panel);color:var(--text)}
+.ftree-ico{flex:none;display:grid;color:#6f7a93}
+.ftree-row.is-free .ftree-ico{color:#8d9ab5}
+.ftree-row.is-restricted .ftree-ico{color:var(--accent)}
+.ftree-text{flex:1;min-width:0;display:flex;flex-direction:column}
+.ftree-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ftree-name mark{background:rgba(245,197,24,.25);color:inherit;border-radius:3px;padding:0 1px}
+.ftree-ctx{font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ftree-tag{
+  flex:0 1 auto;min-width:0;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-size:10.5px;padding:1px 7px;border-radius:999px;border:1px solid var(--line);color:var(--dim);
+}
+.ftree-tag.lock{flex:none;border-color:rgba(245,197,24,.5);color:var(--accent)}
+.ftree-meta{flex:none;color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+.ftree-meta .short{display:none}
+
+/* ---- 手機：bottom sheet ----
+   窄畫面硬塞桌機的下拉浮層，寬度不夠、高度還會被鍵盤吃掉。
+   --fp-kb / --fp-vh 由 wireFolderPicker 依 visualViewport 算（鍵盤彈出時）。 */
+@media (max-width:768px){
+  .folder-pick-backdrop{
+    display:block;position:fixed;inset:0;z-index:155;background:rgba(0,0,0,.55);
+    animation:fp-fade .15s ease-out;
+  }
+  .folder-pick-backdrop[hidden]{display:none}
+  .folder-pick-pop{
+    position:fixed;left:0;right:0;top:auto;bottom:var(--fp-kb, 0px);z-index:160;
+    width:auto;max-width:none;
+    max-height:min(85dvh, calc(var(--fp-vh, 100dvh) - 24px));
+    border-radius:16px 16px 0 0;border-bottom:0;
+    animation:fp-up .18s ease-out;
+  }
+  .fp-title{
+    display:flex;align-items:center;justify-content:space-between;margin:0 2px 8px;
+    font-size:14px;
+  }
+  .fp-x{
+    width:36px;height:36px;border-radius:9px;display:grid;place-items:center;
+    background:none;border:0;color:var(--muted);font-size:15px;cursor:pointer;
+  }
+  .fp-foot{padding-bottom:calc(10px + env(safe-area-inset-bottom))}
+  .fp-staged{flex:1 1 100%}
+  .fp-acts{width:100%;margin-left:0}
+  .fp-acts .btn{flex:1;min-height:44px}
+  .ftree-row{min-height:44px}
+  .ftree-meta .full{display:none}
+  .ftree-meta .short{display:inline}
+  .ftree-tag{max-width:45%}
+  .acl-rule-line,.acl-warn,.acl-covers{margin-left:0}
+  .acl-rule-acts .btn{min-height:40px}
+  .acl-form-foot .btn{width:100%;min-height:44px}
+}
+@keyframes fp-up{from{opacity:.6;transform:translateY(16px)}to{opacity:1;transform:none}}
+@keyframes fp-fade{from{opacity:0}to{opacity:1}}
+/* sheet 開著時背景不捲 —— 不然在清單裡滑到底會變成捲動後面的頁面 */
+html.fp-lock,html.fp-lock body{overflow:hidden}
+@media (prefers-reduced-motion:reduce){
+  .folder-pick-pop,.folder-pick-backdrop{animation:none}
+  .folder-pick-caret,.ftree-twisty svg{transition:none}
 }
 
 /* ---------------------------------------------------------------- 檔案選擇器

@@ -189,185 +189,726 @@ TABS.overview = async el => {
 /* ---------------------------------------------------------------- 受限資料夾（L） */
 /* 只給特定帳號看的資料夾。三件事刻意這樣做：
  *
- * 1. **從掃到的資料夾清單勾選，不讓人手打路徑。**手打就會拼錯，而拼錯的規則
+ * 1. **從掃到的資料夾清單挑，不讓人手打路徑。**手打就會拼錯，而拼錯的規則
  *    等於沒有保護 —— 畫面上還是會顯示「已設定」，沒有人會發現。
+ *    所以這一區沒有任何可以打路徑的欄位；picker 裡的搜尋框只是篩選，
+ *    打的字永遠不會變成 prefix（送出去的一定是 ac.folders 裡的某一筆）。
  * 2. **密碼登入沒有帳號身分**，所以無法被授權。這句話要印在畫面上，
  *    不然設定的人會以為「我設了但他還是看不到」是壞掉。
  * 3. 授權用 checkbox 一次送出整份名單（PUT grants），不是逐一 add/remove ——
  *    逐一送會有「加了三個、第四個失敗」的半套狀態。
- */
-function aclBlock(ac) {
-  // **管理員不放進勾選清單。**他們看得到受限資料夾是因為「角色」，
-  // 不是因為這裡有一筆授權（acl.can_read 的第一句就是 is_admin）。
-  //
-  // 那為什麼不乾脆在升管理員時順手勾起來？因為降級的時候會出事：
-  // 授權留著 → 他降回一般帳號之後仍然看得到，而畫面上一切正常
-  // （這就是 L 章開頭寫的「安靜的外洩」）；若改成降級時自動刪，
-  // 又會刪掉他升級**之前**本來就有的授權，而那救不回來。
-  // 所以資料維持一種真相（角色歸角色、授權歸授權），改的是畫面：
-  // 把管理員另外列出來，不要讓四個沒勾的框看起來像「四個人都看不到」。
-  const admins = ac.users.filter(u => u.is_admin);
-  const viewers = ac.users.filter(u => !u.is_admin);
-  const adminNames = admins.map(u => esc(u.name)).join('、');
-  const adminTail = admins.length
-    ? ` <span style="color:var(--dim)">＋ 全部管理員（${admins.length} 人）</span>` : '';
+ *
+ * 版面的原則是「平常只看結果」：規則是摘要卡，資料夾樹只在挑的時候出現，
+ * checkbox 只在按「管理授權」之後出現。原本三樣東西全部永遠攤開，
+ * 一條規則就佔半個螢幕，而 320px 高的資料夾清單大部分時間根本沒人在用。
+ *
+ * 資料夾清單以前是 <select>，後來改自訂元件，理由到現在都還成立：
+ * option 在 Chrome/Safari 套不了深色樣式、表達不了階層、也標不出
+ * 「已受限／被涵蓋」；篩選靠的 option.hidden 只有 Firefox 認 ——
+ * Chrome／Safari 完全忽略，篩選看起來是壞的（打字沒反應）。 */
 
-  const rules = ac.rules.map(r => `
-    <div class="rowcard acl-rule" data-rule="${r.id}">
-      <div class="top"><b><code>${esc(r.prefix)}</code></b>
-        <button class="btn" data-aclrm="${r.id}">移除限制</button></div>
-      <dl><dt>備註</dt><dd>${esc(r.note || '—')}</dd>
-        <dt>看得到的人</dt><dd>${r.user_names.length
-          ? r.user_names.map(n => esc(n)).join('、') + adminTail
-          : '<span style="color:#ffaeae">目前沒有人</span>' + adminTail}</dd>
-        <dt>涵蓋範圍</dt><dd>${(() => {
-          // 子資料夾是「自動跟著受限」的 —— 那句話寫在說明裡，但沒有人
-          // 會去數到底跟了幾個。列出來才知道這條規則的實際影響有多大。
-          const kids = ac.folders.filter(f => f.covered_by === r.prefix);
-          if (!kids.length) return '<span style="color:var(--dim)">底下沒有子資料夾</span>';
-          const show = kids.slice(0, 12);
-          return `<span style="color:var(--dim)">連同底下 ${kids.length} 個子資料夾</span>
-            <div class="acl-covers">${show.map(f =>
-              `<code title="${esc(f.folder)}">${esc(f.folder.split('/').filter(Boolean).pop())}</code>`
-            ).join('')}${kids.length > show.length
-              ? `<code>…另外 ${kids.length - show.length} 個</code>` : ''}</div>`;
-        })()}</dd></dl>
-      <div class="acl-users">
-        ${viewers.length ? viewers.map(u => `
-          <label><input type="checkbox" data-aclu="${u.id}"
-            ${r.user_ids.includes(u.id) ? 'checked' : ''}>
-            <span>${esc(u.name)}</span></label>`).join('')
-          : '<span style="color:var(--dim)">沒有可以授權的一般帳號。</span>'}
-      </div>
-      ${admins.length ? `<div style="font-size:11.5px;color:var(--dim);margin-top:6px">
-        管理員一律看得到，不需要（也不能）在這裡勾選：${adminNames}
-        ${(() => {
-          // 先被授權、後來升管理員的人：那筆授權還在，而且降級後仍然有效。
-          // 不講出來的話它就是一個看不見的狀態。
-          const kept = admins.filter(u => r.user_ids.includes(u.id));
-          return kept.length
-            ? `<br>其中 ${kept.map(u => esc(u.name)).join('、')} 另外保有授權，降為一般帳號後仍看得到。`
-            : '';
-        })()}</div>` : ''}
-      <div class="acts"><button class="btn primary" data-aclsave="${r.id}">儲存授權</button></div>
-    </div>`).join('');
+/* ---- 資料夾樹：純函式 ----
+   tests/acl_picker_test.js 會把 @@folder-tree-begin 到 @@folder-tree-end 之間
+   這一段原封不動載進 node 跑 —— 所以這裡**不能碰 DOM**，也不能用到這段以外
+   的東西。資料處理跟點擊處理拆開，才測得到「搜尋會不會改掉展開狀態」這種事。 */
+// @@folder-tree-begin
+const segsOf = p => String(p || '').split('/').filter(Boolean);
+const leafOf = p => { const s = segsOf(p); return s.length ? s[s.length - 1] : '/'; };
 
-  // **全部列出來，不能選的也列** —— 原本只列可選的，於是「我明明有這個資料夾，
-  // 為什麼清單裡找不到」變成一個沒有答案的問題。標成灰色並寫明原因（已受限／
-  // 被上層涵蓋）比讓它消失有用。
-  const free = ac.folders.filter(f => !f.restricted && !f.covered_by);
-  const row = f => {
-    const off = f.restricted || f.covered_by;
-    const bits = [f.videos && `影片 ${f.videos}`, f.photos && `相片 ${f.photos}`,
-                  f.documents && `文件 ${f.documents}`].filter(Boolean).join('　');
-    // 只顯示最後一段，父層靠縮排線表達 —— 完整路徑在 title 裡，
-    // 深層目錄的完整路徑很長，列出來會把數量擠掉。
-    const leaf = f.folder === '/' ? '/' : f.folder.split('/').filter(Boolean).pop();
-    const tag = f.restricted ? '<span class="ftree-tag lock">已受限</span>'
-      : f.covered_by ? `<span class="ftree-tag">在 ${esc(f.covered_by)} 底下</span>` : '';
-    const indent = Array.from({ length: Math.max(0, f.depth - 1) },
-      () => '<span class="ftree-indent" style="width:11px"></span>').join('');
-    return `<button type="button" class="ftree-row${off ? ' is-off' : ''}"
-      data-folder="${esc(f.folder)}" data-path="${esc(f.folder.toLowerCase())}"
-      title="${esc(f.folder)}"${off ? ' disabled' : ''}>
-      ${indent}<span class="ftree-name">${esc(leaf)}</span>
-      ${tag}<span class="ftree-meta">${bits}</span></button>`;
+/** 已受限優先於被涵蓋：巢狀規則（舊資料）兩個都成立，但「它自己就是一條規則」
+ *  才是使用者要知道的那件事。 */
+function folderState(f) {
+  return f.restricted ? 'restricted' : f.covered_by ? 'covered' : 'free';
+}
+
+function folderStats(folders) {
+  const c = { free: 0, restricted: 0, covered: 0 };
+  for (const f of folders || []) c[folderState(f)]++;
+  return c;
+}
+
+/** ac.folders（依路徑排好的平面清單）→ 樹。
+ *
+ *  父子關係在這裡一次算好，不要在 DOM 裡靠 path 去猜。
+ *  **父層找「清單裡最近的祖先」，不是直屬父層**：folder_counts 只回前 4 層，
+ *  但已受限的資料夾不管幾層都會回 —— 第 6 層的規則，它第 5 層的父層不在清單裡，
+ *  只找直屬父層的話它會變成孤兒掉到最上層，看起來像一個頂層資料夾。 */
+function buildFolderTree(folders) {
+  const byPath = new Map();
+  for (const f of folders || []) {
+    if (!f || !f.folder || byPath.has(f.folder)) continue;
+    byPath.set(f.folder, {
+      folder: f.folder, name: leafOf(f.folder), depth: 0, parent: null, children: [],
+      restricted: !!f.restricted, covered_by: f.covered_by || null, state: folderState(f),
+      videos: f.videos || 0, photos: f.photos || 0, documents: f.documents || 0,
+      dupName: false,
+    });
+  }
+  const roots = [];
+  for (const n of byPath.values()) {
+    const s = segsOf(n.folder);
+    let p = null, i = s.length - 1;
+    for (; i > 0 && !p; i--) p = byPath.get('/' + s.slice(0, i).join('/')) || null;
+    n.parent = p;
+    // 跳層的節點名稱要帶著中間那幾段（d/e、Deep/a/b/c），只寫 leaf 會丟掉脈絡
+    n.name = s.slice(p ? i + 1 : 0).join('/') || '/';
+    (p ? p.children : roots).push(n);
+  }
+  const cmp = (a, b) => a.name.localeCompare(b.name, 'zh-Hant', { numeric: true, sensitivity: 'base' });
+  const walk = (list, d) => { list.sort(cmp); for (const n of list) { n.depth = d; walk(n.children, d + 1); } };
+  walk(roots, 0);
+  // 同名資料夾（/Movies/2024 與 /HomeVideo/2024）：列表上只寫「2024」兩次等於沒寫，
+  // 標出來讓畫面多給一行上層脈絡。
+  const seen = new Map();
+  for (const n of byPath.values()) {
+    const k = n.name.toLowerCase();
+    seen.set(k, (seen.get(k) || 0) + 1);
+  }
+  for (const n of byPath.values()) n.dupName = seen.get(n.name.toLowerCase()) > 1;
+  return { roots, byPath };
+}
+
+/** 「HBO / Westworld」—— 最後兩層。同名消歧義與 trigger 的主行都用這個。 */
+const folderContext = p => segsOf(p).slice(-2).join(' / ') || '/';
+
+/** 數量只在有值時出現。長版給桌機，短版（合計）給手機。 */
+function folderCountText(n) {
+  const full = [n.videos && `影片 ${n.videos}`, n.photos && `相片 ${n.photos}`,
+                n.documents && `文件 ${n.documents}`].filter(Boolean).join(' · ');
+  const total = (n.videos || 0) + (n.photos || 0) + (n.documents || 0);
+  return { full, short: total ? `${total} 個項目` : '' };
+}
+
+/** 現在畫面上該出現哪幾列（依顯示順序）。
+ *
+ *  - 沒有搜尋：從最上層開始，只往 expanded 裡有的節點展開。
+ *  - 有搜尋：比對**完整路徑**（打 west 找得到 /HBO/Westworld，打 HBO 也找得到它
+ *    底下的東西），命中的列與它的祖先都留著、祖先自動展開 ——
+ *    只顯示命中的那一列，縮排就沒有參照物，看起來像浮在半空。
+ *    **搜尋不寫回 expanded**：清掉搜尋就回到搜尋前的樣子。搜尋中手動收合的
+ *    節點記在另一個 collapsed 裡，換一個關鍵字就作廢。
+ *  - show 控制已受限／被涵蓋要不要出現。可選的永遠出現。被過濾掉的命中數
+ *    另外回傳（hiddenHits）—— 「找不到」跟「被藏起來」要分得出來，不然管理員
+ *    會以為那個資料夾不存在。 */
+function visibleFolderRows(tree, { expanded, query = '', show = {}, collapsed = null }) {
+  const q = String(query || '').trim().toLowerCase();
+  const allowed = n => n.state === 'free' || !!show[n.state];
+  const rows = [];
+  if (!q) {
+    const walk = list => {
+      for (const n of list) {
+        if (!allowed(n)) continue;
+        const kids = n.children.filter(allowed);
+        const open = kids.length > 0 && expanded.has(n.folder);
+        rows.push({ node: n, level: n.depth, hasKids: kids.length > 0, open, hit: false });
+        if (open) walk(kids);
+      }
+    };
+    walk(tree.roots);
+    return { rows, hits: 0, hiddenHits: 0 };
+  }
+  const keep = new Set(), matched = new Set();
+  let hiddenHits = 0;
+  for (const n of tree.byPath.values()) {
+    if (!n.folder.toLowerCase().includes(q)) continue;
+    if (!allowed(n)) { hiddenHits++; continue; }
+    matched.add(n);
+    for (let p = n; p; p = p.parent) keep.add(p);   // 祖先一定留著（當作脈絡）
+  }
+  const walk = list => {
+    for (const n of list) {
+      if (!keep.has(n)) continue;
+      const kids = n.children.filter(k => keep.has(k));
+      const open = kids.length > 0 && !(collapsed && collapsed.has(n.folder));
+      rows.push({ node: n, level: n.depth, hasKids: kids.length > 0, open, hit: matched.has(n) });
+      if (open) walk(kids);
+    }
   };
+  walk(tree.roots);
+  return { rows, hits: matched.size, hiddenHits };
+}
+
+/** 名稱裡要標亮的那一段（[start, end)）。命中在祖先段時名稱裡沒有，回 null。 */
+function hitRange(name, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return null;
+  const i = String(name).toLowerCase().indexOf(q);
+  return i < 0 ? null : [i, i + q.length];
+}
+
+/** PUT grants 要送的完整名單。
+ *
+ *  **管理員原本就有的授權要原封帶回去。**這個端點是「整份取代」，
+ *  而管理員不在勾選清單裡 —— 不帶的話，一個「先被授權、後來升管理員」的人
+ *  會在別人按一次儲存時被安靜地收回授權，然後在他降級的那天才發現。 */
+function grantPayload(rule, users, checkedIds) {
+  const adminIds = new Set((users || []).filter(u => u.is_admin).map(u => u.id));
+  const keep = ((rule && rule.user_ids) || []).filter(i => adminIds.has(i));
+  return [...new Set([...(checkedIds || []), ...keep])];
+}
+
+/** 規則卡的摘要。只算「現在真的看得到的一般帳號」：管理員靠角色，
+ *  不算在「N 人可看」裡（不然授權了零個人的規則會顯示「2 人可看」）。 */
+function aclRuleSummary(rule, users, folders) {
+  const admins = (users || []).filter(u => u.is_admin);
+  const granted = new Set(rule.user_ids || []);
+  const viewers = (users || []).filter(u => !u.is_admin && granted.has(u.id)).map(u => u.name);
+  const preview = viewers.length <= 2 ? viewers.join('、')
+    : viewers.slice(0, 2).join('、') + ` +${viewers.length - 2}`;
+  const base = rule.prefix.replace(/\/+$/, '') + '/';
+  const kids = (folders || []).filter(f => f.covered_by === rule.prefix)
+    .map(f => f.folder.startsWith(base) ? f.folder.slice(base.length) : f.folder);
+  return {
+    name: leafOf(rule.prefix), viewers: viewers.length, preview,
+    admins: admins.length, keptAdmins: admins.filter(u => granted.has(u.id)).map(u => u.name),
+    kids,
+  };
+}
+// @@folder-tree-end
+
+const ICON = {
+  folder: '<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.6c.4 0 .8.16 1.06.44L9.9 5.7c.1.1.23.16.36.16H16a1.5 1.5 0 0 1 1.5 1.5v7.14A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/></svg>',
+  lock: '<svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M6 8V6.5a4 4 0 1 1 8 0V8h.5A1.5 1.5 0 0 1 16 9.5v6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 4 15.5v-6A1.5 1.5 0 0 1 5.5 8zm1.8 0h4.4V6.5a2.2 2.2 0 1 0-4.4 0z"/></svg>',
+  caret: '<svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M5.3 7.3a1 1 0 0 1 1.4 0L10 10.6l3.3-3.3a1 1 0 1 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 0-1.4z"/></svg>',
+  search: '<svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M8.5 3a5.5 5.5 0 0 1 4.38 8.83l3.4 3.4a1 1 0 0 1-1.42 1.41l-3.39-3.4A5.5 5.5 0 1 1 8.5 3m0 2a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7"/></svg>',
+};
+
+/* ---- Folder Picker ----
+   關著的時候只是一顆按鈕，點了才長出浮層（手機是 bottom sheet）。
+   **選擇與套用是兩步**：樹裡點一列只是「暫選」，按浮層的「選擇」才帶回表單，
+   真正建立規則還要再按「加入限制」並通過 confirmBox。點一下就生效的話，
+   手滑點錯一列就是一條錯的規則。 */
+function folderPickerHTML({ id, stats, labelId }) {
   return `
-    <div class="box">
-      <div style="font-size:12.5px;color:var(--muted);line-height:1.7">
-        <b>沒被列在這裡的資料夾，所有登入者都看得到。</b>
-        列進來的只有被授權的帳號與管理員看得到，子資料夾自動跟著受限。<br>
-        <b>勾選的意思是「即使不是管理員也看得到」</b> ——
-        所以管理員不在勾選清單裡，而一個人從管理員降成一般帳號之後，
-        沒被勾到的受限資料夾他就看不到了。要讓他降級後仍然看得到，
-        趁現在先勾起來。<br>
-        ${esc(ac.password_login_note)}
+  <div class="folder-pick" id="${esc(id)}">
+    <button type="button" class="folder-pick-trigger" id="${esc(id)}-btn"
+            aria-haspopup="dialog" aria-expanded="false" aria-controls="${esc(id)}-pop"
+            aria-labelledby="${esc(labelId)} ${esc(id)}-val">
+      <span class="folder-pick-icon">${ICON.folder}</span>
+      <span class="folder-pick-value" id="${esc(id)}-val">
+        <span class="folder-pick-main is-ph">選擇要限制的資料夾</span></span>
+      <span class="folder-pick-caret">${ICON.caret}</span>
+    </button>
+    <div class="folder-pick-backdrop" hidden></div>
+    <div class="folder-pick-pop" id="${esc(id)}-pop" role="dialog" tabindex="-1"
+         aria-label="選擇要限制的資料夾" hidden>
+      <div class="fp-head">
+        <div class="fp-title"><b>選擇資料夾</b>
+          <button type="button" class="fp-x" data-fp-cancel aria-label="關閉">✕</button></div>
+        <label class="fp-search-wrap">${ICON.search}
+          <input class="fp-search" id="${esc(id)}-q" type="search" autocomplete="off"
+                 spellcheck="false" placeholder="搜尋資料夾…" aria-label="搜尋資料夾（比對完整路徑）"
+                 aria-controls="${esc(id)}-tree"></label>
+        <div class="fp-chips" role="group" aria-label="要顯示哪些資料夾">
+          <span class="fp-chip is-static" title="可以設為受限的資料夾">可選 <b>${stats.free}</b></span>
+          <button type="button" class="fp-chip" data-show="restricted" aria-pressed="true"
+                  title="已經是一條規則，不能重複建立">${ICON.lock} 已受限 <b>${stats.restricted}</b></button>
+          <button type="button" class="fp-chip" data-show="covered" aria-pressed="false"
+                  title="在某個受限資料夾底下，已經自動跟著受限">被涵蓋 <b>${stats.covered}</b></button>
+        </div>
       </div>
-      ${rules || '<div class="empty" style="margin-top:10px">目前沒有受限資料夾。</div>'}
-      <div style="margin-top:14px">
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">
-          從掃到的資料夾裡挑一個加入限制（數量已經把子資料夾累加進來）：</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <input id="aclFilter" placeholder="篩選資料夾…" style="flex:1;min-width:160px">
-          <input id="aclNote" placeholder="備註（選填）" style="flex:1;min-width:140px">
+      <div class="fp-body">
+        <div class="ftree" id="${esc(id)}-tree" role="tree" aria-label="資料夾"></div>
+        <div class="fp-msg" hidden></div>
+      </div>
+      <div class="fp-foot">
+        <div class="fp-staged" aria-live="polite"></div>
+        <div class="fp-acts">
+          <button type="button" class="btn" data-fp-cancel>取消</button>
+          <button type="button" class="btn primary" data-fp-ok disabled>選擇</button>
         </div>
-        <div class="ftree" id="aclTree">
-          ${ac.folders.length ? ac.folders.map(row).join('')
-            : '<div class="ftree-empty">還沒有掃到任何資料夾。</div>'}
-          <div class="ftree-empty" id="aclNoHit" hidden>沒有符合的資料夾。</div>
+      </div>
+      <div class="fp-live" role="status" aria-live="polite"></div>
+    </div>
+  </div>`;
+}
+
+/** 接線。回傳 { get, open, close }；get() 回已確認的路徑（沒選是 ''）。 */
+function wireFolderPicker(el, { id, tree, onChange = null }) {
+  const root = el.querySelector('#' + id);
+  if (!root) return { get: () => '', open() {}, close() {} };
+  const trig = root.querySelector('.folder-pick-trigger');
+  const val = root.querySelector('.folder-pick-value');
+  const pop = root.querySelector('.folder-pick-pop');
+  const back = root.querySelector('.folder-pick-backdrop');
+  const q = root.querySelector('.fp-search');
+  const treeEl = root.querySelector('.ftree');
+  const msg = root.querySelector('.fp-msg');
+  const stagedEl = root.querySelector('.fp-staged');
+  const okBtn = root.querySelector('[data-fp-ok]');
+  const live = root.querySelector('.fp-live');
+  const mq = window.matchMedia ? window.matchMedia('(max-width:768px)') : { matches: false };
+  const free = [...tree.byPath.values()].filter(n => n.state === 'free').length;
+
+  const expanded = new Set();          // 使用者展開的（搜尋不會動它）
+  let collapsed = new Set();           // 搜尋中手動收合的（換關鍵字就作廢）
+  let lastQ = '';
+  const show = { restricted: true, covered: false };
+  let chosen = null;                   // 已確認（帶回表單的）
+  let staged = null;                   // 浮層裡暫選的
+  let active = null;                   // 鍵盤游標（roving tabindex）
+  let rows = [];
+  let isOpen = false;
+
+  const say = t => { live.textContent = ''; live.textContent = t; };
+  const stateText = n => n.state === 'restricted' ? '已受限，不能重複建立'
+    : n.state === 'covered' ? `在 ${n.covered_by} 底下，已經跟著受限` : '';
+
+  const rowHTML = (r, i, pos, size) => {
+    const n = r.node;
+    const hr = hitRange(n.name, q.value);
+    const name = hr ? esc(n.name.slice(0, hr[0])) + '<mark>' + esc(n.name.slice(hr[0], hr[1]))
+      + '</mark>' + esc(n.name.slice(hr[1])) : esc(n.name);
+    const cnt = folderCountText(n);
+    const off = n.state !== 'free';
+    // 同名，或搜尋中（祖先可能被收合）→ 補一行上層脈絡
+    const ctx = (n.dupName || (r.hit && n.depth > 0)) && n.depth > 0 ? folderContext(n.folder) : '';
+    const label = [n.folder, stateText(n), cnt.full].filter(Boolean).join('，');
+    return `<div class="ftree-row is-${n.state}${n.folder === (staged && staged.folder) ? ' is-staged' : ''}"
+        role="treeitem" id="${esc(id)}-r${i}" data-i="${i}" data-folder="${esc(n.folder)}"
+        tabindex="${n.folder === active ? 0 : -1}" aria-level="${n.depth + 1}"
+        aria-setsize="${size}" aria-posinset="${pos}"
+        ${r.hasKids ? `aria-expanded="${r.open}"` : ''}
+        aria-selected="${n.folder === (staged && staged.folder)}"${off ? ' aria-disabled="true"' : ''}
+        aria-label="${esc(label)}" title="${esc(n.folder)}" style="--lv:${n.depth}">
+      <span class="ftree-twisty"${r.hasKids ? ' data-toggle' : ''}>${r.hasKids ? ICON.caret : ''}</span>
+      <span class="ftree-ico">${off ? ICON.lock : ICON.folder}</span>
+      <span class="ftree-text"><span class="ftree-name">${name}</span>${
+        ctx ? `<span class="ftree-ctx">${esc(ctx)}</span>` : ''}</span>
+      ${n.state === 'restricted' ? '<span class="ftree-tag lock">已受限</span>'
+        : n.state === 'covered' ? `<span class="ftree-tag" title="${esc(n.covered_by)}">被 ${
+          esc(n.covered_by)} 涵蓋</span>` : ''}
+      ${cnt.full ? `<span class="ftree-meta"><span class="full">${esc(cnt.full)}</span><span class="short">${
+        esc(cnt.short)}</span></span>` : ''}
+    </div>`;
+  };
+
+  const rowEl = folder => {
+    const i = rows.findIndex(r => r.node.folder === folder);
+    return i < 0 ? null : treeEl.querySelector('#' + id + '-r' + i);
+  };
+  const focusRow = folder => {
+    const r = rowEl(folder);
+    if (!r) return;
+    treeEl.querySelectorAll('[role=treeitem][tabindex="0"]').forEach(x => x.tabIndex = -1);
+    r.tabIndex = 0;
+    r.focus({ preventScroll: true });
+    r.scrollIntoView({ block: 'nearest' });
+  };
+
+  const render = () => {
+    const nq = q.value.trim().toLowerCase();
+    if (nq !== lastQ) { lastQ = nq; collapsed = new Set(); }
+    const v = visibleFolderRows(tree, { expanded, query: q.value, show, collapsed });
+    rows = v.rows;
+    if (!rows.some(r => r.node.folder === active)) {
+      const s = staged && rows.find(r => r.node.folder === staged.folder);
+      active = s ? s.node.folder : rows.length ? rows[0].node.folder : null;
+    }
+    const hadFocus = treeEl.contains(document.activeElement);
+    // aria-setsize/posinset 以「畫面上同一個父層底下」為一組
+    const groups = new Map();
+    rows.forEach(r => {
+      const k = r.node.parent ? r.node.parent.folder : '';
+      groups.set(k, (groups.get(k) || 0) + 1);
+    });
+    const seen = new Map();
+    treeEl.innerHTML = rows.map((r, i) => {
+      const k = r.node.parent ? r.node.parent.folder : '';
+      seen.set(k, (seen.get(k) || 0) + 1);
+      return rowHTML(r, i, seen.get(k), groups.get(k));
+    }).join('');
+    const hiddenNote = v.hiddenHits ? `<div>另有 ${v.hiddenHits} 個符合的資料夾已受限或被涵蓋，目前沒顯示。
+      <button type="button" class="linkbtn" data-fp-showall>全部顯示</button></div>` : '';
+    if (!tree.byPath.size) {
+      msg.innerHTML = '還沒有掃到任何資料夾。';
+    } else if (lastQ && !rows.length) {
+      msg.innerHTML = `沒有符合「<b>${esc(q.value.trim())}</b>」的資料夾。${hiddenNote}`;
+    } else {
+      msg.innerHTML = hiddenNote;
+    }
+    msg.hidden = !msg.innerHTML;
+    if (lastQ) say(`找到 ${v.hits} 個資料夾`);
+    if (hadFocus) focusRow(active);
+  };
+
+  const paintFoot = () => {
+    okBtn.disabled = !staged;
+    stagedEl.innerHTML = staged
+      ? `<span class="fp-staged-k">已選</span><span class="fp-staged-v"><b>${esc(staged.name)}</b>
+         <code>${esc(staged.folder)}</code></span>`
+      : `<span class="fp-staged-k">尚未選擇</span><span class="fp-staged-v">可選 ${free} 個</span>`;
+  };
+
+  const paintTrigger = () => {
+    if (!chosen) {
+      val.innerHTML = '<span class="folder-pick-main is-ph">選擇要限制的資料夾</span>';
+      trig.removeAttribute('title');
+      return;
+    }
+    const parent = segsOf(chosen.folder).slice(-2, -1)[0];
+    val.innerHTML = `<span class="folder-pick-main">${parent
+      ? `<span class="folder-pick-parent">${esc(parent)} / </span>` : ''}<b>${esc(chosen.name)}</b></span>
+      <span class="folder-pick-sub">${esc(chosen.folder)}</span>`;
+    trig.title = chosen.folder;
+  };
+
+  const stage = n => {
+    staged = n;
+    paintFoot();
+    render();
+    say(`已暫選 ${n.folder}。按「選擇」帶回表單`);
+  };
+
+  const toggle = r => {
+    const set = lastQ ? collapsed : expanded;
+    // 搜尋中 collapsed 記的是「收起來的」；平常 expanded 記的是「展開的」
+    const nowOpen = !r.open;
+    if (lastQ) nowOpen ? set.delete(r.node.folder) : set.add(r.node.folder);
+    else nowOpen ? set.add(r.node.folder) : set.delete(r.node.folder);
+    render();
+  };
+
+  // 手機鍵盤彈出來時 visualViewport 會縮，fixed 的 sheet 不會自己跟著 ——
+  // 不處理的話 sheet 的下半（正是「選擇」那顆鈕）被鍵盤蓋住。
+  const vv = window.visualViewport;
+  const fitViewport = () => {
+    if (!vv) return;
+    const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    pop.style.setProperty('--fp-kb', kb + 'px');
+    pop.style.setProperty('--fp-vh', vv.height + 'px');
+  };
+
+  const outside = e => { if (!root.contains(e.target)) close(false); };
+
+  const open = () => {
+    if (isOpen) return;
+    isOpen = true;
+    staged = chosen;
+    if (chosen) for (let p = chosen.parent; p; p = p.parent) expanded.add(p.folder);
+    active = chosen ? chosen.folder : null;
+    q.value = '';
+    lastQ = '';
+    pop.hidden = false;
+    back.hidden = false;
+    root.dataset.open = '1';
+    trig.setAttribute('aria-expanded', 'true');
+    const sheet = mq.matches;
+    pop.setAttribute('aria-modal', sheet ? 'true' : 'false');
+    render();
+    paintFoot();
+    if (sheet) {
+      document.documentElement.classList.add('fp-lock');
+      if (vv) { fitViewport(); vv.addEventListener('resize', fitViewport); vv.addEventListener('scroll', fitViewport); }
+      // 不自動聚焦搜尋框：手機一聚焦就彈鍵盤，半個 sheet 被蓋掉，而多數時候只是要點一下
+      pop.focus({ preventScroll: true });
+    } else {
+      q.focus({ preventScroll: true });
+      pop.scrollIntoView({ block: 'nearest' });
+    }
+    const s = staged && rowEl(staged.folder);
+    if (s) s.scrollIntoView({ block: 'nearest' });
+    document.addEventListener('pointerdown', outside, true);
+  };
+
+  /** 關掉 = 取消暫選。已確認的 chosen 不動 —— Escape 的意思是「不挑了」，
+   *  不是「我不要剛才選好的那個」。 */
+  function close(restoreFocus = true) {
+    if (!isOpen) return;
+    isOpen = false;
+    staged = null;
+    pop.hidden = true;
+    back.hidden = true;
+    root.dataset.open = '0';
+    trig.setAttribute('aria-expanded', 'false');
+    document.documentElement.classList.remove('fp-lock');
+    if (vv) { vv.removeEventListener('resize', fitViewport); vv.removeEventListener('scroll', fitViewport); }
+    document.removeEventListener('pointerdown', outside, true);
+    if (restoreFocus) trig.focus({ preventScroll: true });
+  }
+
+  const confirm = () => {
+    if (!staged || staged.state !== 'free') return;
+    chosen = staged;
+    paintTrigger();
+    close(true);
+    if (onChange) onChange(chosen.folder);
+  };
+
+  trig.onclick = () => (isOpen ? close(true) : open());
+  trig.onkeydown = e => { if (e.key === 'ArrowDown') { e.preventDefault(); open(); } };
+  back.onclick = () => close(true);
+  root.querySelectorAll('[data-fp-cancel]').forEach(b => b.onclick = () => close(true));
+  okBtn.onclick = confirm;
+
+  root.querySelectorAll('[data-show]').forEach(b => b.onclick = () => {
+    const k = b.dataset.show;
+    show[k] = !show[k];
+    b.setAttribute('aria-pressed', String(show[k]));
+    render();
+  });
+  msg.onclick = e => {
+    if (!e.target.closest('[data-fp-showall]')) return;
+    show.restricted = show.covered = true;
+    root.querySelectorAll('[data-show]').forEach(b => b.setAttribute('aria-pressed', 'true'));
+    render();
+  };
+
+  q.oninput = render;
+  q.onkeydown = e => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter') {
+      e.preventDefault();
+      if (rows.length) focusRow(active || rows[0].node.folder);
+    }
+  };
+
+  // Escape：搜尋框裡有字 → 先清字；否則關浮層。攔在浮層層級，
+  // 焦點在樹裡、在 chip 上、在按鈕上都一樣。
+  pop.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (document.activeElement === q && q.value) { q.value = ''; render(); }
+    else close(true);
+  });
+  // Tab 出浮層 = 不挑了
+  root.addEventListener('focusout', e => {
+    if (isOpen && e.relatedTarget && !root.contains(e.relatedTarget)) close(false);
+  });
+
+  treeEl.onclick = e => {
+    const rowN = e.target.closest('[role=treeitem]');
+    if (!rowN) return;
+    const r = rows[+rowN.dataset.i];
+    active = r.node.folder;
+    if (e.target.closest('[data-toggle]')) return toggle(r);
+    if (r.node.state === 'free') return stage(r.node);
+    // 不能選的列：有子資料夾就當作展開／收合，沒有就只說明原因
+    if (r.hasKids) return toggle(r);
+    say(stateText(r.node));
+    render();
+  };
+  treeEl.ondblclick = e => {
+    const rowN = e.target.closest('[role=treeitem]');
+    if (rowN && !e.target.closest('[data-toggle]') && staged
+        && staged.folder === rowN.dataset.folder) confirm();
+  };
+
+  treeEl.onkeydown = e => {
+    const i = rows.findIndex(r => r.node.folder === active);
+    if (i < 0) return;
+    const r = rows[i];
+    const go = j => { if (rows[j]) { active = rows[j].node.folder; focusRow(active); } };
+    switch (e.key) {
+      case 'ArrowDown': go(i + 1); break;
+      case 'ArrowUp': if (i === 0) q.focus(); else go(i - 1); break;
+      case 'Home': go(0); break;
+      case 'End': go(rows.length - 1); break;
+      case 'ArrowRight':
+        if (r.hasKids && !r.open) toggle(r);
+        else if (r.open) go(i + 1);
+        break;
+      case 'ArrowLeft':
+        if (r.open) toggle(r);
+        else if (r.node.parent && rows.some(x => x.node === r.node.parent)) {
+          active = r.node.parent.folder; focusRow(active);
+        }
+        break;
+      case 'Enter': case ' ':
+        if (r.node.state !== 'free') { if (r.hasKids) toggle(r); else say(stateText(r.node)); break; }
+        // 已暫選的那一列再按一次 Enter = 確認，鍵盤不用再 Tab 到「選擇」
+        if (e.key === 'Enter' && staged && staged.folder === r.node.folder) confirm();
+        else stage(r.node);
+        break;
+      default: return;
+    }
+    e.preventDefault();
+  };
+
+  paintTrigger();
+  return { get: () => (chosen ? chosen.folder : ''), open, close };
+}
+
+/* ---- 規則卡 ----
+   平常只有摘要：哪個資料夾、幾個人看得到、涵蓋多少子資料夾。
+   checkbox 收在「管理授權」後面 —— 那是要修改時才需要的東西。 */
+function aclRuleCard(r, ac) {
+  const s = aclRuleSummary(r, ac.users, ac.folders);
+  const viewers = ac.users.filter(u => !u.is_admin);
+  const admins = ac.users.filter(u => u.is_admin);
+  const rid = esc(r.id);
+  const who = s.viewers
+    ? `<div class="acl-rule-line"><span class="acl-who-names">${esc(s.preview)}</span>${
+        s.admins ? `<span class="acl-sep">·</span><span class="acl-dim">另有管理員 ${s.admins} 人</span>` : ''}</div>`
+    // **沒人被授權要一眼看得到。**剛建好的規則就是這個狀態，而它的意思是
+    // 「除了管理員誰都看不到」—— 那通常不是設定的人想要的結果。
+    : `<div class="acl-warn" role="note"><b>⚠ 尚未授權任何一般帳號</b>
+         <span>管理員仍可存取${s.admins ? `（${s.admins} 人）` : ''}</span></div>`;
+  return `
+  <div class="acl-rule${s.viewers ? '' : ' is-empty'}" data-rule="${rid}">
+    <div class="acl-rule-top">
+      <span class="acl-rule-ico">${ICON.lock}</span>
+      <div class="acl-rule-id">
+        <div class="acl-rule-name">${esc(s.name)}</div>
+        <code class="acl-rule-path" title="${esc(r.prefix)}">${esc(r.prefix)}</code>
+      </div>
+      <span class="acl-who${s.viewers ? '' : ' none'}">${s.viewers ? `${s.viewers} 人可看` : '0 人可看'}</span>
+    </div>
+    ${who}
+    ${r.note ? `<div class="acl-rule-line acl-note">${esc(r.note)}</div>` : ''}
+    <div class="acl-rule-line acl-dim">${s.kids.length
+      ? `涵蓋 ${s.kids.length} 個子資料夾
+         <button type="button" class="linkbtn" data-aclcovers aria-expanded="false"
+                 aria-controls="aclCov-${rid}">查看</button>`
+      : '底下沒有子資料夾'}</div>
+    ${s.kids.length ? `<div class="acl-covers" id="aclCov-${rid}" hidden>${s.kids.map(k =>
+      `<code title="${esc(r.prefix.replace(/\/+$/, '') + '/' + k)}">${esc(k)}</code>`).join('')}</div>` : ''}
+    <div class="acl-rule-acts">
+      <span class="acl-dirty" hidden>● 尚未儲存</span>
+      <button type="button" class="btn" data-acledit aria-expanded="false"
+              aria-controls="aclEdit-${rid}">管理授權</button>
+      <button type="button" class="btn subtle-danger" data-aclrm="${rid}">移除限制</button>
+    </div>
+    <div class="acl-edit" id="aclEdit-${rid}" hidden>
+      <div class="acl-edit-h">一般帳號
+        <small>勾選的意思是「即使不是管理員也看得到」</small></div>
+      <div class="acl-users">${viewers.length ? viewers.map(u => `
+        <label><input type="checkbox" data-aclu="${esc(u.id)}"
+          ${(r.user_ids || []).includes(u.id) ? 'checked' : ''}><span>${esc(u.name)}</span></label>`).join('')
+        : '<span class="acl-dim">沒有可以授權的一般帳號。</span>'}</div>
+      ${admins.length ? `
+      <div class="acl-edit-h">管理員 <small>${admins.length} 人</small></div>
+      <div class="acl-admins">${admins.map(u => esc(u.name)).join('、')}
+        <div class="acl-dim">管理員永遠可以存取 —— 靠的是角色，不是這裡的授權，所以不在上面的勾選清單裡。
+        一個人降回一般帳號之後，沒勾到的受限資料夾他就看不到了；要讓他降級後仍然看得到，趁現在先勾起來。</div>
+        ${s.keptAdmins.length ? `<div class="acl-dim">其中 ${s.keptAdmins.map(esc).join('、')}
+          另外保有授權，降為一般帳號後仍看得到（儲存時會原封保留）。</div>` : ''}</div>` : ''}
+      <div class="acl-edit-acts">
+        <button type="button" class="btn" data-aclcancel>取消</button>
+        <button type="button" class="btn primary" data-aclsave="${rid}" disabled>儲存授權</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function wireAclRule(card, rule, ac) {
+  const edit = card.querySelector('.acl-edit');
+  const editBtn = card.querySelector('[data-acledit]');
+  const save = card.querySelector('[data-aclsave]');
+  const dirtyEl = card.querySelector('.acl-dirty');
+  const boxes = [...card.querySelectorAll('[data-aclu]')];
+  const orig = new Map(boxes.map(b => [b, b.checked]));
+
+  const isDirty = () => boxes.some(b => b.checked !== orig.get(b));
+  const paint = () => {
+    const d = isDirty();
+    card.classList.toggle('is-dirty', d);
+    dirtyEl.hidden = !d;
+    save.disabled = !d;
+  };
+  const setOpen = v => {
+    edit.hidden = !v;
+    editBtn.setAttribute('aria-expanded', String(v));
+    editBtn.textContent = v ? '收起授權' : '管理授權';
+  };
+
+  editBtn.onclick = () => {
+    const v = edit.hidden;
+    setOpen(v);
+    if (v) (boxes[0] || save).focus({ preventScroll: true });
+  };
+  // checkbox 只改畫面，不打 API —— 一次送整份名單，見這一節開頭的第 3 點
+  boxes.forEach(b => b.onchange = paint);
+
+  card.querySelector('[data-aclcancel]').onclick = () => {
+    boxes.forEach(b => { b.checked = orig.get(b); });
+    paint();
+    setOpen(false);
+    editBtn.focus();
+  };
+
+  const cov = card.querySelector('[data-aclcovers]');
+  if (cov) cov.onclick = () => {
+    const list = card.querySelector('.acl-covers');
+    list.hidden = !list.hidden;
+    cov.setAttribute('aria-expanded', String(!list.hidden));
+    cov.textContent = list.hidden ? '查看' : '收起';
+  };
+
+  save.onclick = async () => {
+    const ids = boxes.filter(b => b.checked).map(b => +b.dataset.aclu);
+    const all = grantPayload(rule, ac.users, ids);
+    save.disabled = true;
+    try {
+      await api(`/folders/acl/${rule.id}/grants`,
+        { method: 'PUT', body: JSON.stringify({ user_ids: all }) });
+      toast(ids.length ? `已授權 ${ids.length} 個帳號` : '已收回全部授權');
+      render('library');
+    } catch (e) { toast(e.message, true); paint(); }
+  };
+
+  card.querySelector('[data-aclrm]').onclick = async () => {
+    if (!await confirmBox({ title: '移除限制', ok: '移除', danger: true,
+      body: `<code>${esc(rule.prefix)}</code> 之後<b>所有登入者都看得到</b>。` })) return;
+    try { await api('/folders/acl/' + rule.id, { method: 'DELETE' });
+      toast('已移除限制'); render('library'); }
+    catch (e) { toast(e.message, true); }
+  };
+}
+
+function aclBlock(ac) {
+  const stats = folderStats(ac.folders);
+  return `
+    <div class="box acl">
+      <div class="acl-intro">
+        <b>沒被列在這裡的資料夾，所有登入者都看得到。</b>
+        列進來的只有被授權的一般帳號與管理員看得到，子資料夾自動跟著受限。
+        <div class="acl-pwnote">${esc(ac.password_login_note)}</div>
+      </div>
+
+      <div class="acl-sec-h">已建立規則 <span>${ac.rules.length}</span></div>
+      ${ac.rules.length ? ac.rules.map(r => aclRuleCard(r, ac)).join('')
+        : '<div class="empty acl-none">目前沒有受限資料夾。</div>'}
+
+      <div class="acl-sec-h">新增限制</div>
+      <div class="acl-form">
+        <div class="acl-field">
+          <span class="acl-lbl" id="aclPickLbl">資料夾</span>
+          ${folderPickerHTML({ id: 'aclPick', stats, labelId: 'aclPickLbl' })}
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center">
-          <span id="aclPicked" style="flex:1;min-width:200px;font-size:12.5px;color:var(--dim)">
-            尚未選擇（可選 ${free.length} 個）</span>
-          <button class="btn" id="aclAdd" disabled>加入限制</button>
+        <div class="acl-field">
+          <label class="acl-lbl" for="aclNote">備註</label>
+          <input id="aclNote" class="acl-input"
+                 placeholder="為什麼限制這個資料夾？（選填）">
         </div>
-        <div style="font-size:11.5px;color:var(--dim);margin-top:6px">
-          只列到第 4 層。更深的資料夾請選它的上層 —— 子資料夾自動跟著受限，
-          而限制一個葉目錄幾乎永遠不是你想做的事。
+        <div class="acl-form-foot">
+          <span class="acl-dim">只列到第 4 層。更深的請選它的上層 —— 子資料夾自動跟著受限，
+            而限制一個葉目錄幾乎永遠不是你想做的事。</span>
+          <button type="button" class="btn primary" id="aclAdd" disabled>加入限制</button>
         </div>
       </div>
     </div>`;
 }
 
 function wireAcl(el, ac) {
-  const tree = el.querySelector('#aclTree');
-  const picked = el.querySelector('#aclPicked');
+  const tree = buildFolderTree(ac.folders);
   const add = el.querySelector('#aclAdd');
-  let chosen = '';
-
-  // 篩選。**原本用 option.hidden，那個屬性只有 Firefox 認** ——
-  // Chrome／Safari 完全忽略，所以篩選看起來是壞的（打字沒反應）。
-  // 現在是自訂清單，用 style.display 藏，三家都一樣。
-  //
-  // 命中一個深層目錄時，它的父層也要留著 —— 只顯示命中的那一列，
-  // 縮排就沒有參照物，看起來像浮在半空。
-  const flt = el.querySelector('#aclFilter');
-  const applyFilter = () => {
-    const q = (flt ? flt.value : '').trim().toLowerCase();
-    const rows = [...tree.querySelectorAll('.ftree-row')];
-    let hit = 0;
-    const keep = new Set();
-    if (q) {
-      for (const r of rows) {
-        if (!r.dataset.path.includes(q)) continue;
-        keep.add(r.dataset.folder);
-        // 把祖先一路加進來
-        const segs = r.dataset.folder.split('/').filter(Boolean);
-        for (let i = 1; i < segs.length; i++) keep.add('/' + segs.slice(0, i).join('/'));
-      }
-    }
-    for (const r of rows) {
-      const show = !q || keep.has(r.dataset.folder);
-      r.style.display = show ? '' : 'none';
-      if (show && r.dataset.path.includes(q)) hit++;
-    }
-    const none = el.querySelector('#aclNoHit');
-    if (none) none.hidden = !q || hit > 0;
-  };
-  if (flt) flt.oninput = applyFilter;
-
-  // 選取：自己管 on 樣式與按鈕狀態。disabled 的列（已受限／被涵蓋）點不動。
-  tree.onclick = e => {
-    const row = e.target.closest('.ftree-row');
-    if (!row || row.disabled) return;
-    const same = chosen === row.dataset.folder;
-    tree.querySelectorAll('.ftree-row.on').forEach(r => r.classList.remove('on'));
-    chosen = same ? '' : row.dataset.folder;
-    if (!same) row.classList.add('on');
-    picked.textContent = chosen ? chosen : '尚未選擇';
-    picked.style.color = chosen ? 'var(--text)' : 'var(--dim)';
-    add.disabled = !chosen;
-  };
+  const lbl = el.querySelector('#aclPickLbl');
+  const picker = wireFolderPicker(el, { id: 'aclPick', tree,
+    onChange: f => { if (add) add.disabled = !f; } });
+  if (lbl) lbl.onclick = () => el.querySelector('#aclPick-btn').focus();
 
   if (add) add.onclick = async () => {
-    const prefix = chosen;
-    if (!prefix) return toast('先選一個資料夾', true);
+    const prefix = picker.get();
+    // 介面上本來就只挑得到可選的；這裡再擋一次，是因為 picker 的狀態
+    // 跟這一份 ac 必須是同一份 —— 對不上就不送（後端也會擋重複，但別讓它走到那裡）。
+    const n = tree.byPath.get(prefix);
+    if (!prefix || !n || n.state !== 'free') return toast('先選一個可以限制的資料夾', true);
     if (!await confirmBox({
       title: '把這個資料夾設為受限', ok: '設為受限',
       body: `<code>${esc(prefix)}</code> 與它底下的子資料夾，
              之後只有<b>被授權的帳號</b>與管理員看得到。<br><br>
-             設定完成的當下<b>還沒有人被授權</b> —— 記得接著勾選要開放給誰。`
+             設定完成的當下<b>還沒有人被授權</b> —— 記得接著按「管理授權」勾選要開放給誰。`
     })) return;
     try {
       await api('/folders/acl', { method: 'POST',
@@ -377,34 +918,9 @@ function wireAcl(el, ac) {
     } catch (e) { toast(e.message, true); }
   };
 
-  el.querySelectorAll('[data-aclrm]').forEach(b => b.onclick = async () => {
-    const wrap = b.closest('.acl-rule');
-    const prefix = wrap.querySelector('code').textContent;
-    if (!await confirmBox({ title: '移除限制', ok: '移除',
-      body: `<code>${esc(prefix)}</code> 之後<b>所有登入者都看得到</b>。` })) return;
-    try { await api('/folders/acl/' + b.dataset.aclrm, { method: 'DELETE' });
-      toast('已移除限制'); render('library'); }
-    catch (e) { toast(e.message, true); }
-  });
-
-  el.querySelectorAll('[data-aclsave]').forEach(b => b.onclick = async () => {
-    const wrap = b.closest('.acl-rule');
-    const ruleId = +b.dataset.aclsave;
-    const ids = [...wrap.querySelectorAll('[data-aclu]:checked')].map(x => +x.dataset.aclu);
-    // **管理員原本就有的授權要原封帶回去。**這個端點是「整份取代」，
-    // 而管理員不在勾選清單裡（見 aclBlock 的說明）—— 不帶的話，
-    // 一個「先被授權、後來升管理員」的人會在別人按一次儲存時
-    // 被安靜地收回授權，然後在他降級的那天才發現。
-    const adminIds = new Set((ac.users || []).filter(u => u.is_admin).map(u => u.id));
-    const rule = (ac.rules || []).find(r => r.id === ruleId);
-    const keep = (rule ? rule.user_ids : []).filter(i => adminIds.has(i));
-    const all = [...new Set([...ids, ...keep])];
-    try {
-      await api(`/folders/acl/${ruleId}/grants`,
-        { method: 'PUT', body: JSON.stringify({ user_ids: all }) });
-      toast(ids.length ? `已授權 ${ids.length} 個帳號` : '已收回全部授權');
-      render('library');
-    } catch (e) { toast(e.message, true); }
+  el.querySelectorAll('.acl-rule').forEach(card => {
+    const rule = ac.rules.find(r => String(r.id) === card.dataset.rule);
+    if (rule) wireAclRule(card, rule, ac);
   });
 }
 
@@ -413,10 +929,10 @@ function wireAcl(el, ac) {
    取代「自己去詳情頁抄 file_id 回來貼」。那個做法的失敗方式很安靜：
    貼錯一個數字不會報錯，而是對**另一支存在的片**跑了一次好幾分鐘的實測。
 
-   形狀照 aclBlock／wireAcl 那一對：一個純函式回 HTML 字串、一個函式接線。
+   形狀照 folderPickerHTML／wireFolderPicker 那一對：一個純函式回 HTML 字串、一個函式接線。
    不要用 <select>：option 在 Chrome/Safari 套不了樣式，而且一列要放兩行
    （片名摘要 + 檔名）option 做不到。篩選也不能靠 option.hidden ——
-   那個屬性只有 Firefox 認（見 wireAcl 裡那段註解）。 */
+   那個屬性只有 Firefox 認（見「受限資料夾」那一節開頭的註解）。 */
 
 /** 一列的主行文字。純函式，測試與渲染共用。 */
 /** 拆成三份而不是一串字：標題、集數、技術規格。
