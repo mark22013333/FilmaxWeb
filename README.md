@@ -362,7 +362,7 @@ filmax-web/
 ├─ app/
 │  ├─ main.py            服務組裝、啟動診斷、靜態頁
 │  ├─ config.py          設定載入（.env）、儲存後端開關
-│  ├─ params.py          81 項參數的登記表（Tier／生效方式／驗證，其中 56 項可線上改）
+│  ├─ params.py          82 項參數的登記表（Tier／生效方式／驗證，其中 56 項可線上改）
 │  ├─ paramstore.py      env > DB > 預設 的解析
 │  ├─ db.py              SQLite、批次寫入、遷移、時間欄位守衛
 │  ├─ purge.py           唯一的刪除進入點 ＋ 孤兒清掃
