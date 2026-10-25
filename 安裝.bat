@@ -24,7 +24,7 @@ if errorlevel 1 (
 )
 
 REM ---------------------------------------------------------------- Python
-echo [1/5] 檢查 Python...
+echo [1/6] 檢查 Python...
 where python >nul 2>nul
 if errorlevel 1 (
   echo       找不到 python，正在安裝...
@@ -36,7 +36,7 @@ if errorlevel 1 (
 
 REM ---------------------------------------------------------------- ffmpeg
 echo.
-echo [2/5] 檢查 ffmpeg 與 ffprobe...
+echo [2/6] 檢查 ffmpeg 與 ffprobe...
 set HAVE_FFMPEG=0
 set HAVE_FFPROBE=0
 where ffmpeg  >nul 2>nul && set HAVE_FFMPEG=1
@@ -58,7 +58,7 @@ if "!HAVE_FFMPEG!!HAVE_FFPROBE!"=="11" (
 
 REM ---------------------------------------------------------------- Python 套件
 echo.
-echo [3/5] 安裝 Python 套件...
+echo [3/6] 安裝 Python 套件...
 if not exist ".venv\Scripts\python.exe" (
   echo       建立虛擬環境...
   python -m venv .venv
@@ -102,7 +102,7 @@ if exist "requirements-dev.txt" (
 
 REM ---------------------------------------------------------------- Flyway
 echo.
-echo [4/5] 檢查 Flyway ^(資料庫遷移用^)...
+echo [4/6] 檢查 Flyway ^(資料庫遷移用^)...
 where flyway >nul 2>nul
 if errorlevel 1 (
   echo       嘗試用 winget 安裝...
@@ -124,7 +124,7 @@ if errorlevel 1 (
 
 REM ---------------------------------------------------------------- cloudflared
 echo.
-echo [5/5] 檢查 cloudflared ^(對外網址用，第三期^)...
+echo [5/6] 檢查 cloudflared ^(對外網址用，第三期^)...
 where cloudflared >nul 2>nul
 if errorlevel 1 (
   echo       尚未安裝。第三期要做 video.longhopick.com 時再裝即可：
@@ -132,6 +132,33 @@ if errorlevel 1 (
 ) else (
   echo       已安裝
 )
+
+REM ---------------------------------------------------------------- OpenAver
+REM JAV scraping imports OpenAver's scrapers straight from its source tree
+REM (app\javscraper.py), so the source has to be on disk. Clone on the first run,
+REM fast-forward on later runs: scrapers break when the sites change and the fix
+REM lands upstream, so re-running this installer is how you pick it up.
+REM vendor\ is gitignored. Leaving OPENAVER_PATH empty in .env points here.
+echo.
+echo [6/6] 下載／更新 OpenAver ^(JAV 資料配對用^)...
+where git >nul 2>nul
+if errorlevel 1 (
+  echo       [!] 找不到 git，略過。要用 JAV 資料配對請先裝 git 再重跑本檔：
+  echo           winget install -e --id Git.Git
+  goto :after_openaver
+)
+if exist "vendor\OpenAver\.git" (
+  git -C "vendor\OpenAver" pull -q --ff-only
+) else (
+  git clone -q --depth 1 https://github.com/slive777/OpenAver "vendor\OpenAver"
+)
+if errorlevel 1 (
+  echo       [X] OpenAver 下載／更新失敗
+  set FAILED=!FAILED! openaver
+) else (
+  echo       完成：vendor\OpenAver
+)
+:after_openaver
 
 REM ---------------------------------------------------------------- 結果
 echo.

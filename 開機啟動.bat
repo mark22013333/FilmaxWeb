@@ -50,7 +50,25 @@ REM ugly: the scan finds nothing, marks every file vanished, and purge cleans up
 REM a library that was only ever missing. So wait for the root to actually exist
 REM before handing over to Python. 60 x 2s = 2 minutes, then give up loudly.
 REM (Task Scheduler retries after that, so giving up here is not the end.)
-set "WAITROOT=D:\1.FTP"
+REM
+REM Which volume to wait for comes from LIBRARY_LOCAL_ROOTS in .env, not a
+REM hardcoded folder: the library path differs per machine, and a hardcoded
+REM D:\1.FTP on a box without it burns the whole 2 minutes and then refuses to
+REM start at all. Only the drive root of the first mapping is used -- the point
+REM is "is the disk mounted", and the drive letter keeps this line ASCII.
+REM Empty LIBRARY_LOCAL_ROOTS means the library is remote only: nothing to wait for.
+set "LOCALROOTS="
+for /f "usebackq tokens=1,* delims==" %%a in (`findstr /B /C:"LIBRARY_LOCAL_ROOTS=" ".env"`) do set "LOCALROOTS=%%b"
+set "WAITROOT="
+if defined LOCALROOTS for /f "tokens=1,* delims==" %%a in ("%LOCALROOTS%") do set "WAITROOT=%%b"
+if not defined WAITROOT goto nowait
+set "WAITROOT=%WAITROOT:~0,2%"
+if "%WAITROOT:~1,1%"==":" goto waitstart
+:nowait
+echo [%DATE% %TIME%] no local library root in .env, skipping disk wait >> "%LOG%"
+goto launch
+
+:waitstart
 set /a TRIES=0
 :waitloop
 if exist "%WAITROOT%\" goto rootok
@@ -66,7 +84,14 @@ goto waitloop
 
 :rootok
 echo [%DATE% %TIME%] %WAITROOT% present after %TRIES% retries >> "%LOG%"
+
+:launch
 echo [%DATE% %TIME%] starting run.py >> "%LOG%"
+
+REM With no console, Python falls back to the ANSI code page (cp950) for
+REM redirected stdout, while the echo lines above are UTF-8 -- one log, two
+REM encodings, and the Chinese half reads as garbage. Force UTF-8.
+set "PYTHONUTF8=1"
 
 REM 2>&1 so tracebacks land in the log too -- uvicorn writes its startup lines
 REM and every error to stderr, which is exactly what you want to read later.

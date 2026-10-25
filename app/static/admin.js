@@ -2040,7 +2040,12 @@ TABS.system = async el => {
         <b>${diag.ftp && diag.ftp.ok ? '正常' : '連不上'}</b><small>FTP</small></div>
       <div class="stat ${diag.tmdb_enabled ? '' : 'warn'}">
         <b>${diag.tmdb_enabled ? '已設定' : '未設定'}</b><small>TMDB</small></div>
+      <div class="stat ${diag.jav && diag.jav.enabled ? '' : 'warn'}"
+           title="${esc((diag.jav && (diag.jav.error || diag.jav.path)) || '')}">
+        <b>${diag.jav && diag.jav.enabled ? '就緒' : '停用'}</b><small>JAV 配對（OpenAver）</small></div>
     </div>
+    ${(diag.problems || []).length ? `<div class="banner bad" style="margin-top:14px">
+      ${diag.problems.map(p => esc(p)).join('<br>')}</div>` : ''}
     <div class="box" style="margin-top:12px">
       <button class="btn" id="bFtpTest">測試 FTP 連線</button>
       <button class="btn" id="bRecheck">重新檢查所有相依</button>

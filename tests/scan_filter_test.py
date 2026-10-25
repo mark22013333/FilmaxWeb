@@ -141,6 +141,32 @@ check(".env.example 有寫（env_drift_test 會擋，但這裡也釘一次）",
       "SCAN_MIN_SIZE_EXEMPT_DIRS=" in env_example)
 
 
+head("[P] 資料夾前綴類設定填了路徑要在存檔時擋下")
+# 比對是逐層看單一資料夾名稱，含斜線的值永遠比不到 —— 實際發生過：
+# SCAN_JAV_DIRS 存成「媒體櫃\100.private\vv」，JAV 配對安靜地從沒生效。
+for key in ("SCAN_EXCLUDE_DIR_PREFIXES", "SCAN_MIN_SIZE_EXEMPT_DIRS",
+            "SCAN_JAV_DIRS", "SCAN_HOME_DIRS"):
+    p = params.REGISTRY[key]
+    for bad in ("100.Private/vv", "媒體櫃\\100.private\\vv", "ok, a/b"):
+        try:
+            params.parse(p, bad)
+            check(f"{key} 擋下 {bad!r}", False, "存得進去")
+        except ValueError as e:
+            check(f"{key} 擋下 {bad!r}", "單一層資料夾名稱" in str(e), str(e))
+    for good in ("", "vv", "100.Private, vv;New Folder"):
+        try:
+            params.parse(p, good)
+            check(f"{key} 接受 {good!r}", True)
+        except ValueError as e:
+            check(f"{key} 接受 {good!r}", False, str(e))
+check("擋下的值本來就比不到（證明這條規則沒有擋掉有效的設定）",
+      scanner._dir_hits("/媒體櫃/100.private/vv/a.mp4",
+                        settings._dir_prefixes("100.private/vv")) is False)
+check("改成單層名稱就比得到",
+      scanner._dir_hits("/媒體櫃/100.private/vv/a.mp4",
+                        settings._dir_prefixes("vv")) is True)
+
+
 print("\n" + "=" * 50)
 print(f"通過 {OK}，失敗 {FAIL}")
 sys.exit(1 if FAIL else 0)

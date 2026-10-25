@@ -10,7 +10,8 @@ TMDB 查不到番號。`SSIS-938` 丟進去只會是 `scrape_state='failed'`，
 `beautifulsoup4`，跑在本專案的 venv 裡（實測 Python 3.10.11 對 OpenAver 的
 embedded 3.12.4 沒有語法問題）。
 
-**只借兩支**：`extract_number()` 解析番號、`search_jav()` 查 metadata。
+**只借三支**：`extract_number()` 解析番號、`search_jav()` 查 metadata、
+`decode_image_payload()` 解開 javdb 圖床（tp.spfcas.com）XOR 過的封面。
 刻意不碰 `core.enricher` —— 它會拉進 OpenAver 自己的 SQLite 與 NFO 產生器，
 而本專案要的是把結果寫進 `media_item`，不是在影片檔旁邊放 .nfo。
 """
@@ -22,6 +23,7 @@ import os
 import sys
 import threading
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -35,11 +37,11 @@ _import_error: str = ""
 
 
 def _load() -> Optional[Dict[str, Any]]:
-    """把 OpenAver 的兩支函式載進來。失敗只記一次，不重試。
+    """把 OpenAver 的兩支函式載進來。失敗會記住，直到 `retry()`。
 
     第一次呼叫才做，理由是 import 它要走一段不算短的 module 初始化
     （`core.scrapers.__init__` 會把所有來源的 scraper 都載入），
-    沒設 `OPENAVER_PATH` 的人不該付這個代價。
+    沒用到 JAV 配對的人不該付這個代價。
     """
     global _mods, _import_error
     if _mods is not None or _import_error:
@@ -50,11 +52,10 @@ def _load() -> Optional[Dict[str, Any]]:
             return _mods
 
         path = (settings.openaver_path or "").strip()
-        if not path:
-            _import_error = "未設定 OPENAVER_PATH"
-            return None
-        if not os.path.isdir(path):
-            _import_error = f"OPENAVER_PATH 不存在: {path}"
+        if not os.path.isfile(os.path.join(path, "core", "scraper.py")):
+            _import_error = (f"找不到 OpenAver（{path} 底下沒有 core/scraper.py）"
+                             "　→ 執行安裝.bat 自動下載，或把 .env 的 OPENAVER_PATH "
+                             "指到含 core 資料夾的 OpenAver 目錄")
             log.warning("JAV 刮削停用 —— %s", _import_error)
             return None
 
@@ -68,7 +69,15 @@ def _load() -> Optional[Dict[str, Any]]:
             log.warning("JAV 刮削停用 —— 載入 OpenAver 失敗: %s", _import_error)
             return None
 
-        _mods = {"extract_number": extract_number, "search_jav": search_jav}
+        try:
+            from core.image_codec import decode_image_payload      # type: ignore
+        except ImportError:
+            # 舊版 OpenAver 沒有這支；少了它只是 javdb 的封面抓不到，不該連配對都停掉。
+            def decode_image_payload(host, content):
+                return content
+
+        _mods = {"extract_number": extract_number, "search_jav": search_jav,
+                 "decode_image_payload": decode_image_payload}
         log.info("JAV 刮削就緒（OpenAver: %s）", path)
         return _mods
 
@@ -77,8 +86,23 @@ def enabled() -> bool:
     return _load() is not None
 
 
+def retry() -> None:
+    """清掉上次的載入失敗，下次用到時重新嘗試 —— 剛跑完安裝.bat 不必重啟服務。
+
+    失敗的 import 可能留下半套 `core.*` 在 sys.modules，不清掉的話
+    重試會直接拿到那份壞掉的模組。
+    """
+    global _import_error
+    with _import_lock:
+        if _mods is not None or not _import_error:
+            return
+        for name in [m for m in sys.modules if m == "core" or m.startswith("core.")]:
+            del sys.modules[name]
+        _import_error = ""
+
+
 def status() -> Dict[str, Any]:
-    """給 /api/health 之類的地方看的診斷資訊。"""
+    """給後台診斷頁看的：OpenAver 有沒有載入成功、失敗的原因。"""
     ok = enabled()
     return {"enabled": ok, "path": settings.openaver_path or "", "error": "" if ok else _import_error}
 
@@ -123,6 +147,11 @@ def _ext_of(url: str) -> str:
     return "." + (ext if ext in ("jpg", "jpeg", "png", "webp") else "jpg")
 
 
+def _is_image(data: bytes) -> bool:
+    return (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+            or data[:4] == b"GIF8" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
+
+
 def download_image(url: Optional[str], referer: str = "") -> Optional[str]:
     """把封面抓下來存進 IMAGE_DIR，回傳檔名（比照 TmdbClient.download_image）。
 
@@ -143,10 +172,15 @@ def download_image(url: Optional[str], referer: str = "") -> Optional[str]:
     try:
         with httpx.Client(timeout=30, follow_redirects=True, headers=headers) as c:
             r = c.get(url)
-        # 防盜連的表現形式是 200 配一頁 HTML，不是 4xx —— 要看 content-type。
+        # 防盜連的表現形式是 200 配一頁 HTML，不是 4xx —— 要看內容本身。
+        # 不看 content-type：javdb 的圖床回 binary/octet-stream，內容還 XOR 過，
+        # 解碼方式照 OpenAver 依 host 決定。
         ctype = (r.headers.get("content-type") or "").lower()
-        if r.status_code == 200 and r.content and ctype.startswith("image/"):
-            dest.write_bytes(r.content)
+        m = _load()
+        data = (m["decode_image_payload"](urlparse(url).hostname or "", r.content)
+                if m else r.content)
+        if r.status_code == 200 and _is_image(data):
+            dest.write_bytes(data)
             return name
         log.warning("下載封面失敗 %s: status=%s content-type=%s", url, r.status_code, ctype or "-")
     except Exception as e:                                          # noqa: BLE001
