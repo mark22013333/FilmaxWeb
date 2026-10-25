@@ -353,6 +353,24 @@ def _home_dir(path: str) -> bool:
     return _dir_hits(path, settings.home_dirs)
 
 
+def _kind_stale(entry: ftpclient.FtpEntry, kind: Optional[str]) -> bool:
+    """既有檔案的歸類跟現在的 SCAN_JAV_DIRS / SCAN_HOME_DIRS 對不上。
+
+    先掃過片庫、之後才設這兩個目錄是常態，而大小沒變的檔案會在
+    _index_file 早退 —— 不檢查這個，設定就只對新檔案有效。
+
+    已經是 jav 的只看目錄還在不在設定裡，不看番號解不解得出來：
+    OpenAver 暫時載入失敗時 extract_number 會回 None，那不該把整批 JAV 打回 movie。
+    """
+    if kind == "jav":
+        return not _jav_dir(entry.path)
+    if kind == "home":
+        return not _home_dir(entry.path)
+    if _jav_dir(entry.path) and javscraper.extract_number(entry.name):
+        return True
+    return _home_dir(entry.path) and nameparser.home_video_time(entry.name) is not None
+
+
 def _wanted(f) -> bool:
     """這個檔案要不要收進媒體庫。
 
@@ -496,10 +514,14 @@ def _read_photos() -> None:
 
 def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
                 sibling_files=None, reparse: bool = False, *, batch) -> None:
-    existing = db.q1("SELECT id, size FROM media_file WHERE ftp_path=?", (entry.path,))
+    existing = db.q1("SELECT f.id, f.size, i.kind FROM media_file f "
+                     "LEFT JOIN media_item i ON i.id=f.item_id WHERE f.ftp_path=?",
+                     (entry.path,))
     # 檔案大小沒變就早退 —— 但改了解析器之後這個捷徑會讓既有檔案永遠
-    # 不重新分組。reparse=True 時強制重新解析。
-    if existing and (existing["size"] or 0) == entry.size and not reparse:
+    # 不重新分組。reparse=True 時強制重新解析。目錄設定改了也一樣，
+    # 那個不能靠使用者記得按「重新分組」，所以由 _kind_stale 自動判斷。
+    if (existing and (existing["size"] or 0) == entry.size and not reparse
+            and not _kind_stale(entry, existing["kind"])):
         batch.touch_file(existing["id"], db.now_i())
         return
 
@@ -703,13 +725,13 @@ def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
     # 兩個刮削源各自獨立：TMDB 沒設不該擋住 JAV，反之亦然。
     # 兩個都沒有才是真的不用刮。
     if not tmdb.enabled and not javscraper.enabled():
-        status.note("未設定 TMDB_API_KEY，也未設定 OPENAVER_PATH，跳過刮削"
+        status.note("未設定 TMDB_API_KEY，OpenAver 也沒載入成功，跳過刮削"
                     "（仍可用檔名瀏覽與播放）")
         return
     if not tmdb.enabled:
         status.note("未設定 TMDB_API_KEY，只刮 JAV 條目")
     if not javscraper.enabled():
-        status.note("未設定 OPENAVER_PATH，JAV 條目會維持未刮削")
+        status.note("OpenAver 沒載入成功（原因見後台〈系統〉），JAV 條目會維持未刮削")
     if force:
         where = "" if include_manual else "WHERE scrape_state != 'manual'"
     else:

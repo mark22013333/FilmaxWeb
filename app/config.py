@@ -69,8 +69,10 @@ class Settings:
 
 
     # JAV 刮削（番號類作品走 javbus/fc2/d2pass/jav321，不走 TMDB）。
-    # 空 = 停用，掃到的東西照舊全部丟給 TMDB。
-    openaver_path: str = field(default_factory=lambda: _s("OPENAVER_PATH", ""))
+    # 空 = 用安裝.bat 下載的那份（vendor/OpenAver）。真正的開關是 SCAN_JAV_DIRS：
+    # 沒有目錄命中，載進來的 OpenAver 也不會被呼叫。
+    openaver_path: str = field(default_factory=lambda: _s("OPENAVER_PATH", "")
+                               or str(BASE_DIR / "vendor" / "OpenAver"))
 
     ffmpeg: str = field(default_factory=lambda: _s("FFMPEG_PATH", "ffmpeg") or "ffmpeg")
     ffprobe: str = field(default_factory=lambda: _s("FFPROBE_PATH", "ffprobe") or "ffprobe")

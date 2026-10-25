@@ -39,3 +39,6 @@ segment-boundary-result.txt
 
 # Claude Code 的本機設定（launch.json 等），因人而異、不進版控
 .claude/
+
+# 安裝.bat 下載的第三方原始碼（OpenAver），每台機器自己 clone／更新
+vendor/

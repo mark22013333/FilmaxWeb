@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, hlscache,
-                keyframes, media, mssql, params, paramstore, purge, scanner,
+                javscraper, keyframes, media, mssql, params, paramstore, purge, scanner,
                 streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
@@ -1704,6 +1704,17 @@ def diagnostics(_: str = Depends(admin_only)):
         problems.append(f"FTP 連線失敗：{ftp.get('error')}")
     if not tmdb.enabled:
         problems.append("未設定 TMDB_API_KEY，不會有海報與簡介（不影響播放）")
+    javscraper.retry()                # 剛跑完安裝.bat 下載 OpenAver，不必重啟就看得到
+    jav = javscraper.status()
+    if settings.jav_dirs and not jav["enabled"]:
+        problems.append(f"JAV 資料配對停用：{jav['error']}")
+    # 存檔時會擋，但擋之前就存進去的舊值不會；那種值永遠比不到任何資料夾。
+    for key in ("SCAN_EXCLUDE_DIR_PREFIXES", "SCAN_MIN_SIZE_EXEMPT_DIRS",
+                "SCAN_JAV_DIRS", "SCAN_HOME_DIRS"):
+        p = params.REGISTRY[key]
+        err = params.check(p, paramstore.get(key))
+        if err:
+            problems.append(f"〈{p.label}〉{err}　→ 到〈系統參數〉修正")
     if not user_db["ok"]:
         # 這一項壞掉代表沒有人登得進來，是所有問題裡最該先看到的
         problems.insert(0, "使用者資料庫不可用："
@@ -1734,6 +1745,7 @@ def diagnostics(_: str = Depends(admin_only)):
         "hwaccel_probe": media.hwaccel_probe_report(),
         "ftp": ftp,
         "tmdb_enabled": tmdb.enabled,
+        "jav": jav,
         "probe_failed": failed,
         "probe_error_sample": sample["probe_error"] if sample else None,
         "local_source": coverage,

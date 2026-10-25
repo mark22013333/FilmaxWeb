@@ -119,6 +119,17 @@ def _non_negative(v):
     return None if v >= 0 else "不能是負數"
 
 
+def _dir_names(v):
+    """資料夾前綴類設定是逐層比對單一資料夾名稱（scanner._dir_hits），
+    含斜線的值永遠比不到任何一層 —— 不擋的話會安靜地失效，看不出原因。"""
+    bad = [c.strip() for c in str(v or "").replace(";", ",").split(",")
+           if "/" in c or "\\" in c]
+    if not bad:
+        return None
+    return (f"只能填單一層資料夾名稱，不能填路徑：{'、'.join(bad)}"
+            "（例：要比對 100.Private/vv 就填 vv）")
+
+
 # --------------------------------------------------------------------------
 # 登記表
 # --------------------------------------------------------------------------
@@ -154,6 +165,8 @@ _ALL: List[Param] = [
     # 第 −1 層：FTP 路徑 → 本機路徑。是路徑、會擴大服務讀得到的範圍，所以跟
     # LIBRARY_ROOTS 同一類，不進 UI。
     _p("LIBRARY_LOCAL_ROOTS", NO_UI, section="媒體庫", sensitive=True),
+    # 這個路徑會被加進 sys.path 然後 import —— 等於執行那裡的程式碼。
+    _p("OPENAVER_PATH", NO_UI, section="媒體庫"),
     _p("TRUST_PROXY", NO_UI, type="bool", default=False, section="網路"),
     _p("LOCAL_NETWORKS", NO_UI, section="網路", sensitive=True),
 
@@ -305,20 +318,22 @@ _ALL: List[Param] = [
        label="影片最小大小（MB）", minimum=0,
        help="小於這個大小的影片會被忽略，用來擋預告片與樣本檔"),
     _p("SCAN_EXCLUDE_DIR_PREFIXES", HOT, apply=APPLY_HOT, section="媒體庫",
-       label="略過的資料夾前綴", help="逗號分隔，比對名稱開頭，整棵子樹都不走訪"),
+       label="略過的資料夾前綴", validate=_dir_names,
+       help="逗號分隔，比對名稱開頭，整棵子樹都不走訪"),
     _p("SCAN_MIN_SIZE_EXEMPT_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
-       label="不套用大小門檻的資料夾",
+       label="不套用大小門檻的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下的影片不論多小都收 —— 用來收特定目錄裡的短片，"
             "而不必為它把全域的 MIN_FILE_MB 調低（調低會把手機錄的短片全部拉進來）"),
     _p("SCAN_JAV_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
-       label="走 JAV 刮削的資料夾",
+       label="走 JAV 刮削的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下的影片改用 javbus/fc2/d2pass/jav321 查 metadata，"
             "不走 TMDB（TMDB 查不到番號）。目錄命中之後還要真的解得出番號才算，"
-            "所以同一個目錄裡沒有番號的檔案不會被誤判。需要先設定 OPENAVER_PATH"),
+            "所以同一個目錄裡沒有番號的檔案不會被誤判。只填資料夾名稱（例：vv），不要填路徑。"
+            "需要 OpenAver：跑一次安裝.bat 會自動下載到 vendor/OpenAver"),
     _p("SCAN_HOME_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
-       label="家庭錄影的資料夾",
+       label="家庭錄影的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下、檔名是 20211002_213546+0800 這種格式的影片會歸到"
             "「錄影」分類，標題自動變成可讀日期，不去刮 TMDB（本來就查不到）。"
