@@ -132,8 +132,8 @@ head("[P] HTML 進入點不准快取")
 # 使用者的畫面上卻沒有。
 MAIN = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
 check("HTML 進入點帶 no-store", '"Cache-Control": "no-store, must-revalidate"' in MAIN)
-check("四支 HTML 路由都走同一個 helper（各寫一次遲早漏一個）",
-      MAIN.count('return _page("') == 4, MAIN.count('return _page("'))
+check("五支 HTML 路由都走同一個 helper（各寫一次遲早漏一個）",
+      MAIN.count('return _page("') == 5, MAIN.count('return _page("'))
 # _page() 現在是讀檔 → 補 /static/ 的 ?v= 版本號 → HTMLResponse（見 main.py 的
 # _versioned 註解：Cloudflare 會替 /static/* 補四小時的 max-age）。
 # 路由裡出現 FileResponse(STATIC_DIR / ...) 就代表那一支同時繞過了 no-store 與版本號。

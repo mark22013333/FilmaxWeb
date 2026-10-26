@@ -4,13 +4,12 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 title FilmaxWeb
 
+set "FIRST_RUN="
 if not exist ".env" (
-  echo [!TIME!] [!] 找不到 .env，正在從 .env.example 複製一份...
-  copy ".env.example" ".env" >nul
-  echo [!] 請先用記事本打開 .env 填入 FTP 連線資訊與 TMDB_API_KEY，
-  echo     存檔後再執行一次本檔案。
-  pause
-  exit /b
+  echo [!TIME!] 第一次執行，建立空白的 .env ^(之後由網頁上的設定精靈幫你填^)
+  > ".env" echo # FilmaxWeb 設定。第一次請在瀏覽器的「設定精靈」填寫，不用手動編輯這個檔案。
+  >> ".env" echo # 所有可以調整的項目與說明都在 .env.example。
+  set "FIRST_RUN=1"
 )
 
 if not exist ".venv\Scripts\python.exe" (
@@ -41,6 +40,10 @@ for /f "tokens=1" %%p in ("!PORT!") do set "PORT=%%p"
 REM 沒開驗證時服務只接受本機與區網連線，所以用 127.0.0.1 開最保險
 echo [!TIME!] [3/3] 啟動服務  http://127.0.0.1:!PORT!
 echo.
-start "" http://127.0.0.1:!PORT!
+if defined FIRST_RUN (
+  start "" http://127.0.0.1:!PORT!/setup
+) else (
+  start "" http://127.0.0.1:!PORT!
+)
 ".venv\Scripts\python.exe" run.py
 pause

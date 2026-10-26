@@ -1,0 +1,62 @@
+[hidden]{display:none!important}
+.setup header .tag{font-size:11px;font-weight:800;padding:3px 8px;border-radius:6px;background:#243049;color:var(--blue)}
+.wrap{max-width:720px;margin:0 auto;padding:24px 16px 80px}
+.steps{list-style:none;display:flex;gap:6px;margin:0 0 18px;padding:0;overflow-x:auto}
+.steps li{flex:1;min-width:84px;padding:8px 6px;border-radius:9px;text-align:center;font-size:12.5px;
+  font-weight:700;color:var(--dim);background:var(--panel);border:1px solid var(--line);white-space:nowrap}
+.steps li.done{color:var(--green)}
+.steps li.on{color:var(--accent);border-color:var(--accent);background:var(--panel-2)}
+.steps li.click{cursor:pointer}
+.wcard{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px}
+.wcard h2{margin:0 0 4px;font-size:20px}
+.wcard .lead{margin:0 0 18px;color:var(--muted)}
+.field{margin:0 0 14px}
+.field>label{display:block;font-weight:700;margin-bottom:4px}
+.field .why{font-size:12.5px;color:var(--muted);margin-top:4px}
+.field input[type=text],.field input[type=password],.field input[type=number],.field select{
+  width:100%;min-height:44px;padding:0 12px;border-radius:9px;background:var(--bg-2);
+  border:1px solid var(--line);outline:none}
+.field input:focus,.field select:focus{border-color:var(--accent)}
+.field.bad input{border-color:var(--red)}
+.wrow{display:flex;gap:10px}.wrow>*{flex:1}.wrow>.narrow{flex:0 0 120px}
+.choices{display:grid;gap:10px;margin:0 0 16px}
+.choice{display:block;text-align:left;width:100%;padding:14px;border-radius:10px;background:var(--bg-2);
+  border:1px solid var(--line);transition:.15s}
+.choice b{display:block;margin-bottom:2px}
+.choice span{color:var(--muted);font-size:13px}
+.choice:hover{border-color:var(--muted)}
+.choice.on{border-color:var(--accent);background:var(--panel-2)}
+.actions{display:flex;gap:10px;justify-content:space-between;margin-top:22px;flex-wrap:wrap}
+.actions .grow{flex:1}
+.btn.primary{background:var(--accent);color:#141414;border-color:var(--accent)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.big{min-height:44px;padding:0 18px}
+.result{margin:12px 0 0;padding:12px 14px;border-radius:9px;font-size:13.5px;border:1px solid var(--line);background:var(--bg-2)}
+.result.ok{border-color:#1f5a41;background:#10261d;color:#9ff0c8}
+.result.bad{border-color:#6a2a2a;background:#2a1414;color:#ffbdbd}
+.result.warn{border-color:#6a5222;background:#2a2113;color:#ffd78a}
+.result .hint{display:block;margin-top:4px;color:var(--text);opacity:.85}
+.result code,.wcard code{background:var(--bg-2);padding:1px 6px;border-radius:5px;font-size:12.5px;word-break:break-all}
+.result code{background:rgba(0,0,0,.3)}
+details.adv{margin:6px 0 14px}
+details.adv summary{cursor:pointer;color:var(--muted);font-weight:700;padding:6px 0}
+.check{display:flex;gap:8px;align-items:center;padding:6px 0}
+.check .i{width:20px;text-align:center}
+.wcrumbs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;align-items:center}
+.wcrumbs button{padding:4px 8px;border-radius:6px;background:var(--bg-2);border:1px solid var(--line);font-size:12.5px}
+.dirs{border:1px solid var(--line);border-radius:9px;max-height:260px;overflow:auto;background:var(--bg-2)}
+.dirs button{display:flex;width:100%;text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);gap:8px}
+.dirs button:last-child{border:none}
+.dirs button:hover{background:var(--panel-2)}
+.dirs .wempty{padding:14px;color:var(--muted)}
+.picked{margin:14px 0 0;display:grid;gap:8px}
+.pick{display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:9px;background:var(--bg-2);border:1px solid var(--line)}
+.pick code{flex:1}.pick select{min-height:36px;border-radius:7px;background:var(--panel);border:1px solid var(--line);padding:0 8px}
+.pick button{padding:4px 10px;color:var(--muted)}
+.sum{width:100%;border-collapse:collapse;margin:8px 0}
+.sum td{padding:8px 4px;border-bottom:1px solid var(--line);vertical-align:top}
+.sum td:first-child{color:var(--muted);width:34%}
+ol.how{padding-left:20px;margin:0 0 16px}ol.how li{margin:6px 0}
+  border-radius:9px;border:1px solid var(--line);opacity:0;pointer-events:none;transition:.2s}
+@media(max-width:520px){.wrow{flex-direction:column}.wrow>.narrow{flex:1}.wcard{padding:16px}}
+.box{background:var(--bg-2);border:1px solid var(--line);border-radius:10px;padding:8px 14px;margin:0 0 14px}

@@ -15,9 +15,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (audit, auth, db, ftpclient, geo, hls, media, mssql, params,
-               paramstore, purge, scanner, users)
+               paramstore, purge, scanner, setup, users)
 from .config import settings
 from .routers import api, auth_google, stream
+from .routers import setup as setup_router
 
 # 日期一定要在時間旁邊。服務會連著開好幾天，而問題往往是隔天才回報的 ——
 # 只有 `21:06:39` 的話，沒有人分得出那是今天還是三天前的那一次啟動。
@@ -287,6 +288,7 @@ app.add_middleware(SecurityHeaders)
 app.include_router(auth_google.router, prefix="/auth/google", tags=["auth"])
 app.include_router(api.router, prefix="/api", tags=["library"])
 app.include_router(stream.router, prefix="/api", tags=["stream"])
+app.include_router(setup_router.router, prefix="/api/setup", tags=["setup"])
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -331,6 +333,17 @@ def _page(name: str) -> HTMLResponse:
 @app.get("/", include_in_schema=False)
 def index():
     return _page("index.html")
+
+
+@app.get("/setup", include_in_schema=False)
+def setup_page(request: Request):
+    """首次設定精靈。權限在 /api/setup/* 的 setup_gate；頁面本身不含任何機密。"""
+    if not auth.is_admin(request):
+        if not auth.role_of(request):
+            return RedirectResponse("/login?next=" + quote("/setup"), status_code=303)
+        return HTMLResponse("<!doctype html><meta charset=utf-8><h2>需要管理員權限</h2>",
+                            status_code=403)
+    return _page("setup.html")
 
 
 @app.get("/player", include_in_schema=False)
