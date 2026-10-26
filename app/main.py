@@ -145,7 +145,7 @@ async def lifespan(app: FastAPI):
         log.error("  2. 表還沒建的話，先跑 db\\migrate.bat 套用 Flyway 遷移")
         log.error("  3. 不想接 MSSQL 就把 .env 的 MSSQL_HOST 清空，會改用本機 SQLite")
         log.error("=" * 78)
-    log.info("FTP 目標 %s:%s  根目錄 %s", settings.ftp_host, settings.ftp_port,
+    log.info("%s 目標 %s:%s  根目錄 %s", settings.ftp_protocol.upper(), settings.ftp_host, settings.ftp_port,
              [r.path for r in settings.library_roots])
     tools = media.tool_status()
     for kind, t in tools.items():

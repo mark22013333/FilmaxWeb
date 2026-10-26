@@ -10,6 +10,7 @@ starlette==0.45.0
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 python-dotenv==1.0.1
+paramiko>=3.5.1,<6
 pydantic==2.10.4
 Pillow>=10.4.0
 

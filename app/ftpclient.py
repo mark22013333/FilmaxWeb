@@ -1,4 +1,4 @@
-"""FTP 存取層：連線池、目錄遞迴列舉、支援 Range 的位元組串流。
+"""FTP/SFTP 存取層：目錄遞迴列舉、支援 Range 的位元組串流。
 
 所有 FTP 通訊都在 Python 這一層處理（含檔名編碼），
 ffmpeg 一律改讀本服務自己的 HTTP /stream 端點，
@@ -12,6 +12,7 @@ import posixpath
 import queue
 import re
 import socket
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -221,8 +222,27 @@ def _parse_list_line(line: str, parent: str) -> Optional[FtpEntry]:
 
 
 def list_dir(path: str) -> List[FtpEntry]:
-    """列出目錄。優先 MLSD，退回 LIST 解析。"""
+    """列出目錄。FTP 優先 MLSD，退回 LIST；SFTP 直接使用檔案屬性。"""
     path = "/" + path.strip("/") if path.strip("/") else "/"
+    if settings.ftp_protocol == "sftp":
+        from .sftpclient import connection
+        try:
+            with connection() as (sftp, _):
+                entries = []
+                for attr in sftp.listdir_attr(path):
+                    if attr.filename in (".", ".."):
+                        continue
+                    full = posixpath.join(path, attr.filename)
+                    # Windows directory junctions and symlinks need target metadata.
+                    info = sftp.stat(full) if stat.S_ISLNK(attr.st_mode or 0) else attr
+                    entries.append(FtpEntry(
+                        attr.filename, full, stat.S_ISDIR(info.st_mode or 0),
+                        info.st_size or 0,
+                        datetime.fromtimestamp(info.st_mtime).isoformat() if info.st_mtime else "",
+                    ))
+                return entries
+        except Exception as e:
+            raise FtpError(f"SFTP 無法列出目錄 {path}: {e}") from e
     with pool.conn() as ftp:
         # 1) MLSD
         try:
@@ -316,6 +336,13 @@ def walk(root: str, max_depth: int = 8, on_dir=None) -> Iterator[Tuple[str, List
 
 
 def file_size(path: str) -> int:
+    if settings.ftp_protocol == "sftp":
+        from .sftpclient import connection
+        try:
+            with connection() as (sftp, _):
+                return sftp.stat(path).st_size or 0
+        except Exception as e:
+            raise FtpError(f"SFTP 取得檔案大小失敗 {path}: {e}") from e
     with pool.conn() as ftp:
         try:
             ftp.voidcmd("TYPE I")
@@ -330,6 +357,17 @@ class FtpReadStream:
     def __init__(self, path: str, offset: int = 0):
         self.path = path
         self.offset = offset
+        if settings.ftp_protocol == "sftp":
+            from .sftpclient import connection
+            self._sftp_context = connection()
+            try:
+                sftp, _ = self._sftp_context.__enter__()
+                self._sftp_file = sftp.open(path, "rb")
+                self._sftp_file.seek(offset)
+            except Exception as e:
+                self.close()
+                raise FtpError(f"SFTP 開啟串流失敗 {path}@{offset}: {e}") from e
+            return
         self._ftp = _new_ftp()
         try:
             self._ftp.voidcmd("TYPE I")
@@ -339,6 +377,8 @@ class FtpReadStream:
             raise FtpError(f"開啟串流失敗 {path}@{offset}: {e}") from e
 
     def read(self, n: int) -> bytes:
+        if getattr(self, "_sftp_file", None) is not None:
+            return self._sftp_file.read(n)
         return self._sock.recv(n)
 
     def iter_chunks(self, chunk_size: Optional[int] = None,
@@ -358,7 +398,7 @@ class FtpReadStream:
                 want = chunk_size if limit is None else min(chunk_size, limit - sent)
                 if want <= 0:
                     return
-                data = self._sock.recv(want)
+                data = self.read(want)
                 if not data:
                     return
                 sent += len(data)
@@ -374,7 +414,7 @@ class FtpReadStream:
             self.close()
 
     def close(self) -> None:
-        for attr in ("_sock", "_ftp"):
+        for attr in ("_sftp_file", "_sock", "_ftp"):
             obj = getattr(self, attr, None)
             if obj is None:
                 continue
@@ -383,10 +423,23 @@ class FtpReadStream:
             except Exception:
                 pass
             setattr(self, attr, None)
+        ctx = getattr(self, "_sftp_context", None)
+        if ctx is not None:
+            self._sftp_context = None
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 def test_connection() -> dict:
     try:
+        if settings.ftp_protocol == "sftp":
+            from .sftpclient import connection
+            with connection() as (sftp, ssh):
+                return {"ok": True, "protocol": "sftp",
+                        "welcome": ssh.get_transport().remote_version,
+                        "pwd": sftp.normalize(".")}
         with pool.conn() as ftp:
             welcome = ftp.getwelcome()
             pwd = ftp.pwd()

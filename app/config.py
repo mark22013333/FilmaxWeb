@@ -50,6 +50,13 @@ def _s(key: str, default: str = "") -> str:
     return default if v is None else v.strip()
 
 
+def _ftp_protocol() -> str:
+    value = _s("FTP_PROTOCOL", "ftp").lower()
+    if value not in ("ftp", "sftp"):
+        raise ValueError("FTP_PROTOCOL 必須是 ftp 或 sftp")
+    return value
+
+
 @dataclass
 class LibraryRoot:
     path: str
@@ -58,14 +65,17 @@ class LibraryRoot:
 
 @dataclass
 class Settings:
+    ftp_protocol: str = field(default_factory=_ftp_protocol)
     ftp_host: str = field(default_factory=lambda: _s("FTP_HOST", "127.0.0.1"))
-    ftp_port: int = field(default_factory=lambda: _i("FTP_PORT", 21))
+    ftp_port: int = field(default_factory=lambda: _i("FTP_PORT", 22 if _ftp_protocol() == "sftp" else 21))
     ftp_user: str = field(default_factory=lambda: _s("FTP_USER", "anonymous"))
     ftp_password: str = field(default_factory=lambda: _s("FTP_PASSWORD", ""))
     ftp_tls: bool = field(default_factory=lambda: _b("FTP_TLS", False))
     ftp_passive: bool = field(default_factory=lambda: _b("FTP_PASSIVE", True))
     ftp_encoding: str = field(default_factory=lambda: _s("FTP_ENCODING", "utf-8"))
     ftp_timeout: int = field(default_factory=lambda: _i("FTP_TIMEOUT", 20))
+    sftp_known_hosts: str = field(default_factory=lambda: _s("SFTP_KNOWN_HOSTS", ""))
+    sftp_key_file: str = field(default_factory=lambda: _s("SFTP_KEY_FILE", ""))
 
 
     # JAV 刮削（番號類作品走 javbus/fc2/d2pass/jav321，不走 TMDB）。

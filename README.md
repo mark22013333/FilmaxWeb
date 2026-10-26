@@ -76,6 +76,34 @@ FTP_PASSWORD=你的密碼
 TMDB_API_KEY=去 themoviedb.org 免費申請
 ```
 
+### 使用 Windows OpenSSH SFTP
+
+先執行 `安裝.bat` 或 `.venv\Scripts\python.exe -m pip install -r requirements.txt`，安裝新增的 Paramiko 相依套件。在 `.env` 設定：
+
+```ini
+FTP_PROTOCOL=sftp
+FTP_HOST=192.168.1.100
+FTP_PORT=22
+FTP_USER=Windows帳號
+FTP_PASSWORD=Windows帳號密碼
+FTP_TLS=false
+SFTP_KNOWN_HOSTS=
+SFTP_KEY_FILE=
+LIBRARY_ROOTS=/D:/Movies|movie;/D:/TVShows|tv
+```
+
+`FTP_HOST` 填 OpenSSH Server 所在電腦的位址；同一台電腦可填 `127.0.0.1`。密碼使用 Windows 帳號密碼，不是 Windows Hello PIN。
+若用私鑰登入，填入 `SFTP_KEY_FILE` 的完整路徑；加密私鑰可用 `FTP_PASSWORD` 提供解密密碼。
+SFTP 不使用 `FTP_TLS`、`FTP_PASSIVE` 或 `FTP_ENCODING`；未指定 `FTP_PORT` 時，SFTP 預設 22，FTP 預設 21。
+
+首次連線前，以執行 FilmaxWeb 的同一個 Windows 帳號執行 `sftp -P 22 帳號@主機位址`，核對伺服器主機金鑰指紋後再接受。
+程式使用該帳號的 `~/.ssh/known_hosts`，也可用 `SFTP_KNOWN_HOSTS` 指定金鑰檔。未知或變更的主機金鑰會被拒絕；不會自動略過驗證。
+在 SFTP 提示字元執行 `pwd`、`ls /D:/Movies`，確認實際可讀的片庫路徑，再填 `LIBRARY_ROOTS`。若有設定 chroot，請用 chroot 內的路徑。
+OpenSSH 不會沿用其他 FTP 伺服器的虛擬目錄；從 FTP 切換後，應核對根目錄與 `LIBRARY_LOCAL_ROOTS` 對應，再重啟並重新掃描。
+
+SFTP 支援目錄掃描、中文檔名、影片 Range／指定位置讀取、字幕、相片與 PDF，以及後台連線測試。
+不設定 `FTP_PROTOCOL` 時維持原本 FTP／FTPS 行為。
+
 **片庫跟服務在同一台機器的話**，加這一行會讓轉碼少繞三層（見 [J 章第 −1 層](docs/規格/J-影片畫質.md)）：
 
 ```ini

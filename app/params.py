@@ -167,12 +167,14 @@ _ALL: List[Param] = [
     _p("LIBRARY_LOCAL_ROOTS", NO_UI, section="媒體庫", sensitive=True),
     # 這個路徑會被加進 sys.path 然後 import —— 等於執行那裡的程式碼。
     _p("OPENAVER_PATH", NO_UI, section="媒體庫"),
+    _p("SFTP_KNOWN_HOSTS", NO_UI, section="FTP", sensitive=True),
+    _p("SFTP_KEY_FILE", NO_UI, section="FTP", sensitive=True),
     _p("TRUST_PROXY", NO_UI, type="bool", default=False, section="網路"),
     _p("LOCAL_NETWORKS", NO_UI, section="網路", sensitive=True),
 
     # ---- Tier 1：秘密 ----
     # 問句 3。唯寫欄位，API 任何情況都不回明文。
-    _p("TMDB_API_KEY", SECRET, apply=APPLY_HOT, section="刮削",
+    _p("TMDB_API_KEY", SECRET, apply=APPLY_HOT, section="影片資料",
        label="TMDB API 金鑰", help="沒有它就不會去抓海報與簡介"),
     _p("FTP_PASSWORD", SECRET, apply=APPLY_RELOAD, section="FTP", label="FTP 密碼"),
     _p("GOOGLE_CLIENT_SECRET", SECRET, apply=APPLY_RELOAD, section="登入",
@@ -180,6 +182,9 @@ _ALL: List[Param] = [
 
     # ---- Tier 3：要重載或重啟 ----
     # 問句 4：啟動時被拿去建立長生命週期的東西（連線池、執行緒池、快取）。
+    _p("FTP_PROTOCOL", NEEDS_RELOAD, default="ftp", apply=APPLY_RELOAD,
+       section="FTP", label="傳輸協定", choices=["ftp", "sftp"],
+       help="OpenSSH 選 sftp 並將連接埠改為 22；FTP_TLS 只適用 ftp"),
     _p("FTP_HOST", NEEDS_RELOAD, default="127.0.0.1", apply=APPLY_RELOAD,
        section="FTP", label="FTP 主機", sensitive=True),
     _p("FTP_PORT", NEEDS_RELOAD, type="int", default=21, apply=APPLY_RELOAD,

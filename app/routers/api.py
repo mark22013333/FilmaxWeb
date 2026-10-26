@@ -305,7 +305,8 @@ def stats(request: Request):
             "hwaccel": media.resolve_hwaccel(),
             "hwaccel_probe": media.hwaccel_probe_report(),
             "hwaccel_setting": settings.hwaccel,
-            "ftp": {"host": settings.ftp_host, "port": settings.ftp_port,
+            "ftp": {"protocol": settings.ftp_protocol,
+                    "host": settings.ftp_host, "port": settings.ftp_port,
                     "roots": [r.path for r in settings.library_roots]},
         })
     return out
