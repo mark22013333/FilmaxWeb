@@ -14,18 +14,25 @@ from ..config import settings
 router = APIRouter()
 
 
+def deny_reason(request: Request) -> str:
+    """不能進精靈的原因，能進就回空字串。頁面與 API 共用這一個判斷。"""
+    if not auth.is_admin(request):
+        return "需要管理員權限"
+    if not settings.auth_enabled and not auth.is_loopback(auth.peer_ip(request.scope)):
+        return ("還沒設定登入驗證時，設定精靈只能在執行 FilmaxWeb 的那台電腦上開"
+                "（網址用 http://127.0.0.1:%s/setup）" % settings.port)
+    return ""
+
+
 def setup_gate(request: Request) -> None:
     """能寫 .env 的人只有：登入的管理員；沒開驗證時只有這台機器本人。
 
     沒開驗證時中介層是「區網全放行、每個人都是管理員」，對一般頁面可以，
-    但這裡能改密碼與片源位址，區網裡別台裝置不該能動它。
+    但這裡能改密碼與片源位址，區網裡別台裝置不該能動它，連頁面都不該看到。
     """
-    if not auth.is_admin(request):
-        raise HTTPException(403, "需要管理員權限")
-    if not settings.auth_enabled and not auth.is_loopback(auth.peer_ip(request.scope)):
-        raise HTTPException(
-            403, "還沒設定登入驗證時，設定精靈只能在執行 FilmaxWeb 的那台電腦上開"
-                 "（網址用 http://127.0.0.1:%s/setup）" % settings.port)
+    why = deny_reason(request)
+    if why:
+        raise HTTPException(403, why)
 
 
 class Body(BaseModel):

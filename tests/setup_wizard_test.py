@@ -107,5 +107,8 @@ settings.auth_enabled = False
 check("沒開驗證 + 本機 → 放行", gate("127.0.0.1") == "pass", gate("127.0.0.1"))
 check("沒開驗證 + 區網別台裝置 → 403", gate("192.168.1.50") == 403, gate("192.168.1.50"))
 
+check("頁面與 API 共用同一個判斷（區網裝置被擋）", setup_router.deny_reason(Request(
+    {"type": "http", "client": ("192.168.1.50", 1), "headers": [], "method": "GET", "path": "/"})) != "")
+
 print(f"\n{OK} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
