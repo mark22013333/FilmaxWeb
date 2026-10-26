@@ -56,7 +56,7 @@ def _load() -> Optional[Dict[str, Any]]:
             _import_error = (f"找不到 OpenAver（{path} 底下沒有 core/scraper.py）"
                              "　→ 執行安裝.bat 自動下載，或把 .env 的 OPENAVER_PATH "
                              "指到含 core 資料夾的 OpenAver 目錄")
-            log.warning("JAV 刮削停用 —— %s", _import_error)
+            log.warning("JAV 資料配對停用 —— %s", _import_error)
             return None
 
         if path not in sys.path:
@@ -66,7 +66,7 @@ def _load() -> Optional[Dict[str, Any]]:
             from core.scrapers.utils import extract_number         # type: ignore
         except Exception as e:                                     # noqa: BLE001
             _import_error = f"{type(e).__name__}: {e}"
-            log.warning("JAV 刮削停用 —— 載入 OpenAver 失敗: %s", _import_error)
+            log.warning("JAV 資料配對停用 —— 載入 OpenAver 失敗: %s", _import_error)
             return None
 
         try:
@@ -78,7 +78,7 @@ def _load() -> Optional[Dict[str, Any]]:
 
         _mods = {"extract_number": extract_number, "search_jav": search_jav,
                  "decode_image_payload": decode_image_payload}
-        log.info("JAV 刮削就緒（OpenAver: %s）", path)
+        log.info("JAV 資料配對就緒（OpenAver: %s）", path)
         return _mods
 
 

@@ -1,3 +1,5 @@
+const metadataState = state => ({ pending: '待配對', failed: '配對失敗', ok: '已配對',
+  manual: '手動配對', skip: '不需配對' }[state] || '待配對');
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 // 畫面狀態是兩個**獨立**的維度（見 docs/規格/L-目錄權限.md 的「二維模型」）：
@@ -267,12 +269,16 @@ function cardHtml(it) {
     ? `<img loading="lazy" src="${img}" alt="" onerror="this.remove()">`
     : `<div class="ph">${esc(it.title)}</div>`;
   const rate = it.rating ? `<div class="badge rate">★ ${it.rating.toFixed(1)}</div>` : '';
+  const specialCount = it.special_count || 0;
+  const episodeCount = Math.max(0, (it.episode_count || 0) - specialCount);
+  const counts = [it.season_count || episodeCount ? `${it.season_count} 季・${episodeCount} 集` : '',
+    specialCount ? `特別篇 ${specialCount} 集` : ''].filter(Boolean).join('・');
   const kind = it.kind === 'tv'
-    ? `<div class="badge ep">${it.season_count > 1 ? it.season_count + ' 季' : ''} ${it.file_count} 集</div>` : '';
-  // skip = 本來就不需要 metadata（手機錄影之類），不是「還沒刮到」。
+    ? `<div class="badge ep">${counts || '季集待確認'}</div>` : '';
+  // skip = 本來就不需要 metadata（手機錄影之類），不是「尚未配對」。
   // 這個條件要跟後端的 _UNSCRAPED_SQL 一致，不然後台數字跟這裡的紅點對不上。
   const unscraped = !['ok', 'manual', 'skip'].includes(it.scrape_state)
-    ? `<div class="badge" style="background:rgba(255,92,92,.8)">未刮削</div>` : '';
+    ? `<div class="badge" style="background:rgba(255,92,92,.8)">${metadataState(it.scrape_state)}</div>` : '';
   return `<div class="card" data-id="${it.id}">
     <div class="poster">${poster}${rate}${kind}${unscraped}</div>
     <div class="meta"><div class="t">${esc(it.title)}</div>
@@ -321,8 +327,10 @@ async function openItem(id) {
   $('#modal').innerHTML = '<div class="loading">載入中…</div>';
   const it = await api('/api/items/' + id);
   const files = it.kind === 'tv'
-    ? (it.seasons || []).map(s => `<div class="season-h">第 ${s.season} 季</div>` +
-        s.episodes.map(e => e.files.map(f => fileRow(f, `E${String(e.episode).padStart(2, '0')} ${esc(e.title || '')}`)).join('')).join('')
+    ? (it.seasons || []).map(s => `<div class="season-h">${s.season === 0 ? '特別篇' : `第 ${s.season} 季`}</div>` +
+        s.episodes.map(e => `<div class="episode-group"><h4 style="margin:16px 0 6px">E${String(e.episode).padStart(2, '0')} ${esc(e.title || '')}</h4>` +
+          (e.files.length > 1 ? `<div style="color:var(--muted);font-size:12px">${e.files.length} 個播放版本</div>` : '') +
+          e.files.map(f => fileRow(f)).join('') + '</div>').join('')
       ).join('') + (it.files || []).map(f => fileRow(f)).join('')
     : (it.files || []).map(f => fileRow(f)).join('');
 
@@ -337,20 +345,21 @@ async function openItem(id) {
           <div class="sub">${[it.year, it.original_title && it.original_title !== it.title ? esc(it.original_title) : '',
             it.runtime ? it.runtime + ' 分鐘' : '', it.rating ? '★ ' + it.rating.toFixed(1) : ''].filter(Boolean).join(' · ')}</div>
           <div class="tags">${(it.genres || []).map(g => `<span>${esc(g)}</span>`).join('')}</div>
-          <div class="plot">${esc(it.overview || '（無簡介，可能是 TMDB 沒有資料或尚未刮削）')}</div>
+          <div class="sub">${metadataState(it.scrape_state)}</div>
+          <div class="plot">${esc(it.overview || '（無簡介，可能是 TMDB 沒有資料或尚待配對）')}</div>
           ${(it.cast || []).length ? `<div class="sub" style="margin-top:10px">演員：${it.cast.slice(0, 6).map(c => esc(c.name)).join('、')}</div>` : ''}
         </div>
       </div>
     </div>
     <div class="modal-body">
       <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
-        ${me.is_admin ? `<button class="btn" onclick="rescrape(${it.id})">重新刮削</button>` : ''}
-        ${me.is_admin ? `<button class="btn" onclick="manualMatch(${it.id},'${it.kind}','${esc(it.title).replace(/'/g, "\\'")}')">手動指定 TMDB</button>` : ''}
+        ${me.is_admin ? `<button class="btn" onclick="rescrape(${it.id})">更新影片資料</button>` : ''}
+        ${me.is_admin ? `<button class="btn" onclick="manualMatch(${it.id},'${it.kind}','${esc(it.title).replace(/'/g, "\\'")}')">重新配對</button>` : ''}
         ${me.is_admin ? `<button class="btn" onclick="editItem(${it.id})">改片名／年份</button>` : ''}
         ${me.is_admin ? `<button class="btn" onclick="switchKind(${it.id},'${it.kind}')">改成${it.kind === 'tv' ? '電影' : '影集'}</button>` : ''}
       </div>
       ${me.is_admin && it.scrape_state === 'manual'
-        ? '<div class="sub" style="margin-bottom:12px;color:var(--accent)">這一筆是手動修正過的，自動刮削不會再蓋掉它。</div>' : ''}
+        ? '<div class="sub" style="margin-bottom:12px;color:var(--accent)">這一筆是手動修正過的，自動配對不會再蓋掉它。</div>' : ''}
       ${files || '<div class="empty">沒有檔案</div>'}
     </div>`;
 }
@@ -390,8 +399,8 @@ function fileRow(f, label = '') {
 }
 
 window.rescrape = async id => {
-  toast('刮削中…');
-  try { await api('/api/rescrape/' + id, { method: 'POST' }); toast('完成'); openItem(id); loadLibrary(); }
+  toast('更新影片資料中…');
+  try { const r = await api('/api/rescrape/' + id, { method: 'POST' }); toast('完成'); openItem(r.item_id || id); loadLibrary(); }
   catch (e) { toast('失敗：' + e.message); }
 };
 
@@ -411,7 +420,7 @@ window.manualMatch = async (id, kind, title) => {
 };
 /* 只改片名／年份，不接 TMDB。
  * TMDB 上的中文片名有時候就是不好，或者根本沒有中譯 —— 那種情況下
- * 「整筆重刮」解不了問題，使用者要的只是改一個欄位。 */
+ * 「整筆重新配對」解不了問題，使用者要的只是改一個欄位。 */
 window.editItem = async id => {
   const it = await api('/api/items/' + id).catch(() => null);
   if (!it) return toast('讀不到這個條目');
@@ -426,12 +435,12 @@ window.editItem = async id => {
   try {
     const r = await api('/api/items/' + id, { method: 'PATCH', body: JSON.stringify(body) });
     toast('已改：' + (r.changed || []).join('、'));
-    openItem(id); loadLibrary();
+    openItem(r.item_id || id); loadLibrary();
   } catch (e) { toast('失敗：' + e.message); }
 };
 
 /* 類型認錯（電影 ↔ 影集）。
- * 這是「刮到錯的資料」裡最惡劣的一種：TMDB 的搜尋是分 movie / tv 兩個端點的，
+ * 這是「配對到錯的資料」裡最惡劣的一種：TMDB 的搜尋是分 movie / tv 兩個端點的，
  * 類型錯了的話手動指定也永遠搜不到，而畫面上不會告訴你為什麼。 */
 window.switchKind = async (id, cur) => {
   const to = cur === 'tv' ? 'movie' : 'tv';
@@ -439,14 +448,14 @@ window.switchKind = async (id, cur) => {
   const extra = to === 'tv'
     ? '底下的檔案會依檔名重新指派集數（解析不出集數的就按檔名順序給 S01E01、S01E02…）。'
     : '底下的集數資料會被刪掉（含劇照）。';
-  if (!confirm(`把這一筆改成${label}？\n\n${extra}\n\n改完會自動重新刮削一次，因為類型錯的時候 TMDB 資料整份都是錯的。`))
+  if (!confirm(`把這一筆改成${label}？\n\n${extra}\n\n改完會自動更新影片資料一次，因為類型錯的時候 TMDB 資料整份都是錯的。`))
     return;
   toast('處理中…');
   try {
     const r = await api('/api/items/' + id, { method: 'PATCH', body: JSON.stringify({ kind: to }) });
-    toast(r.rescraped === false ? `已改成${label}，但重新刮削失敗：${r.error || ''}`
+    toast(r.rescraped === false ? `已改成${label}，但更新影片資料失敗：${r.error || ''}`
           : `已改成${label}${r.episodes ? `，指派了 ${r.episodes} 集` : ''}`);
-    openItem(id); loadLibrary();
+    openItem(r.item_id || id); loadLibrary();
   } catch (e) { toast('失敗：' + e.message); }
 };
 
@@ -465,8 +474,8 @@ window.reprobe = async fileId => {
 };
 
 window.applyMatch = async (id, tmdbId) => {
-  await api(`/api/rescrape/${id}?tmdb_id=${tmdbId}`, { method: 'POST' });
-  toast('已套用'); openItem(id); loadLibrary();
+  const r = await api(`/api/rescrape/${id}?tmdb_id=${tmdbId}`, { method: 'POST' });
+  toast('已套用'); openItem(r.item_id || id); loadLibrary();
 };
 
 /* ------------------------- 掃描 ------------------------- */
@@ -484,7 +493,7 @@ async function pollScan() {
   let s;
   // crossScope：掃描進度跟 scope 無關，被當成過期回應丟掉的話輪詢就停了
   try { s = await api('/api/scan/status', { crossScope: true }); } catch { return; }
-  const phase = { listing: '掃描 FTP 目錄', indexing: '建立索引', scraping: 'TMDB 刮削',
+  const phase = { listing: '掃描 FTP 目錄', indexing: '建立索引', scraping: '更新影片資料',
     probing: '分析影片格式', photos: '讀取相片', done: '掃描完成', error: '發生錯誤',
     cancelled: '已停止', idle: '待機' }[s.phase] || s.phase;
   $('#scanPhase').textContent = phase;
@@ -493,7 +502,7 @@ async function pollScan() {
 
   let pct = 0, txt = '';
   if (s.phase === 'listing') { txt = `已看 ${s.dirs_seen} 個資料夾，找到 ${s.files_found} 個影片（新增 ${s.files_new}）`; pct = Math.min(90, s.dirs_seen * 2); }
-  else if (s.phase === 'scraping') { pct = s.items_total ? 100 * s.scraped / s.items_total : 0; txt = `刮削 ${s.scraped}/${s.items_total}`; }
+  else if (s.phase === 'scraping') { pct = s.items_total ? 100 * s.scraped / s.items_total : 0; txt = `更新影片資料 ${s.scraped}/${s.items_total}`; }
   else if (s.phase === 'probing') { pct = s.probe_total ? 100 * s.probed / s.probe_total : 0; txt = `分析 ${s.probed}/${s.probe_total}`; }
   // 相片階段原本沒有對照，會直接印出英文 phase，進度條也跳到 100%
   else if (s.phase === 'photos') { pct = s.photo_total ? 100 * s.photos_read / s.photo_total : 0; txt = `讀取相片 ${s.photos_read}/${s.photo_total}`; }

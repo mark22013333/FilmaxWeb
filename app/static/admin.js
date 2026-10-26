@@ -6,6 +6,9 @@
  */
 'use strict';
 
+const metadataState = state => ({ pending: '待配對', failed: '配對失敗', ok: '已配對',
+  manual: '手動配對', skip: '不需配對' }[state] || '待配對');
+
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g,
@@ -132,7 +135,7 @@ TABS.overview = async el => {
   const warn = [];
   if (d.orphans && d.orphans.total) warn.push(`有 ${d.orphans.total} 筆孤兒資料`);
   if (c.failed) warn.push(`${c.failed} 個檔案分析失敗`);
-  if (c.unscraped) warn.push(`${c.unscraped} 個條目還沒刮到資料`);   // no_metadata 刻意不進 warn：
+  if (c.unscraped) warn.push(`${c.unscraped} 個條目尚未配對影片資料`);   // no_metadata 刻意不進 warn：
   // 手機錄影這類東西本來就不會有 metadata，把它算成「問題」等於天天報一個
   // 永遠修不好的假警報，久了整條橫幅就沒人看了。
   if (disk.percent != null && disk.percent >= 90) warn.push(`磁碟只剩 ${bytes(disk.free)}`);
@@ -953,7 +956,7 @@ function wireAcl(el, ac) {
  *  「哪一列是我要的片」與「這一列是哪個版本」。 */
 function fpParts(it) {
   const pad2 = n => String(n).padStart(2, '0');
-  // 沒刮到的孤兒檔沒有 title，退回檔名去掉副檔名 —— 標題空著比什麼都糟。
+  // 尚未配對的孤兒檔沒有 title，退回檔名去掉副檔名 —— 標題空著比什麼都糟。
   const title = it.title || (it.filename || '').replace(/\.[^.]+$/, '') || `#${it.id}`;
   const ep = (it.season != null && it.episode != null)
     ? `S${pad2(it.season)}E${pad2(it.episode)}` : '';
@@ -1251,7 +1254,7 @@ TABS.library = async el => {
      api('/admin/manual').catch(() => ({ items: [] }))]);
   el.innerHTML = `
     <h2 class="sec">媒體庫</h2>
-    <p class="secsub">掃描控制、刮不到與分析失敗的清單、FTP 目錄。</p>
+    <p class="secsub">掃描控制、無法配對與分析失敗的清單、FTP 目錄。</p>
 
     <div class="box">
       <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -1266,8 +1269,8 @@ TABS.library = async el => {
 
     <h3 class="sub">手動修正過的條目（${mn.items.length}）</h3>
     <div class="box" style="font-size:12.5px;color:var(--muted)">
-      這些條目的 TMDB 資料是你自己指定的。<b>自動刮削（含「完整重掃」）不會蓋掉它們</b> ——
-      要連它們一起重刮，在「完整重掃」的確認框裡勾那一格。
+      這些條目的 TMDB 資料是你自己指定的。<b>自動更新影片資料（含「完整重掃」）不會蓋掉它們</b> ——
+      要連它們一起重新配對，在「完整重掃」的確認框裡勾那一格。
     </div>
     ${mn.items.length ? `<div class="scrollx"><table class="t">
       <thead><tr><th>標題</th><th>類型</th><th>年份</th><th>TMDB</th><th>檔案</th><th>修改時間</th></tr></thead>
@@ -1300,19 +1303,19 @@ TABS.library = async el => {
       <div id="ftpList"><div class="empty">按「上一層」或下面的資料夾開始瀏覽。</div></div>
     </div>
 
-    <h3 class="sub">還沒刮到資料（${pr.unscraped_total ?? pr.unscraped.length}）</h3>
+    <h3 class="sub">尚未配對影片資料（${pr.unscraped_total ?? pr.unscraped.length}）</h3>
     ${pr.unscraped.length ? `<div class="scrollx"><table class="t">
       <thead><tr><th>標題</th><th>類型</th><th>年份</th><th>狀態</th><th></th></tr></thead><tbody>
       ${pr.unscraped.map(r => `<tr><td>${esc(r.title)}</td><td>${esc(r.kind)}</td>
-        <td>${r.year || '—'}</td><td>${esc(r.scrape_state)}</td>
+        <td>${r.year || '—'}</td><td>${metadataState(r.scrape_state)}</td>
         <td><button class="btn" data-rescrape="${r.id}">重試</button>
-        <button class="btn" data-skip="${r.id}">不用刮</button></td></tr>`).join('')}
+        <button class="btn" data-skip="${r.id}">不需配對</button></td></tr>`).join('')}
       </tbody></table></div>
       <div class="rowcards">${pr.unscraped.map(r => `<div class="rowcard">
-        <div class="top"><b>${esc(r.title)}</b><span class="st">${esc(r.scrape_state)}</span></div>
+        <div class="top"><b>${esc(r.title)}</b><span class="st">${metadataState(r.scrape_state)}</span></div>
         <dl><dt>類型</dt><dd>${esc(r.kind)}</dd><dt>年份</dt><dd>${r.year || '—'}</dd></dl>
         <div class="acts"><button class="btn" data-rescrape="${r.id}">重試</button>
-        <button class="btn" data-skip="${r.id}">不用刮</button></div>
+        <button class="btn" data-skip="${r.id}">不需配對</button></div>
         </div>`).join('')}</div>`
       : '<div class="empty">沒有待處理的條目。</div>'}
 
@@ -1381,13 +1384,13 @@ TABS.library = async el => {
     const ok = await confirmBox({
       title: '完整重掃', ok: '開始重掃',
       collect: m => { picked.remanual = !!m.querySelector('#cbRemanual')?.checked; },
-      body: `會重新刮削所有條目、重新分析所有檔案。<br><br>
+      body: `會更新所有條目的影片資料、重新分析所有檔案。<br><br>
         ${n ? `<b>手動修正過的 ${n} 筆不會被動到。</b>真的要連它們一起重新自動比對，
                勾下面這一格 —— 你挑的那個 TMDB 配對<b>沒有留在任何地方</b>，
                蓋掉就是蓋掉了。<br>
                <label style="display:flex;gap:8px;align-items:center;margin-top:10px">
                  <input type="checkbox" id="cbRemanual" style="width:16px;height:16px">
-                 <span>連手動修正過的 ${n} 筆也重新刮削</span></label>`
+                 <span>連手動修正過的 ${n} 筆也更新影片資料</span></label>`
              : '目前沒有手動修正過的條目。'}`
     });
     if (!ok) return;
@@ -1417,13 +1420,13 @@ TABS.library = async el => {
     if (dir) return browse(dir.dataset.dir);
     const ds = e.target.dataset || {};
     if (ds.rescrape) {
-      try { await api('/rescrape/' + ds.rescrape, { method: 'POST' }); toast('已重新刮削'); render('library'); }
+      try { await api('/rescrape/' + ds.rescrape, { method: 'POST' }); toast('已更新影片資料'); render('library'); }
       catch (err) { toast(err.message, true); }
       return;
     }
     if (ds.skip) {
-      // 標成「不用刮」：掉出待處理清單，掃描也不會再拿它去打 API。
-      try { await api('/items/' + ds.skip + '/skip', { method: 'POST' }); toast('已標記為不用刮'); render('library'); }
+      // 標成「不需配對」：掉出待處理清單，掃描也不會再拿它去打 API。
+      try { await api('/items/' + ds.skip + '/skip', { method: 'POST' }); toast('已標記為不需配對'); render('library'); }
       catch (err) { toast(err.message, true); }
       return;
     }

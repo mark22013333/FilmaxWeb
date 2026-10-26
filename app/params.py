@@ -167,12 +167,14 @@ _ALL: List[Param] = [
     _p("LIBRARY_LOCAL_ROOTS", NO_UI, section="媒體庫", sensitive=True),
     # 這個路徑會被加進 sys.path 然後 import —— 等於執行那裡的程式碼。
     _p("OPENAVER_PATH", NO_UI, section="媒體庫"),
+    _p("SFTP_KNOWN_HOSTS", NO_UI, section="FTP", sensitive=True),
+    _p("SFTP_KEY_FILE", NO_UI, section="FTP", sensitive=True),
     _p("TRUST_PROXY", NO_UI, type="bool", default=False, section="網路"),
     _p("LOCAL_NETWORKS", NO_UI, section="網路", sensitive=True),
 
     # ---- Tier 1：秘密 ----
     # 問句 3。唯寫欄位，API 任何情況都不回明文。
-    _p("TMDB_API_KEY", SECRET, apply=APPLY_HOT, section="刮削",
+    _p("TMDB_API_KEY", SECRET, apply=APPLY_HOT, section="影片資料",
        label="TMDB API 金鑰", help="沒有它就不會去抓海報與簡介"),
     _p("FTP_PASSWORD", SECRET, apply=APPLY_RELOAD, section="FTP", label="FTP 密碼"),
     _p("GOOGLE_CLIENT_SECRET", SECRET, apply=APPLY_RELOAD, section="登入",
@@ -180,6 +182,9 @@ _ALL: List[Param] = [
 
     # ---- Tier 3：要重載或重啟 ----
     # 問句 4：啟動時被拿去建立長生命週期的東西（連線池、執行緒池、快取）。
+    _p("FTP_PROTOCOL", NEEDS_RELOAD, default="ftp", apply=APPLY_RELOAD,
+       section="FTP", label="傳輸協定", choices=["ftp", "sftp"],
+       help="OpenSSH 選 sftp 並將連接埠改為 22；FTP_TLS 只適用 ftp"),
     _p("FTP_HOST", NEEDS_RELOAD, default="127.0.0.1", apply=APPLY_RELOAD,
        section="FTP", label="FTP 主機", sensitive=True),
     _p("FTP_PORT", NEEDS_RELOAD, type="int", default=21, apply=APPLY_RELOAD,
@@ -232,11 +237,11 @@ _ALL: List[Param] = [
        section="登入", label="新帳號自動核准"),
 
     # ---- Tier 2：DB + UI，即時生效 ----
-    _p("TMDB_LANGUAGE", HOT, default="zh-TW", apply=APPLY_HOT, section="刮削",
-       label="刮削語言"),
-    _p("TMDB_FALLBACK_LANGUAGE", HOT, default="en-US", apply=APPLY_HOT, section="刮削",
-       label="退回語言", help="刮不到中文簡介時改用這個語言"),
-    _p("TMDB_RATE_LIMIT", HOT, type="int", default=8, apply=APPLY_HOT, section="刮削",
+    _p("TMDB_LANGUAGE", HOT, default="zh-TW", apply=APPLY_HOT, section="影片資料",
+       label="影片資料語言"),
+    _p("TMDB_FALLBACK_LANGUAGE", HOT, default="en-US", apply=APPLY_HOT, section="影片資料",
+       label="退回語言", help="沒有中文簡介時改用這個語言"),
+    _p("TMDB_RATE_LIMIT", HOT, type="int", default=8, apply=APPLY_HOT, section="影片資料",
        label="每秒請求上限", minimum=1, maximum=50),
 
     _p("TRANSCODE_CRF", HOT, type="int", default=21, apply=APPLY_HOT, section="轉碼",
@@ -326,7 +331,7 @@ _ALL: List[Param] = [
             "這些資料夾底下的影片不論多小都收 —— 用來收特定目錄裡的短片，"
             "而不必為它把全域的 MIN_FILE_MB 調低（調低會把手機錄的短片全部拉進來）"),
     _p("SCAN_JAV_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
-       label="走 JAV 刮削的資料夾", validate=_dir_names,
+       label="走 JAV 資料配對的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下的影片改用 javbus/fc2/d2pass/jav321 查 metadata，"
             "不走 TMDB（TMDB 查不到番號）。目錄命中之後還要真的解得出番號才算，"
@@ -336,7 +341,7 @@ _ALL: List[Param] = [
        label="家庭錄影的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下、檔名是 20211002_213546+0800 這種格式的影片會歸到"
-            "「錄影」分類，標題自動變成可讀日期，不去刮 TMDB（本來就查不到）。"
+            "「錄影」分類，標題自動變成可讀日期，不查詢 TMDB（本來就查不到）。"
             "解不出日期的檔案不受影響，照舊走原本的判斷"),
     _p("SCAN_EXCLUDE_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的副檔名", help="逗號分隔。跟下面同時設定時，這裡優先"),

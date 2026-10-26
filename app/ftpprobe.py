@@ -39,7 +39,9 @@ DEFAULT_MAX = 24
 COOLDOWN = 0.6
 
 
-def _connect(timeout: float) -> ftplib.FTP:
+def _connect(timeout: float) -> ftplib.FTP | _SftpProbe:
+    if settings.ftp_protocol == "sftp":
+        return _SftpProbe(timeout)
     ftp = ftplib.FTP_TLS() if settings.ftp_tls else ftplib.FTP()
     ftp.encoding = settings.ftp_encoding or "utf-8"
     ftp.connect(settings.ftp_host, settings.ftp_port, timeout=timeout)
@@ -48,6 +50,25 @@ def _connect(timeout: float) -> ftplib.FTP:
         ftp.prot_p()
     ftp.set_pasv(settings.ftp_passive)
     return ftp
+
+
+class _SftpProbe:
+    """Only the operations shared by the connection/speed probe."""
+
+    def __init__(self, timeout):
+        from .sftpclient import connection
+        self.context = connection(timeout)
+        self.sftp, _ = self.context.__enter__()
+
+    def pwd(self):
+        return self.sftp.normalize(".")
+
+    def close(self):
+        if self.context is not None:
+            ctx, self.context = self.context, None
+            ctx.__exit__(None, None, None)
+
+    quit = close
 
 
 def _classify(e: Exception) -> str:
@@ -67,7 +88,7 @@ def _classify(e: Exception) -> str:
 
 def _open_n(n: int, timeout: float) -> Tuple[int, List[str]]:
     """同時開 n 條連線，回傳 (成功數, 失敗原因清單)。"""
-    conns: List[ftplib.FTP] = []
+    conns: List[ftplib.FTP | _SftpProbe] = []
     errors: List[str] = []
     lock = threading.Lock()
 
@@ -139,6 +160,19 @@ def _pick_file(timeout: float) -> Optional[Tuple[str, int]]:
         while stack and seen < 60:
             d = stack.pop(0)
             seen += 1
+            if isinstance(c, _SftpProbe):
+                import stat
+                try:
+                    for entry in c.sftp.listdir_attr(d):
+                        full = d.rstrip("/") + "/" + entry.filename
+                        if stat.S_ISDIR(entry.st_mode or 0):
+                            if len(stack) < 40 and not entry.filename.startswith("."):
+                                stack.append(full)
+                        elif stat.S_ISREG(entry.st_mode or 0) and (entry.st_size or 0) >= 512 * 1024:
+                            return full, entry.st_size
+                except OSError:
+                    continue
+                continue
             try:
                 c.cwd(d)
                 entries = []
@@ -173,7 +207,7 @@ def _pick_file(timeout: float) -> Optional[Tuple[str, int]]:
 CHUNK_BUDGET = 8 * 1024 * 1024
 
 
-def _fetch_chunk(ftp: ftplib.FTP, path: str, budget: int, stop: threading.Event) -> int:
+def _fetch_chunk(ftp: ftplib.FTP | _SftpProbe, path: str, budget: int, stop: threading.Event) -> int:
     """抓一段就停，而且**不能用 ftplib 的 abort()**。
 
     abort() 會讓控制連線失去同步 —— 它送 ABOR 之後的回應處理有問題，
@@ -184,6 +218,15 @@ def _fetch_chunk(ftp: ftplib.FTP, path: str, budget: int, stop: threading.Event)
 
     正確做法是直接關掉資料連線（伺服器會回 426），控制連線保持乾淨。
     """
+    if isinstance(ftp, _SftpProbe):
+        got = 0
+        with ftp.sftp.open(path, "rb") as source:
+            while got < budget and not stop.is_set():
+                block = source.read(min(65536, budget - got))
+                if not block:
+                    break
+                got += len(block)
+        return got
     sock, _ = ftp.ntransfercmd("RETR " + path)
     got = 0
     try:

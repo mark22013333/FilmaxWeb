@@ -346,6 +346,30 @@ try {
   dropLegacy(cfg);
 } catch {}
 
+const VISUAL_FIELDS = {
+  brightness: { label: '亮度', min: 50, max: 200 },
+  contrast: { label: '對比', min: 50, max: 200 },
+  saturation: { label: '飽和度', min: 0, max: 200 },
+};
+function readVisualPrefs() {
+  let raw;
+  try { raw = JSON.parse(localStorage.getItem('filmax.player.visual') || '{}'); } catch {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+  return Object.fromEntries(Object.entries(VISUAL_FIELDS).map(([key, field]) =>
+    [key, typeof raw[key] === 'number' && Number.isFinite(raw[key])
+      ? clamp(raw[key], field.min, field.max) : 100]));
+}
+let visualPrefs = readVisualPrefs();
+function applyVisualStyle() {
+  v.style.filter = Object.values(visualPrefs).every(value => value === 100) ? 'none'
+    : `brightness(${visualPrefs.brightness}%) contrast(${visualPrefs.contrast}%) saturate(${visualPrefs.saturation}%)`;
+}
+function saveVisualPrefs() {
+  applyVisualStyle();
+  try { localStorage.setItem('filmax.player.visual', JSON.stringify(visualPrefs)); } catch {}
+}
+applyVisualStyle();
+
 let syncTimer = null;
 function writeLocal() {
   try {
@@ -1383,10 +1407,20 @@ function syncSkipLabels() {
 $('#vol').oninput = e => { v.volume = +e.target.value; v.muted = false; cfg.volume = v.volume; cfg.muted = false; saveCfg(); };
 $('#btnMute').onclick = () => { v.muted = !v.muted; cfg.muted = v.muted; saveCfg(); syncVol(); };
 function syncVol() {
-  $('#vol').value = v.muted ? 0 : v.volume;
-  $('#icVol').innerHTML = v.muted || !v.volume
-    ? '<path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 9l4 6M21 9l-4 6"/>'
-    : '<path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 010 7"/>';
+  const muted = v.muted || v.volume === 0;
+  const level = muted ? 'muted' : v.volume <= .5 ? 'low' : 'high';
+  $('#vol').value = muted ? 0 : v.volume;
+  const speaker = '<path d="M4 9v6h4l5 4V5L8 9H4z"/>';
+  $('#icVol').innerHTML = speaker + (muted
+    ? '<path d="M17 9l4 6M21 9l-4 6"/>'
+    : '<path d="M16 9a4 4 0 010 6"/>'
+      + (level === 'high' ? '<path d="M19 6a8 8 0 010 12"/>' : ''));
+  const button = $('#btnMute');
+  button.dataset.volumeState = level;
+  const label = (v.muted ? '取消靜音' : '靜音') + `，音量 ${Math.round(v.volume * 100)}% (m)`;
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.setAttribute('aria-pressed', String(v.muted));
 }
 
 /* ---------------- 進度條：Scrubbing 與 Seek ----------------
@@ -2263,6 +2297,13 @@ function buildPanel() {
        <span class="val" data-val="${id}">${val}${unit}</span></div>`;
 
   p.innerHTML = `
+    <h4>畫面調整</h4>
+    ${Object.entries(VISUAL_FIELDS).map(([key, field]) => `<div class="pi">
+      <label for="visual-${key}">${field.label}</label>
+      <input id="visual-${key}" type="range" data-visual="${key}" min="${field.min}" max="${field.max}" step="1" value="${visualPrefs[key]}">
+      <span class="val" data-visual-value="${key}">${visualPrefs[key]}%</span></div>`).join('')}
+    <div class="foot"><button data-visual-reset="1">恢復畫面預設值</button></div>
+    <div class="hint">僅記住目前瀏覽器的畫面設定，不影響字幕。原生全螢幕或子母畫面可能不套用調整，請使用網頁全螢幕。</div>
     <h4>字幕</h4>
     <div class="opt ${curSub < 0 ? 'on' : ''}" data-sub="-1"><span class="tick">${curSub<0?'✓':''}</span>關閉</div>
     ${subs.length ? `<div class="opt ${savedPick()===undefined?'on':''}" data-sub="auto">
@@ -2340,6 +2381,17 @@ function buildPanel() {
       `<div class="ir"><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('')}</div>
     <div class="foot"><button data-reset="1">恢復字幕預設值</button></div>`;
 
+  p.querySelectorAll('[data-visual]').forEach(el => el.oninput = () => {
+    const key = el.dataset.visual;
+    const field = VISUAL_FIELDS[key];
+    visualPrefs[key] = clamp(Number(el.value), field.min, field.max);
+    p.querySelector(`[data-visual-value="${key}"]`).textContent = visualPrefs[key] + '%';
+    saveVisualPrefs();
+  });
+  p.querySelector('[data-visual-reset]').onclick = () => {
+    visualPrefs = { brightness: 100, contrast: 100, saturation: 100 };
+    saveVisualPrefs(); buildPanel(); toast('已恢復畫面預設值');
+  };
   p.querySelectorAll('[data-sub]').forEach(el => el.onclick = () => {
     if (el.dataset.sub === 'auto') {
       forgetPick();
@@ -2560,6 +2612,7 @@ v.addEventListener('error', () => {
    而回到 Safari 再關分頁只會觸發後者。 */
 const SAVE_EVERY_MS = 8000;
 let lastSaveAt = 0, lastSavedPos = -1;
+let nextEpisodeNavigation = false;
 
 /** 寫進度。force = 不管節流一定寫（離開頁面、暫停、播完）。
  *
@@ -2567,7 +2620,7 @@ let lastSaveAt = 0, lastSavedPos = -1;
  *  但它在部分瀏覽器有佇列上限、也可能回 false —— 回 false 時退回
  *  keepalive fetch，不要靜靜地掉掉。 */
 function saveProgress(finished = false, { force = false } = {}) {
-  if (!info) return;
+  if (!info || nextEpisodeNavigation) return;
   // **拖曳期間絕對不能寫進度。**preview 只是「打算跳到哪」，真正的
   // currentTime 還停在原處；而 seek 已經送出、還沒落地時 currentTime 也
   // 仍是舊值。這兩種情形寫進去都是把錯的位置蓋到資料庫上 ——
@@ -2598,7 +2651,7 @@ function saveProgress(finished = false, { force = false } = {}) {
   }
 }
 
-/** 確實把目前這一集標記完成，並等到真的送出去為止。
+/** 等待換集前的進度寫入，片尾跳集預設標記完成。
  *
  *  **為什麼需要一個會 await 的版本**：切下一集時如果只發 sendBeacon 再
  *  立刻 `location.href = ...`，導覽會把還沒送出的請求砍掉 ——
@@ -2607,10 +2660,10 @@ function saveProgress(finished = false, { force = false } = {}) {
  *
  *  所以這裡用會回 Promise 的 fetch + keepalive，並在跳頁前 await 它。
  *  逾時也要放行 —— 網路卡住不該把使用者困在這一頁。 */
-async function finishCurrentEpisode() {
+async function finishCurrentEpisode(finished = true) {
   if (!info) return;
   const body = JSON.stringify({ file_id: +fileId, position: v.currentTime || 0,
-    duration: getCanonicalDuration(), finished: true });
+    duration: getCanonicalDuration(), finished });
   lastSaveAt = Date.now(); lastSavedPos = v.currentTime;
   try {
     await Promise.race([
@@ -2649,6 +2702,14 @@ function syncNextEp() {
   const box = $('#nextEp');
   if (!box) return;
   const n = nextEpInfo();
+  const toolbar = $('#btnNextEp');
+  if (toolbar) {
+    toolbar.hidden = !n;
+    toolbar.disabled = nextEpisodeNavigation;
+    const label = n ? [n.label, n.title].filter(Boolean).join(' ') : '';
+    toolbar.title = '播放下一集' + (label ? ' ' + label : '');
+    toolbar.setAttribute('aria-label', toolbar.title);
+  }
   const show = PS.nextEpisodeVisible({
     hasNext: !!n,
     duration: getCanonicalDuration(),
@@ -2664,19 +2725,23 @@ function syncNextEp() {
   }
 }
 
-/** 按下「下一集」：先確實完成這一集，再跳頁。
+/** 換集前先寫入進度，片尾按鈕會把目前這一集標記完成。
  *
  *  順序不能顛倒（見 finishCurrentEpisode 的說明）—— 先跳頁的話，
  *  這一集的 finished 寫不進去，它會重新出現在「繼續觀看」上。 */
-async function goNextEpisode() {
+async function goNextEpisode(finishCurrent = true) {
   const n = nextEpInfo();
-  if (!n) return;
-  const btn = $('#nextEp');
-  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
-  // 這個 pause 是「要換頁了」，不是使用者按暫停 —— 不閃 ❚❚
+  if (!n || nextEpisodeNavigation) return;
+  nextEpisodeNavigation = true;
+  for (const id of ['nextEp', 'btnNextEp']) {
+    const button = $('#' + id);
+    if (button) button.disabled = true;
+  }
   feedbackMuted = true;
   try { v.pause(); } catch {}
-  await finishCurrentEpisode();
+  const nearEnd = PS.nextEpisodeVisible({ hasNext: true, duration: getCanonicalDuration(),
+    currentTime: v.currentTime, ended: v.ended });
+  await finishCurrentEpisode(finishCurrent || nearEnd);
   location.href = n.url || ('/player?file=' + n.file_id);
 }
 
@@ -2686,6 +2751,13 @@ async function goNextEpisode() {
 // 按鈕本身不能吃掉 .tapzone 的點擊：它是 .stage 的子元素而且在上層，
 // 所以要擋住冒泡，否則按下去會同時暫停影片。
 $('#nextEp')?.addEventListener('click', e => { e.stopPropagation(); goNextEpisode(); });
+$('#btnNextEp')?.addEventListener('click', e => { e.stopPropagation(); goNextEpisode(false); });
+window.addEventListener('pageshow', () => {
+  if (nextEpisodeNavigation) feedbackMuted = false;
+  nextEpisodeNavigation = false;
+  $('#nextEp').disabled = false;
+  syncNextEp();
+});
 
 document.addEventListener('keydown', e => {
   if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;

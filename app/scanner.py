@@ -1,4 +1,4 @@
-"""媒體庫掃描：走訪 FTP → 建立/更新條目 → 背景刮削與探測。"""
+"""媒體庫掃描：走訪 FTP → 建立/更新條目 → 背景影片資料更新與探測。"""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
 from . import (db, ftpclient, javscraper, keyframes, media, nameparser, photo,
-               purge, timeparse)
+               purge, series, timeparse)
 from .config import settings
 from .scraper import normalize_details, tmdb
 
@@ -62,10 +62,10 @@ def cancel() -> None:
 def start(full: bool = False, reparse: bool = False, remanual: bool = False) -> bool:
     """開始掃描。
 
-    full     重新刮削所有條目、重新分析所有檔案
+    full     更新所有條目的影片資料、重新分析所有檔案
     reparse  強制重新解析每個檔名並重新分組。改了解析規則之後要用這個 ——
              平常的掃描看到「檔案大小沒變」就早退，不會重新分組。
-    remanual 連手動修正過的條目也重新刮削。**預設 false，而且要跟 full 一起用。**
+    remanual 連手動修正過的條目也更新影片資料。**預設 false，而且要跟 full 一起用。**
              見 `_scrape_items` 的註解 —— 這個開關存在的唯一理由是「真的要換」，
              不該是「完整重掃」的副作用。
     """
@@ -138,6 +138,7 @@ def _run(full: bool, reparse: bool = False, remanual: bool = False) -> None:
 # --------------------------------------------------------------------------
 # 1) 走訪 FTP 建立檔案索引
 # --------------------------------------------------------------------------
+@series.serialized
 def _scan_files(reparse: bool = False) -> None:
     _load_registry()
     seen_paths: List[str] = []
@@ -344,7 +345,7 @@ def _dir_hits(path: str, prefixes: tuple) -> bool:
 
 
 def _jav_dir(path: str) -> bool:
-    """這個檔案的所在目錄是不是走 JAV 刮削。"""
+    """這個檔案的所在目錄是不是走 JAV 資料配對。"""
     return _dir_hits(path, settings.jav_dirs)
 
 
@@ -553,8 +554,8 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     elif root.kind == "tv":
         kind = "tv"
         parsed.is_tv = True
-        parsed.season = parsed.season or 1
-        parsed.episode = parsed.episode or 1
+        parsed.season = 1 if parsed.season is None else parsed.season
+        parsed.episode = 1 if parsed.episode is None else parsed.episode
     else:
         kind = "tv" if parsed.is_tv else "movie"
 
@@ -572,7 +573,7 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
 
     episode_id = None
     if kind == "tv":
-        episode_id = _upsert_episode(item_id, parsed.season or 1, parsed.episode or 1)
+        episode_id = _upsert_episode(item_id, 1 if parsed.season is None else parsed.season, 1 if parsed.episode is None else parsed.episode)
 
     batch.upsert_file(item_id=item_id, episode_id=episode_id, path=entry.path,
                       name=entry.name, size=entry.size, mtime=entry.mtime,
@@ -604,6 +605,11 @@ def _load_registry() -> None:
         _ep_reg.clear()
         for r in db.q("SELECT id, guess_key FROM media_item WHERE guess_key IS NOT NULL"):
             _item_reg[r["guess_key"]] = r["id"]
+        for r in db.q("SELECT a.guess_key,a.item_id FROM media_item_alias a "
+                      "JOIN media_item i ON i.id=a.item_id "
+                      "LEFT JOIN media_item p ON p.guess_key=a.guess_key "
+                      "WHERE i.kind='tv' AND (p.id IS NULL OR p.id=a.item_id)"):
+            _item_reg[r["guess_key"]] = r["item_id"]
         for r in db.q("SELECT id, item_id, season, episode FROM episode"):
             _ep_reg[(r["item_id"], r["season"], r["episode"])] = r["id"]
     log.debug("註冊表載入 %s 個條目、%s 集", len(_item_reg), len(_ep_reg))
@@ -629,7 +635,7 @@ def _upsert_item(kind: str, key: str, parsed, jav_number: str = None,
             title = time.strftime("%Y-%m-%d %H:%M", lt)
             sort_title = time.strftime("%Y%m%d-%H%M%S", lt)
             year = lt.tm_year
-            # 家庭錄影沒有外部 metadata 可刮，這不是「還沒刮到」而是「不用刮」。
+            # 家庭錄影不需要外部影片資料，這不是「尚未配對」而是「不需配對」。
             state = "skip"
         cur = db.execute(
             """INSERT INTO media_item(kind, title, original_title, sort_title, year, guess_key,
@@ -666,10 +672,10 @@ def reassign_episodes(item_id: int) -> int:
     for r in files:
         parsed = nameparser.parse(r["filename"], [])
         season, ep = parsed.season, parsed.episode
-        if not ep:
+        if ep is None:
             auto += 1
-            season, ep = season or 1, auto
-        ep_id = _upsert_episode(item_id, season or 1, ep)
+            season, ep = 1 if season is None else season, auto
+        ep_id = _upsert_episode(item_id, 1 if season is None else season, ep)
         db.execute("UPDATE media_file SET episode_id=? WHERE id=?", (ep_id, r["id"]))
         n += 1
     return n
@@ -704,40 +710,40 @@ def _upsert_episode(item_id: int, season: int, episode: int) -> int:
 
 
 # --------------------------------------------------------------------------
-# 2) TMDB 刮削
+# 2) 更新影片資料
 # --------------------------------------------------------------------------
 def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
-    """刮削。
+    """影片資料更新。
 
-    **`scrape_state='manual'` 的條目預設永遠不刮，連 force 也不刮。**
+    **`scrape_state='manual'` 的條目預設永遠不配對，連 force 也不配對。**
 
     原本 force 的 where 是空字串 —— 於是「完整重掃」會把使用者一個一個手動指定
     好的條目，拿去重新自動比對再蓋掉。而自動比對之所以會挑錯，通常是檔名的問題，
     那個原因不會因為重掃而改變，所以它會挑錯第二次，一模一樣。
     整件事沒有任何提示，使用者只會發現「我修好的片又變回錯的了」。
 
-    實測（Yu 的資料庫）：一般掃描會刮 9 筆，force 會刮 23 筆 ——
+    實測（Yu 的資料庫）：一般掃描會處理 9 筆，force 會處理 23 筆 ——
     手動修正過的 2 筆也在裡面。
 
-    真的要重刮手動修正過的條目時，走 include_manual=True（後台一個預設關閉的
+    真的要重新配對手動修正過的條目時，走 include_manual=True（後台一個預設關閉的
     勾選）。那必須是一個明確的動作，不是「完整重掃」的副作用。
     """
-    # 兩個刮削源各自獨立：TMDB 沒設不該擋住 JAV，反之亦然。
-    # 兩個都沒有才是真的不用刮。
+    # 兩個影片資料更新源各自獨立：TMDB 沒設不該擋住 JAV，反之亦然。
+    # 兩個都沒有才是真的不需配對。
     if not tmdb.enabled and not javscraper.enabled():
-        status.note("未設定 TMDB_API_KEY，OpenAver 也沒載入成功，跳過刮削"
+        status.note("未設定 TMDB_API_KEY，OpenAver 也沒載入成功，跳過影片資料更新"
                     "（仍可用檔名瀏覽與播放）")
         return
     if not tmdb.enabled:
-        status.note("未設定 TMDB_API_KEY，只刮 JAV 條目")
+        status.note("未設定 TMDB_API_KEY，只配對 JAV 條目")
     if not javscraper.enabled():
-        status.note("OpenAver 沒載入成功（原因見後台〈系統〉），JAV 條目會維持未刮削")
+        status.note("OpenAver 沒載入成功（原因見後台〈系統〉），JAV 條目會維持待配對")
     if force:
         where = "" if include_manual else "WHERE scrape_state != 'manual'"
     else:
         where = "WHERE scrape_state IN ('pending','failed')"
-    # `skip` 一律不刮，連 include_manual 也不刮 —— 「重刮我手動修正過的」跟
-    # 「重刮本來就不該有 metadata 的」是兩件不同的事，前者不該蘊含後者。
+    # `skip` 一律不配對，連 include_manual 也不配對 —— 「重新配對我手動修正過的」跟
+    # 「重新配對本來就不該有 metadata 的」是兩件不同的事，前者不該蘊含後者。
     # 疊在上面而不是寫進那兩行，是因為那兩行的字面被 rescrape_test 釘住了；
     # 行為由這裡補完，測試改成驗結果集而不是比對字串。
     where = f"{where} AND scrape_state != 'skip'" if where else "WHERE scrape_state != 'skip'"
@@ -745,63 +751,72 @@ def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
     if force and not include_manual:
         kept = db.q1("SELECT COUNT(*) c FROM media_item WHERE scrape_state='manual'")["c"]
         if kept:
-            status.note(f"保留 {kept} 筆手動修正過的條目（沒有重新刮削）")
+            status.note(f"保留 {kept} 筆手動修正過的條目（沒有更新影片資料）")
     status.items_total = len(rows)
-    for row in rows:
+    for queued in rows:
         if _cancel.is_set():
             return
-        status.current = row["title"]
-        # 先記一次嘗試再去打 API：這樣即使中途當掉，次數也算得準。
-        # 目前只記錄不做退避 —— 退避的閾值要等這些數字累積出分佈再定。
-        db.execute("UPDATE media_item SET scrape_attempts=COALESCE(scrape_attempts,0)+1, "
-                   "scrape_last_at=? WHERE id=?", (db.now_i(), row["id"]))
-        try:
-            _scrape_one(dict(row))
-        except Exception as e:
-            log.warning("刮削失敗 %s: %s", row["title"], e)
-            db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
-                       (db.now_i(), row["id"]))
-        status.scraped += 1
+        with series.mutation_lock:
+            row = db.q1("SELECT * FROM media_item WHERE id=?", (queued["id"],))
+            if row is None or row["scrape_state"] == "skip" or (
+                    row["scrape_state"] == "manual" and not include_manual):
+                status.scraped += 1
+                continue
+            status.current = row["title"]
+            # 先記一次嘗試再去打 API：這樣即使中途當掉，次數也算得準。
+            # 目前只記錄不做退避 —— 退避的閾值要等這些數字累積出分佈再定。
+            db.execute("UPDATE media_item SET scrape_attempts=COALESCE(scrape_attempts,0)+1, "
+                       "scrape_last_at=? WHERE id=?", (db.now_i(), row["id"]))
+            try:
+                _scrape_one(dict(row))
+            except Exception as e:
+                log.warning("配對失敗 %s: %s", row["title"], e)
+                db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
+                           (db.now_i(), row["id"]))
+            status.scraped += 1
 
 
-def _scrape_one(item: dict) -> None:
+@series.serialized
+def _scrape_one(item: dict) -> int:
     kind = item["kind"]
     if kind == "jav":
         _scrape_one_jav(item)
-        return
+        return item["id"]
     if not tmdb.enabled:
-        return
+        return item["id"]
     hit = tmdb.search(kind, item["title"], item.get("year"), item.get("original_title") or "")
     if not hit:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
                    (db.now_i(), item["id"]))
         status.note(f"找不到: {item['title']}")
-        return
+        return item["id"]
     detail = tmdb.details(kind, hit["id"])
     if not detail:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
                    (db.now_i(), item["id"]))
-        return
+        return item["id"]
     n = normalize_details(kind, detail)
     poster = tmdb.download_image(n["poster_path"], "w500")
     backdrop = tmdb.download_image(n["backdrop_path"], "w1280")
-    db.execute(
-        """UPDATE media_item SET title=?, original_title=?, sort_title=?, year=?, tmdb_id=?,
-               overview=?, poster=?, backdrop=?, rating=?, runtime=?, genres=?, cast_json=?,
-               scrape_state='ok', updated_at=? WHERE id=?""",
-        (n["title"] or item["title"], n["original_title"], (n["title"] or "").lower(),
-         n["year"] or item.get("year"), n["tmdb_id"], n["overview"], poster, backdrop,
-         n["rating"], n["runtime"], json.dumps(n["genres"], ensure_ascii=False),
-         json.dumps(n["cast"], ensure_ascii=False), db.now_i(), item["id"]),
-    )
-    status.note(f"刮到: {n['title']} ({n['year'] or '-'})")
-
     if kind == "tv":
         _scrape_seasons(item["id"], n["tmdb_id"])
+    item_id = series.save_metadata(item["id"], {
+        "title": n["title"] or item["title"], "original_title": n["original_title"],
+        "sort_title": (n["title"] or item["title"]).lower(), "year": n["year"] or item.get("year"),
+        "tmdb_id": n["tmdb_id"], "overview": n["overview"], "poster": poster, "backdrop": backdrop,
+        "rating": n["rating"], "runtime": n["runtime"],
+        "genres": json.dumps(n["genres"], ensure_ascii=False),
+        "cast_json": json.dumps(n["cast"], ensure_ascii=False),
+        "scrape_state": "manual" if item.get("scrape_state") == "manual" else "ok",
+        "updated_at": db.now_i(),
+    })
+    _load_registry()
+    status.note(f"已配對: {n['title']} ({n['year'] or '-'})")
+    return item_id
 
 
 def _scrape_one_jav(item: dict) -> None:
-    """番號類作品的刮削。查不到就標 failed，下次掃描會再試。
+    """番號類作品的影片資料更新。查不到就標 failed，下次掃描會再試。
 
     **不寫 NFO、不動影片檔旁邊的任何東西** —— 產出只進 media_item。
     （OpenAver 自己的 GUI 會寫 NFO，那是給 Jellyfin 用的另一條路，
@@ -842,7 +857,7 @@ def _scrape_one_jav(item: dict) -> None:
          n["number"] or number, n["maker"], n["label"], n["director"], n["source"],
          db.now_i(), item["id"]),
     )
-    status.note(f"刮到: {n['number'] or number} {n['title'][:30]} ({n['source']})")
+    status.note(f"配對到: {n['number'] or number} {n['title'][:30]} ({n['source']})")
 
 
 def _scrape_seasons(item_id: int, tmdb_id: int) -> None:
