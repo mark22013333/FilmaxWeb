@@ -438,3 +438,11 @@ body.page-fs .ctl{padding-bottom:max(10px, env(safe-area-inset-bottom))}
   .next-ep{transition:none}
   .next-ep:hover{transform:none}
 }
+
+@media(max-width:480px){
+  .row{flex-wrap:wrap;gap:3px}
+  .time{order:1;flex:0 0 100%;text-align:center;padding:0}
+  .grow{min-width:0}
+  .panel{bottom:110px}
+  .next-ep{bottom:calc(130px + env(safe-area-inset-bottom))}
+}
