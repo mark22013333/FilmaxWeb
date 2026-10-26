@@ -237,11 +237,11 @@ _ALL: List[Param] = [
        section="登入", label="新帳號自動核准"),
 
     # ---- Tier 2：DB + UI，即時生效 ----
-    _p("TMDB_LANGUAGE", HOT, default="zh-TW", apply=APPLY_HOT, section="刮削",
-       label="刮削語言"),
-    _p("TMDB_FALLBACK_LANGUAGE", HOT, default="en-US", apply=APPLY_HOT, section="刮削",
-       label="退回語言", help="刮不到中文簡介時改用這個語言"),
-    _p("TMDB_RATE_LIMIT", HOT, type="int", default=8, apply=APPLY_HOT, section="刮削",
+    _p("TMDB_LANGUAGE", HOT, default="zh-TW", apply=APPLY_HOT, section="影片資料",
+       label="影片資料語言"),
+    _p("TMDB_FALLBACK_LANGUAGE", HOT, default="en-US", apply=APPLY_HOT, section="影片資料",
+       label="退回語言", help="沒有中文簡介時改用這個語言"),
+    _p("TMDB_RATE_LIMIT", HOT, type="int", default=8, apply=APPLY_HOT, section="影片資料",
        label="每秒請求上限", minimum=1, maximum=50),
 
     _p("TRANSCODE_CRF", HOT, type="int", default=21, apply=APPLY_HOT, section="轉碼",
@@ -331,7 +331,7 @@ _ALL: List[Param] = [
             "這些資料夾底下的影片不論多小都收 —— 用來收特定目錄裡的短片，"
             "而不必為它把全域的 MIN_FILE_MB 調低（調低會把手機錄的短片全部拉進來）"),
     _p("SCAN_JAV_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
-       label="走 JAV 刮削的資料夾", validate=_dir_names,
+       label="走 JAV 資料配對的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下的影片改用 javbus/fc2/d2pass/jav321 查 metadata，"
             "不走 TMDB（TMDB 查不到番號）。目錄命中之後還要真的解得出番號才算，"
@@ -341,7 +341,7 @@ _ALL: List[Param] = [
        label="家庭錄影的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
             "這些資料夾底下、檔名是 20211002_213546+0800 這種格式的影片會歸到"
-            "「錄影」分類，標題自動變成可讀日期，不去刮 TMDB（本來就查不到）。"
+            "「錄影」分類，標題自動變成可讀日期，不查詢 TMDB（本來就查不到）。"
             "解不出日期的檔案不受影響，照舊走原本的判斷"),
     _p("SCAN_EXCLUDE_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的副檔名", help="逗號分隔。跟下面同時設定時，這裡優先"),

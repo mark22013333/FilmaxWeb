@@ -830,10 +830,10 @@ def scan_start(full: bool = Query(default=False),
                _: str = Depends(admin_only)):
     """開始掃描。
 
-    full=true     重新刮削所有條目、重新分析所有檔案
+    full=true     更新所有條目的影片資料、重新分析所有檔案
     reparse=true  強制重新解析檔名並重新分組（改了解析規則之後要用）
-    remanual=true 連手動修正過的條目也重新刮削。**只有跟 full 一起才有意義**，
-                  而且預設是 false —— 手動修正被自動刮削蓋掉是不可逆的損失
+    remanual=true 連手動修正過的條目也更新影片資料。**只有跟 full 一起才有意義**，
+                  而且預設是 false —— 手動修正被自動配對蓋掉是不可逆的損失
                   （使用者挑的那個 tmdb_id 沒有留在任何地方）。
     """
     if not scanner.start(full=full, reparse=reparse, remanual=remanual and full):
@@ -1575,7 +1575,7 @@ def admin_overview(_: str = Depends(admin_only)):
 
 @router.get("/admin/problems")
 def admin_problems(_: str = Depends(admin_only)):
-    """未刮削與探測失敗的清單。總覽只給數字，這裡給名字。"""
+    """待配對與探測失敗的清單。總覽只給數字，這裡給名字。"""
     return {
         # 只列真的要處理的（同 _UNSCRAPED_SQL）。之前是 `!='ok'`，於是這張
         # 表會被 127 筆手機錄影塞爆，加了操作按鈕也找不到該按哪一個。

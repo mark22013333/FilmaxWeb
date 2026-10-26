@@ -422,7 +422,7 @@ check("每張表都有空狀態", admin_js.count("empty\">") >= 4 or admin_js.co
 # 從此不存在 —— 而沒有人會發現，所以逐項釘住。
 MUST_HAVE = {
     "總覽": ["/admin/overview", "磁碟剩餘", "孤兒", "最近活動", "待審核"],
-    "媒體庫": ["/scan", "/ftp/browse", "還沒刮到資料", "分析失敗", "上一層"],
+    "媒體庫": ["/scan", "/ftp/browse", "尚未配對影片資料", "分析失敗", "上一層"],
     "使用者": ["/users", "核准", "拒絕", "停權", "刪除", "備註", "最後登入"],
     "播放與轉碼": ["/diagnostics/encoder/", "/diagnostics/bench/", "/diagnostics/gpu",
                    "/admin/ftp-probe", "/cache/clear"],
