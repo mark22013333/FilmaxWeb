@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
 from . import (db, ftpclient, javscraper, keyframes, media, nameparser, photo,
-               purge, timeparse)
+               purge, series, timeparse)
 from .config import settings
 from .scraper import normalize_details, tmdb
 
@@ -138,6 +138,7 @@ def _run(full: bool, reparse: bool = False, remanual: bool = False) -> None:
 # --------------------------------------------------------------------------
 # 1) 走訪 FTP 建立檔案索引
 # --------------------------------------------------------------------------
+@series.serialized
 def _scan_files(reparse: bool = False) -> None:
     _load_registry()
     seen_paths: List[str] = []
@@ -553,8 +554,8 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     elif root.kind == "tv":
         kind = "tv"
         parsed.is_tv = True
-        parsed.season = parsed.season or 1
-        parsed.episode = parsed.episode or 1
+        parsed.season = 1 if parsed.season is None else parsed.season
+        parsed.episode = 1 if parsed.episode is None else parsed.episode
     else:
         kind = "tv" if parsed.is_tv else "movie"
 
@@ -572,7 +573,7 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
 
     episode_id = None
     if kind == "tv":
-        episode_id = _upsert_episode(item_id, parsed.season or 1, parsed.episode or 1)
+        episode_id = _upsert_episode(item_id, 1 if parsed.season is None else parsed.season, 1 if parsed.episode is None else parsed.episode)
 
     batch.upsert_file(item_id=item_id, episode_id=episode_id, path=entry.path,
                       name=entry.name, size=entry.size, mtime=entry.mtime,
@@ -604,6 +605,11 @@ def _load_registry() -> None:
         _ep_reg.clear()
         for r in db.q("SELECT id, guess_key FROM media_item WHERE guess_key IS NOT NULL"):
             _item_reg[r["guess_key"]] = r["id"]
+        for r in db.q("SELECT a.guess_key,a.item_id FROM media_item_alias a "
+                      "JOIN media_item i ON i.id=a.item_id "
+                      "LEFT JOIN media_item p ON p.guess_key=a.guess_key "
+                      "WHERE i.kind='tv' AND (p.id IS NULL OR p.id=a.item_id)"):
+            _item_reg[r["guess_key"]] = r["item_id"]
         for r in db.q("SELECT id, item_id, season, episode FROM episode"):
             _ep_reg[(r["item_id"], r["season"], r["episode"])] = r["id"]
     log.debug("註冊表載入 %s 個條目、%s 集", len(_item_reg), len(_ep_reg))
@@ -666,10 +672,10 @@ def reassign_episodes(item_id: int) -> int:
     for r in files:
         parsed = nameparser.parse(r["filename"], [])
         season, ep = parsed.season, parsed.episode
-        if not ep:
+        if ep is None:
             auto += 1
-            season, ep = season or 1, auto
-        ep_id = _upsert_episode(item_id, season or 1, ep)
+            season, ep = 1 if season is None else season, auto
+        ep_id = _upsert_episode(item_id, 1 if season is None else season, ep)
         db.execute("UPDATE media_file SET episode_id=? WHERE id=?", (ep_id, r["id"]))
         n += 1
     return n
@@ -745,63 +751,72 @@ def _scrape_items(force: bool = False, include_manual: bool = False) -> None:
     if force and not include_manual:
         kept = db.q1("SELECT COUNT(*) c FROM media_item WHERE scrape_state='manual'")["c"]
         if kept:
-            status.note(f"保留 {kept} 筆手動修正過的條目（沒有重新刮削）")
+            status.note(f"保留 {kept} 筆手動修正過的條目（沒有更新影片資料）")
     status.items_total = len(rows)
-    for row in rows:
+    for queued in rows:
         if _cancel.is_set():
             return
-        status.current = row["title"]
-        # 先記一次嘗試再去打 API：這樣即使中途當掉，次數也算得準。
-        # 目前只記錄不做退避 —— 退避的閾值要等這些數字累積出分佈再定。
-        db.execute("UPDATE media_item SET scrape_attempts=COALESCE(scrape_attempts,0)+1, "
-                   "scrape_last_at=? WHERE id=?", (db.now_i(), row["id"]))
-        try:
-            _scrape_one(dict(row))
-        except Exception as e:
-            log.warning("刮削失敗 %s: %s", row["title"], e)
-            db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
-                       (db.now_i(), row["id"]))
-        status.scraped += 1
+        with series.mutation_lock:
+            row = db.q1("SELECT * FROM media_item WHERE id=?", (queued["id"],))
+            if row is None or row["scrape_state"] == "skip" or (
+                    row["scrape_state"] == "manual" and not include_manual):
+                status.scraped += 1
+                continue
+            status.current = row["title"]
+            # 先記一次嘗試再去打 API：這樣即使中途當掉，次數也算得準。
+            # 目前只記錄不做退避 —— 退避的閾值要等這些數字累積出分佈再定。
+            db.execute("UPDATE media_item SET scrape_attempts=COALESCE(scrape_attempts,0)+1, "
+                       "scrape_last_at=? WHERE id=?", (db.now_i(), row["id"]))
+            try:
+                _scrape_one(dict(row))
+            except Exception as e:
+                log.warning("配對失敗 %s: %s", row["title"], e)
+                db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
+                           (db.now_i(), row["id"]))
+            status.scraped += 1
 
 
-def _scrape_one(item: dict) -> None:
+@series.serialized
+def _scrape_one(item: dict) -> int:
     kind = item["kind"]
     if kind == "jav":
         _scrape_one_jav(item)
-        return
+        return item["id"]
     if not tmdb.enabled:
-        return
+        return item["id"]
     hit = tmdb.search(kind, item["title"], item.get("year"), item.get("original_title") or "")
     if not hit:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
                    (db.now_i(), item["id"]))
         status.note(f"找不到: {item['title']}")
-        return
+        return item["id"]
     detail = tmdb.details(kind, hit["id"])
     if not detail:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
                    (db.now_i(), item["id"]))
-        return
+        return item["id"]
     n = normalize_details(kind, detail)
     poster = tmdb.download_image(n["poster_path"], "w500")
     backdrop = tmdb.download_image(n["backdrop_path"], "w1280")
-    db.execute(
-        """UPDATE media_item SET title=?, original_title=?, sort_title=?, year=?, tmdb_id=?,
-               overview=?, poster=?, backdrop=?, rating=?, runtime=?, genres=?, cast_json=?,
-               scrape_state='ok', updated_at=? WHERE id=?""",
-        (n["title"] or item["title"], n["original_title"], (n["title"] or "").lower(),
-         n["year"] or item.get("year"), n["tmdb_id"], n["overview"], poster, backdrop,
-         n["rating"], n["runtime"], json.dumps(n["genres"], ensure_ascii=False),
-         json.dumps(n["cast"], ensure_ascii=False), db.now_i(), item["id"]),
-    )
-    status.note(f"刮到: {n['title']} ({n['year'] or '-'})")
-
     if kind == "tv":
         _scrape_seasons(item["id"], n["tmdb_id"])
+    item_id = series.save_metadata(item["id"], {
+        "title": n["title"] or item["title"], "original_title": n["original_title"],
+        "sort_title": (n["title"] or item["title"]).lower(), "year": n["year"] or item.get("year"),
+        "tmdb_id": n["tmdb_id"], "overview": n["overview"], "poster": poster, "backdrop": backdrop,
+        "rating": n["rating"], "runtime": n["runtime"],
+        "genres": json.dumps(n["genres"], ensure_ascii=False),
+        "cast_json": json.dumps(n["cast"], ensure_ascii=False),
+        "scrape_state": "manual" if item.get("scrape_state") == "manual" else "ok",
+        "updated_at": db.now_i(),
+    })
+    _load_registry()
+    status.note(f"已配對: {n['title']} ({n['year'] or '-'})")
+    return item_id
 
 
 def _scrape_one_jav(item: dict) -> None:
-    """番號類作品的刮削。查不到就標 failed，下次掃描會再試。
+    """番號類作品的影片資料更新。查不到就標 failed，下次掃描會再試。
 
     **不寫 NFO、不動影片檔旁邊的任何東西** —— 產出只進 media_item。
     （OpenAver 自己的 GUI 會寫 NFO，那是給 Jellyfin 用的另一條路，

@@ -12,8 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, hlscache,
-                javscraper, keyframes, media, mssql, params, paramstore, purge, scanner,
-                streamstat, users)
+                javscraper, keyframes, media, mssql, params, paramstore, purge,
+                scanner, series, streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
 
@@ -163,10 +163,13 @@ def library(
     if genre:
         where.append("i.genres LIKE ?")
         params.append(f'%"{genre}"%')
+    file_acl, file_args = acl.filter_sql(request, "f.ftp_path")
+    visible_file = (" AND " + file_acl) if file_acl else ""
     if q:
         where.append("(i.title LIKE ? OR i.original_title LIKE ? OR EXISTS("
-                     "SELECT 1 FROM media_file f WHERE f.item_id=i.id AND f.filename LIKE ?))")
-        params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+                     "SELECT 1 FROM media_file f WHERE f.item_id=i.id AND f.filename LIKE ?"
+                     + visible_file + "))")
+        params += [f"%{q}%", f"%{q}%", f"%{q}%"] + file_args
     if unscraped:
         where.append(f"i.{_UNSCRAPED_SQL}")
     # 受限資料夾（L）。條目沒有路徑，路徑在 media_file 上，而影集分組可能跨資料夾 ——
@@ -192,12 +195,19 @@ def library(
 
     total = db.q1(f"SELECT COUNT(*) c FROM media_item i WHERE {sql_where}", params)["c"]
     rows = db.q(
-        f"""SELECT i.*,
-                   (SELECT COUNT(*) FROM media_file f WHERE f.item_id=i.id) file_count,
-                   (SELECT COUNT(DISTINCT e.season) FROM episode e WHERE e.item_id=i.id) season_count
-            FROM media_item i WHERE {sql_where}
+        f"""WITH visible_counts AS (
+                SELECT f.item_id, COUNT(*) file_count, COUNT(DISTINCT e.id) episode_count,
+                       COUNT(DISTINCT CASE WHEN e.season>0 THEN e.season END) season_count,
+                       COUNT(DISTINCT CASE WHEN e.season=0 THEN e.id END) special_count
+                FROM media_file f LEFT JOIN episode e ON e.id=f.episode_id AND e.item_id=f.item_id
+                WHERE 1=1{visible_file} GROUP BY f.item_id
+            )
+            SELECT i.*, COALESCE(c.file_count,0) file_count,
+                   COALESCE(c.episode_count,0) episode_count,
+                   COALESCE(c.season_count,0) season_count, COALESCE(c.special_count,0) special_count
+            FROM media_item i LEFT JOIN visible_counts c ON c.item_id=i.id WHERE {sql_where}
             ORDER BY {order} LIMIT ? OFFSET ?""",
-        params + [page_size, (page - 1) * page_size],
+        file_args + params + [page_size, (page - 1) * page_size],
     )
     return {"total": total, "page": page, "page_size": page_size,
             "items": [_item_row(r) for r in rows]}
@@ -332,7 +342,7 @@ def item_detail(item_id: int, request: Request):
     files = [db.row_to_dict(r) for r in db.q(
         f"""SELECT f.*, p.position, p.duration AS watched_duration, p.finished
            FROM media_file f LEFT JOIN play_state p ON p.file_id=f.id
-           WHERE f.item_id=?{(' AND ' + ff) if ff else ''} ORDER BY f.filename""",
+           WHERE f.item_id=?{(' AND ' + ff) if ff else ''} ORDER BY f.filename, f.id""",
         [item_id] + fa)]
     for f in files:
         f["size_gb"] = round((f.get("size") or 0) / 1024 ** 3, 2)
@@ -345,6 +355,8 @@ def item_detail(item_id: int, request: Request):
             by_ep.setdefault(f.get("episode_id"), []).append(f)
         seasons: Dict[int, List[dict]] = {}
         for e in eps:
+            if not by_ep.get(e["id"]):
+                continue
             e["still_url"] = f"/api/image/{e['still']}" if e.get("still") else None
             e["files"] = by_ep.get(e["id"], [])
             seasons.setdefault(e["season"], []).append(e)
@@ -898,88 +910,67 @@ def _rekey(old_key: Optional[str], kind: str, year: Optional[int]) -> Optional[s
     return f"movie::{base}::{year or ''}"
 
 
+def _check_item_key(key: str, item_id: int) -> None:
+    if db.q1("SELECT id FROM media_item WHERE guess_key=? AND id!=?", (key, item_id)):
+        raise HTTPException(409, "相同的檔名分組已存在，請先確認兩筆作品的類型與配對資料")
+
+
 @router.patch("/items/{item_id}")
+@series.serialized
 def item_patch(item_id: int, body: ItemPatch, request: Request,
                _: str = Depends(admin_only)):
-    """手動修正條目：片名、年份、類型。
-
-    改過的條目一律標成 `scrape_state='manual'`，之後自動刮削不會再蓋掉它
-    （見 `scanner._scrape_items`）。
-    """
     row = db.q1("SELECT * FROM media_item WHERE id=?", (item_id,))
     if not row:
         raise HTTPException(404, "找不到條目")
-    item = db.row_to_dict(row) or {}
-    sets, args, notes = [], [], []
-
+    item = dict(row)
     if body.kind is not None and body.kind not in ("movie", "tv", "jav", "home"):
-        raise HTTPException(400, "kind 只能是 movie 或 tv")
-
+        raise HTTPException(400, "kind 只能是 movie、tv、jav 或 home")
     kind = body.kind or item["kind"]
     year = item.get("year") if body.year is None else (body.year or None)
     if year is not None and not (1870 <= int(year) <= 2200):
         raise HTTPException(400, "年份看起來不對")
-
+    changes, notes = {}, []
     if body.title is not None:
-        t = body.title.strip()
-        if not t:
+        title = body.title.strip()
+        if not title:
             raise HTTPException(400, "片名不能空白")
-        # sort_title 一定要跟著改。只改 title 的話排序還是用舊名字，
-        # 而使用者會以為「改了但沒生效」。
-        sets += ["title=?", "sort_title=?"]
-        args += [t, t.lower()]
+        changes.update(title=title, sort_title=title.lower())
         notes.append("片名")
-
     if body.year is not None:
-        sets.append("year=?")
-        args.append(year)
+        changes["year"] = year
         notes.append("年份")
-
     kind_changed = body.kind is not None and body.kind != item["kind"]
     if kind_changed:
-        sets.append("kind=?")
-        args.append(kind)
+        changes.update(kind=kind, tmdb_id=None, overview=None, poster=None, backdrop=None,
+                       rating=None, runtime=None, genres=None, cast_json=None)
         notes.append("類型")
-
-    # kind 或 year 動了就要重算 guess_key（見 _rekey）
     if kind_changed or body.year is not None:
-        nk = _rekey(item.get("guess_key"), kind, year)
-        if nk:
-            sets += ["guess_key=?"]
-            args.append(nk)
-
-    if not sets:
-        return {"ok": True, "changed": []}
-
-    sets += ["scrape_state=?", "updated_at=?"]
-    args += ["manual", db.now_i()]
-    db.execute(f"UPDATE media_item SET {', '.join(sets)} WHERE id=?", args + [item_id])
-
-    # 類型換了，集數結構也要跟著換
+        key = _rekey(item.get("guess_key"), kind, year)
+        if key:
+            _check_item_key(key, item_id)
+            changes["guess_key"] = key
+    if not changes:
+        return {"ok": True, "changed": [], "item_id": item_id}
+    changes.update(scrape_state="manual", updated_at=db.now_i())
+    item_id = series.save_metadata(item_id, changes)
     eps = 0
     if kind_changed:
         eps = (scanner.reassign_episodes(item_id) if kind == "tv"
                else scanner.clear_episodes(item_id))
-
     audit.record("item_patch", role=auth.role_of(request),
-                 ip=auth.client_ip(request.scope), loc={},
-                 email=auth.user_email(request),
+                 ip=auth.client_ip(request.scope), loc={}, email=auth.user_email(request),
                  detail=f"#{item_id} {'/'.join(notes)}")
-    out = {"ok": True, "changed": notes, "episodes": eps, "kind": kind}
-
-    # 類型換了就順手重刮一次 —— 認錯類型的條目，TMDB 資料整份都是錯的
+    out = {"ok": True, "changed": notes, "episodes": eps, "kind": kind, "item_id": item_id}
     if kind_changed and tmdb.enabled:
         try:
-            db.execute("UPDATE media_item SET scrape_state='pending' WHERE id=?", (item_id,))
-            scanner._scrape_one(dict(db.q1("SELECT * FROM media_item WHERE id=?", (item_id,))))
-            # 重刮成功會被寫成 'ok'，但這是使用者手動改過的條目 —— 標回 manual，
-            # 否則下一次 force 重掃又會把它拿去自動比對。
+            item_id = scanner._scrape_one(dict(db.q1("SELECT * FROM media_item WHERE id=?", (item_id,)))) or item_id
+            out["rescraped"] = bool(db.q1("SELECT tmdb_id FROM media_item WHERE id=?", (item_id,))["tmdb_id"])
+        except Exception as exc:
+            out.update(rescraped=False, error=str(exc))
+        finally:
             db.execute("UPDATE media_item SET scrape_state='manual' WHERE id=?", (item_id,))
-            out["rescraped"] = True
-        except Exception as e:
-            db.execute("UPDATE media_item SET scrape_state='manual' WHERE id=?", (item_id,))
-            out["rescraped"] = False
-            out["error"] = str(e)
+    out["item_id"] = item_id
+    scanner._load_registry()
     return out
 
 
@@ -994,6 +985,7 @@ def admin_manual(_: str = Depends(admin_only)):
 
 
 @router.post("/rescrape/{item_id}")
+@series.serialized
 def rescrape(item_id: int, tmdb_id: Optional[int] = None, title: Optional[str] = None,
              _: str = Depends(admin_only)):
     row = db.q1("SELECT * FROM media_item WHERE id=?", (item_id,))
@@ -1001,7 +993,6 @@ def rescrape(item_id: int, tmdb_id: Optional[int] = None, title: Optional[str] =
         raise HTTPException(404, "找不到條目")
     item = dict(row)
     if title:
-        # sort_title 要跟著改，否則排序還是用舊名字（PATCH /items 那邊同樣的理由）
         db.execute("UPDATE media_item SET title=?, sort_title=? WHERE id=?",
                    (title, title.lower(), item_id))
         item["title"] = title
@@ -1011,39 +1002,41 @@ def rescrape(item_id: int, tmdb_id: Optional[int] = None, title: Optional[str] =
         if not detail:
             raise HTTPException(404, "TMDB 查無此 ID")
         n = normalize_details(item["kind"], detail)
-        db.execute(
-            """UPDATE media_item SET title=?, original_title=?, sort_title=?, year=?, tmdb_id=?,
-                   overview=?, poster=?, backdrop=?, rating=?, runtime=?, genres=?, cast_json=?,
-                   scrape_state='manual', updated_at=? WHERE id=?""",
-            (n["title"], n["original_title"], (n["title"] or "").lower(), n["year"], n["tmdb_id"],
-             n["overview"], tmdb.download_image(n["poster_path"], "w500"),
-             tmdb.download_image(n["backdrop_path"], "w1280"), n["rating"], n["runtime"],
-             json.dumps(n["genres"], ensure_ascii=False), json.dumps(n["cast"], ensure_ascii=False),
-             db.now_i(), item_id))
-        # **guess_key 要跟著年份重算。** 上面那句 UPDATE 把 year 換成 TMDB 的年份，
-        # 而電影的 guess_key 是 `movie::片名::年份` —— 不重算的話，下一次掃描
-        # 會用新算出來的 key 找不到這個條目、再建一個新的，使用者手動指定的
-        # 那一筆變孤兒被清掉。症狀是「我修好的片隔天變成兩筆，然後我改的那筆不見了」。
-        nk = _rekey(item.get("guess_key"), item["kind"], n["year"])
-        if nk and nk != item.get("guess_key"):
-            db.execute("UPDATE media_item SET guess_key=? WHERE id=?", (nk, item_id))
-        return {"ok": True}
-    db.execute("UPDATE media_item SET scrape_state='pending' WHERE id=?", (item_id,))
-    try:
-        scanner._scrape_one(dict(db.q1("SELECT * FROM media_item WHERE id=?", (item_id,))))
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    return {"ok": True}
+        changes = {
+            "title": n["title"], "original_title": n["original_title"],
+            "sort_title": (n["title"] or "").lower(), "year": n["year"], "tmdb_id": n["tmdb_id"],
+            "overview": n["overview"], "poster": tmdb.download_image(n["poster_path"], "w500"),
+            "backdrop": tmdb.download_image(n["backdrop_path"], "w1280"), "rating": n["rating"],
+            "runtime": n["runtime"], "genres": json.dumps(n["genres"], ensure_ascii=False),
+            "cast_json": json.dumps(n["cast"], ensure_ascii=False),
+            "scrape_state": "manual", "updated_at": db.now_i(),
+        }
+        key = _rekey(item.get("guess_key"), item["kind"], n["year"])
+        if key:
+            _check_item_key(key, item_id)
+            changes["guess_key"] = key
+        item_id = series.save_metadata(item_id, changes)
+    else:
+        try:
+            item_id = scanner._scrape_one(item) or item_id
+        except Exception as exc:
+            raise HTTPException(500, str(exc))
+        finally:
+            if item["scrape_state"] == "manual":
+                db.execute("UPDATE media_item SET scrape_state='manual' WHERE id=?", (item_id,))
+    scanner._load_registry()
+    return {"ok": True, "item_id": item_id}
 
 
 @router.post("/items/{item_id}/skip")
+@series.serialized
 def item_skip(item_id: int, undo: bool = Query(default=False), _: str = Depends(admin_only)):
     """把條目標成「不需要 metadata」（或取消）。
 
-    在這之前，「刮不到」的條目沒有出路：manual 要先成功指定一筆正確資料才拿得到
+    在這之前，「無法配對」的條目沒有出路：manual 要先成功指定一筆正確資料才拿得到
     （PATCH /items 與 rescrape?tmdb_id= 都是成功之後才標 manual），
     所以查無資料的片只能永遠停在 failed，每次掃描重打一次必然失敗的 API，
-    並且永遠佔著「未刮削」那個數字。
+    並且永遠佔著「待配對」那個數字。
 
     用 skip 而不是 manual 是因為兩者語意不同：manual 是「我已經填好正確答案」，
     skip 是「這東西根本不需要答案」。混在一起的話 /admin/manual 那張

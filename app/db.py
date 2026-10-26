@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS media_item (
 );
 CREATE INDEX IF NOT EXISTS idx_item_kind ON media_item(kind);
 CREATE INDEX IF NOT EXISTS idx_item_title ON media_item(title);
+CREATE INDEX IF NOT EXISTS idx_item_tmdb ON media_item(kind, tmdb_id);
+CREATE TABLE IF NOT EXISTS media_item_alias (
+    guess_key TEXT PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES media_item(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_item_alias_item ON media_item_alias(item_id);
 
 CREATE TABLE IF NOT EXISTS episode (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -567,6 +573,8 @@ def init_db() -> None:
         _migrate(conn)
         _round_time_points(conn)
         conn.commit()
+    from . import series
+    series.consolidate_existing()
 
 
 def q(sql: str, params: Iterable = ()) -> List[sqlite3.Row]:
