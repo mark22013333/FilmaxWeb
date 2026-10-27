@@ -340,9 +340,9 @@ _ALL: List[Param] = [
     _p("SCAN_HOME_DIRS", HOT, apply=APPLY_HOT, section="媒體庫",
        label="家庭錄影的資料夾", validate=_dir_names,
        help="逗號分隔，比對名稱開頭（跟上面同一套規則），含子資料夾。"
-            "這些資料夾底下、檔名是 20211002_213546+0800 這種格式的影片會歸到"
-            "「錄影」分類，標題自動變成可讀日期，不查詢 TMDB（本來就查不到）。"
-            "解不出日期的檔案不受影響，照舊走原本的判斷"),
+            "這些資料夾底下的影片一律歸到「錄影」分類，不查詢 TMDB（本來就查不到）。"
+            "檔名是 20211002_213546+0800 這種格式的，標題會變成可讀日期；"
+            "相機流水號（C0016.MP4）等沒有日期的檔名，標題就用檔名"),
     _p("SCAN_EXCLUDE_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
        label="略過的副檔名", help="逗號分隔。跟下面同時設定時，這裡優先"),
     _p("SCAN_ONLY_EXTS", HOT, apply=APPLY_HOT, section="媒體庫",
