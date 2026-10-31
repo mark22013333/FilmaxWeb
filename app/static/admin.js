@@ -146,6 +146,8 @@ TABS.overview = async el => {
     <h2 class="sec">總覽</h2>
     <p class="secsub">執行了 ${dur(d.uptime)}　·　Python ${esc(d.python)}</p>
 
+    ${d.needsSetup ? `<div class="banner"><b>還沒設定影片來源。</b>
+      <a class="btn primary" href="/setup">開啟設定精靈</a>　一步一步帶你填，每一步都會當場驗證。</div>` : ''}
     ${d.configDrift.length ? `<div class="banner">
       <b>有 ${d.configDrift.length} 項後台設定被環境變數蓋掉</b>，所以不會生效：
       ${d.configDrift.map(k => `<code>${esc(k)}</code>`).join(' ')}
@@ -2161,7 +2163,8 @@ TABS.params = async el => {
 
   el.innerHTML = `
     <h2 class="sec">系統參數</h2>
-    <p class="secsub">解析順序是 <b>.env / 環境變數　&gt;　這裡存的值　&gt;　程式預設值</b>，
+    <p class="secsub">第一次設定、或想換影片來源／登入密碼，請用 <a href="/setup"><u>設定精靈</u></a>，不必手動改 <code>.env</code>。<br>
+      解析順序是 <b>.env / 環境變數　&gt;　這裡存的值　&gt;　程式預設值</b>，
       沒有例外。目前 <b>${pd.items.length}</b> 項裡有 <b>${pd.items.length - free}</b>
       項由 <code>.env</code> 決定、在這裡改不動。<br>
       連線資訊、綁定位址、密碼這類改錯會讓你進不來的設定，刻意<b>只能</b>在

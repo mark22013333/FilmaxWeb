@@ -85,6 +85,19 @@ check("沒命中就是沒命中", not scanner._home_dir("/媒體資料庫/0.Movi
 # 只比目錄，不比檔名 —— 否則一個叫「手機照片.mp4」的檔案會在任何地方命中
 check("只比目錄不比檔名", not scanner._home_dir("/媒體資料庫/手機照片.mp4"))
 
+# home 目錄底下的影片一律是錄影，檔名沒有日期（相機流水號、UUID）也算
+class _E:
+    def __init__(self, path):
+        self.path, self.name = path, path.rsplit("/", 1)[-1]
+
+
+check("home 目錄裡沒有日期的 movie 要重新歸類",
+      scanner._kind_stale(_E("/pic/手機照片/C0016.MP4"), "movie"))
+check("已經是 home 且仍在 home 目錄 → 不用重來",
+      not scanner._kind_stale(_E("/pic/手機照片/C0016.MP4"), "home"))
+check("home 目錄被拿掉後 → 要重來", scanner._kind_stale(_E("/pic/別處/C0016.MP4"), "home"))
+check("沒命中目錄的 movie 不動", not scanner._kind_stale(_E("/pic/別處/x.mkv"), "movie"))
+
 # ---------------------------------------------------------------- [3]
 head("[3] 兩個數字是兩件事")
 

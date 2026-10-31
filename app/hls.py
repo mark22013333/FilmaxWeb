@@ -327,6 +327,13 @@ _ABR_MIN_GAP = 100
 # 低於這個高度就不再往下發 —— 再低畫質已經不能看，不如讓 ABR 卡在低階
 # 重試（那至少還播得動），而不是給一個沒有人想看的畫面。
 _ABR_MIN_HEIGHT = 240
+# 有高畫質頂階時，主階的碼率是頂階的幾成。8000 → 5200 → 3600：相鄰兩階都差
+# 1.5 倍上下，8～9 Mbps 的鏈路才有一階剛好跑得動（實機日誌，見 two_rung_test）。
+_MAIN_UNDER_HIGH = 0.65
+# MPEG-TS 封裝（188 位元組的封包、PES 標頭）在視訊＋音訊之外多出來的量。
+# 實測 file 144 的 1080p@4242：公式 5848 kbps，分段最大 5870（+0.4%）；
+# 720p@2757：公式 3868，最大 3914（+1.2%）。
+_TS_OVERHEAD = 1.03
 
 
 def _high_rung(src_h: int, base_h: int, base_b: int,
@@ -362,7 +369,7 @@ def _high_rung(src_h: int, base_h: int, base_b: int,
 
 
 def abr_ladder(src_w: int, src_h: int, base_h: int, base_b: int,
-               auto: bool = True) -> List[Tuple[int, int]]:
+               auto: bool = True, src_kbps: int = 0) -> List[Tuple[int, int]]:
     """遠端轉碼階梯：回傳 [(高度, 碼率kbps), ...]，最好的排前面。
 
     `base_h` 0 代表「不縮放」；那種情況下階梯要從片源的實際高度往下算，
@@ -375,6 +382,12 @@ def abr_ladder(src_w: int, src_h: int, base_h: int, base_b: int,
     # base_b 0 是「不鎖峰值」。階梯下面幾階一定要有一個數字才算得出碼率，
     # 用片源尺寸推一個保守值（跟 build_master 的 lower_cap 同一條公式）。
     top_b = base_b if base_b > 0 else max(1500, int(top * top * 16 / 9 * 4 / 1000))
+    if src_kbps > 0:
+        # 碼率導向的 NVENC 會把 -b:v 填滿：2.6 Mbps 的片源轉成 720p 吐出 10 Mbps，
+        # 畫質不會比片源好。先壓頂階，下面各階照比例跟著走。
+        top_b = min(top_b, src_kbps)
+        if base_b > 0:
+            base_b = top_b
 
     out: List[Tuple[int, int]] = []
     # 高畫質頂階排在主階前面（master 裡最好的要排前面）。
@@ -385,6 +398,10 @@ def abr_ladder(src_w: int, src_h: int, base_h: int, base_b: int,
         h = top if i == 0 else int(top * fh) // 2 * 2
         b = base_b if i == 0 else max(300, int(top_b * fb))
         if i == 0:
+            # 頂階已經用掉 base_b：主階再用同一個碼率，ABR 只會挑解析度高的那個，
+            # 這一階形同不存在，而下一階（0.45）跟頂階差 2.2 倍。
+            if high:
+                b = int(base_b * _MAIN_UNDER_HIGH)
             out.append((base_h, b))       # 主階照原樣傳回（0 = 不縮放要保住）
             continue
         if h < _ABR_MIN_HEIGHT or h >= src_h:
@@ -394,7 +411,10 @@ def abr_ladder(src_w: int, src_h: int, base_h: int, base_b: int,
         if any(abs(h - x) < _ABR_MIN_GAP for x in prev):
             continue
         out.append((h, b))
-    return out
+    if src_kbps <= 0:
+        return out
+    # 低階的 300 kbps 下限可能讓它不比上一階低；同碼率的低解析度階 ABR 永遠不會選。
+    return [r for i, r in enumerate(out) if i == 0 or 0 < r[1] < out[i - 1][1] or out[i - 1][1] == 0]
 
 
 def quality_policy(remote: bool, h: Optional[int]) -> Tuple[int, int]:
@@ -516,10 +536,14 @@ def build_master(file_id: int, profile: str, remote: bool = False,
         尺寸。自己再算一次 `w * h / 2 * 2` 遲早會跟濾鏡鏈分岔。
         """
         out_w, out_h = media.scaled_size(w, h, step_h)
-        # BANDWIDTH 填 VBV 上限（保證的天花板）、AVERAGE 填目標碼率。
-        cap = step_b * 1000 if step_b else max(1_500_000, int(out_w * out_h * 4))
-        avg_b = step_b * 1000 if step_b else 0
-        inf = _stream_inf(cap, avg_b, out_w, out_h,
+        # BANDWIDTH 填一段可能的峰值。AVERAGE 不寫：hls.js 有 AVERAGE 就不看
+        # 自己量到的實際碼率，而這裡給不出比峰值更準的平均。
+        if step_b:
+            peak = (media.segment_peak_kbps(step_b, settings.hls_segment_seconds)
+                    + settings.audio_bitrate_kbps) * 1000 * _TS_OVERHEAD
+        else:
+            peak = max(1_500_000, int(out_w * out_h * 4))
+        inf = _stream_inf(math.ceil(peak), 0, out_w, out_h,
                           codecs_attr("High", _level_int(out_h)))
         return inf, f"index.m3u8?p={profile_key(step_h, prof_a, step_b, RUNG_TRANSCODE)}"
 
@@ -558,7 +582,8 @@ def build_master(file_id: int, profile: str, remote: bool = False,
     # 遠端發整條階梯讓 ABR 有得降；區網（走到這裡代表沒有上階可給）維持單一階
     # —— 鏈路夠寬，多發幾階只是多養幾份轉碼快取，換不到東西。
     base_h = prof_h if prof_h is not None else target_h
-    steps = (abr_ladder(w, h, base_h, prof_b, auto=auto) if remote
+    src_kbps = int((row["bitrate"] if row else 0) or 0) // 1000
+    steps = (abr_ladder(w, h, base_h, prof_b, auto=auto, src_kbps=src_kbps) if remote
              else [(base_h, prof_b)])
     for step_h, step_b in steps:
         inf, url = transcode_inf(step_h, step_b)

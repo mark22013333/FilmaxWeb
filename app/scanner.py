@@ -369,7 +369,8 @@ def _kind_stale(entry: ftpclient.FtpEntry, kind: Optional[str]) -> bool:
         return not _home_dir(entry.path)
     if _jav_dir(entry.path) and javscraper.extract_number(entry.name):
         return True
-    return _home_dir(entry.path) and nameparser.home_video_time(entry.name) is not None
+    # home 目錄底下的影片一律是錄影，不再要求檔名解得出日期
+    return _home_dir(entry.path)
 
 
 def _wanted(f) -> bool:
@@ -537,13 +538,16 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
     jav_number = javscraper.extract_number(entry.name) if _jav_dir(entry.path) else None
     # 家庭錄影同理：TMDB 不會有手機拍的影片，硬送過去只是每次掃描都失敗一次。
     # 排在 JAV 之後 —— 兩個目錄設定萬一有重疊，番號的判斷比較明確，讓它先贏。
-    home_ts = (nameparser.home_video_time(entry.name)
-               if not jav_number and _home_dir(entry.path) else None)
+    # 目錄命中就是錄影，檔名解得出拍攝時間只決定標題與合併鍵怎麼取：
+    # 相機流水號（C0016.MP4）、UUID 之類沒有日期的檔名照樣收，
+    # 但不能拿 mtime 當日期（那是搬檔時間）。
+    is_home = not jav_number and _home_dir(entry.path)
+    home_ts = nameparser.home_video_time(entry.name) if is_home else None
     if jav_number:
         kind = "jav"
         parsed.is_tv = False
         parsed.season = parsed.episode = None
-    elif home_ts:
+    elif is_home:
         kind = "home"
         parsed.is_tv = False
         parsed.season = parsed.episode = None
@@ -567,6 +571,11 @@ def _index_file(entry: ftpclient.FtpEntry, root, sibling_dirs=None,
         # 拍攝時間就是這支錄影的身分。同一支影片被放到兩個目錄時
         # （這座庫裡有 2 組），epoch 相同會正確合併成一個條目。
         key = f"home::{home_ts}"
+    elif is_home:
+        # 沒有日期的檔名（C0016.MP4 會在每張記憶卡重複出現）不能用檔名當身分，
+        # 不然不同卡的同名檔會被合成一支。用完整路徑：一個檔案一個條目，
+        # 代價是搬動檔案會變成新條目（舊的由掃描後的清掃處理）。
+        key = f"home::path::{entry.path}"
     else:
         key = nameparser.guess_key(parsed, kind)
     item_id = _upsert_item(kind, key, parsed, jav_number=jav_number, home_ts=home_ts)
@@ -617,6 +626,8 @@ def _load_registry() -> None:
 
 def _upsert_item(kind: str, key: str, parsed, jav_number: str = None,
                  home_ts: int = None) -> int:
+    """home_ts 有值＝用拍攝時間當標題；kind=home 但沒有 home_ts＝沒有日期的錄影，
+    標題用檔名。兩種都不需要外部影片資料。"""
     hit = _item_reg.get(key)
     if hit is not None:
         return hit
@@ -627,7 +638,7 @@ def _upsert_item(kind: str, key: str, parsed, jav_number: str = None,
         title = parsed.title or parsed.raw
         sort_title = title.lower()
         year = parsed.year
-        state = "pending"
+        state = "skip" if kind == "home" else "pending"
         if home_ts:
             # 標題排成 ISO 風格是刻意的：同一年的錄影在 year 排序底下會退回
             # title ASC，而這個格式的字典序剛好等於時序，所以同年內仍然正確。

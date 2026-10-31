@@ -15,9 +15,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (audit, auth, db, ftpclient, geo, hls, media, mssql, params,
-               paramstore, purge, scanner, users)
+               paramstore, purge, scanner, setup, users)
 from .config import settings
 from .routers import api, auth_google, stream
+from .routers import setup as setup_router
 
 # 日期一定要在時間旁邊。服務會連著開好幾天，而問題往往是隔天才回報的 ——
 # 只有 `21:06:39` 的話，沒有人分得出那是今天還是三天前的那一次啟動。
@@ -287,6 +288,7 @@ app.add_middleware(SecurityHeaders)
 app.include_router(auth_google.router, prefix="/auth/google", tags=["auth"])
 app.include_router(api.router, prefix="/api", tags=["library"])
 app.include_router(stream.router, prefix="/api", tags=["stream"])
+app.include_router(setup_router.router, prefix="/api/setup", tags=["setup"])
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -331,6 +333,22 @@ def _page(name: str) -> HTMLResponse:
 @app.get("/", include_in_schema=False)
 def index():
     return _page("index.html")
+
+
+@app.get("/setup", include_in_schema=False)
+def setup_page(request: Request):
+    """首次設定精靈。只有管理員看得到頁面；沒開驗證時只限本機（規則同 API 的 setup_gate）。"""
+    if not auth.role_of(request):
+        return RedirectResponse("/login?next=" + quote("/setup"), status_code=303)
+    why = setup_router.deny_reason(request)
+    if why:
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>無法開啟</title>"
+            "<style>body{font:15px/1.7 system-ui,sans-serif;max-width:520px;"
+            "margin:15vh auto;padding:0 24px;color:#222}</style>"
+            f"<h2>無法開啟設定精靈</h2><p>{escape(why)}</p>"
+            "<p><a href=\"/\">回到媒體庫</a></p>", status_code=403)
+    return _page("setup.html")
 
 
 @app.get("/player", include_in_schema=False)

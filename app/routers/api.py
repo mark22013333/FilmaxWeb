@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .. import (acl, audit, auth, db, episodes, ftpclient, geo, hls, hlscache,
-                javscraper, keyframes, media, mssql, params, paramstore, purge,
+                javscraper, keyframes, media, mssql, params, paramstore, purge, setup,
                 scanner, series, streamstat, users)
 from ..config import CACHE_DIR, IMAGE_DIR, settings
 from ..scraper import tmdb
@@ -1563,6 +1563,7 @@ def admin_overview(_: str = Depends(admin_only)):
             "SELECT at, event, role, ip, email FROM login_audit ORDER BY at DESC LIMIT 10")],
         "configDrift": [d["key"] for d in paramstore.drift()],
         "needsRestart": paramstore.needs_restart(),
+        "needsSetup": setup.needs_setup(),
     }
 
 
