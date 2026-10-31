@@ -739,6 +739,19 @@ def pick_option(encoder: str, option: str, preferences: List[str]) -> Optional[s
 _hw_probe: Dict[str, Dict[str, Any]] = {}
 
 
+def vbv_bufsize_kbps(target_kbps: int) -> int:
+    return target_kbps * 2
+
+
+def segment_peak_kbps(target_kbps: int, seconds: float) -> float:
+    """一段視訊最多會吐多少 kbps。
+
+    每一段是一次獨立的 ffmpeg，VBV 緩衝每段都從滿的開始，所以一段可以花掉
+    maxrate×秒數 再加上整個 bufsize。實測宣告 8000 的階，分段是 9.5～10.8 Mbps。
+    """
+    return target_kbps + vbv_bufsize_kbps(target_kbps) / max(seconds, 1.0)
+
+
 def _rate_args(encoder: str, target_kbps: int) -> List[str]:
     """這一段要怎麼控制位元率：有目標碼率就綁碼率，沒有就綁品質。
 
@@ -757,7 +770,7 @@ def _rate_args(encoder: str, target_kbps: int) -> List[str]:
     3,174 kbps，上限 12000 完全咬不到；真正決定畫質的是 CRF，上限是保險。
     """
     if target_kbps > 0:
-        cap = [f"-maxrate", f"{target_kbps}k", "-bufsize", f"{target_kbps * 2}k"]
+        cap = [f"-maxrate", f"{target_kbps}k", "-bufsize", f"{vbv_bufsize_kbps(target_kbps)}k"]
         if encoder == "h264_nvenc":
             # 碼率導向：-b:v 就是目標，不再給 -cq
             return ["-b:v", f"{target_kbps}k"] + cap

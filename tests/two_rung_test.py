@@ -51,15 +51,16 @@ _seq = [0]
 
 
 def add_file(codec="h264", profile="High", level=41, size=60_000_000,
-             w=1920, h=960, kf="ok", gap=3.625, ext="mkv"):
+             w=1920, h=960, kf="ok", gap=3.625, ext="mkv", bitrate=None):
     _seq[0] += 1
     fid = db.execute(
         """INSERT INTO media_file(ftp_path, filename, ext, size, duration,
                                   width, height, video_codec, video_profile,
-                                  video_level, probe_state, kf_state, seen_at, added_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,'ok',?,0,0)""",
+                                  video_level, probe_state, kf_state, seen_at, added_at,
+                                  bitrate)
+           VALUES(?,?,?,?,?,?,?,?,?,?,'ok',?,0,0,?)""",
         (f"/x/{_seq[0]}-{codec}-{kf}.{ext}", f"x.{ext}", ext, size, DUR,
-         w, h, codec, profile, level, kf)).lastrowid
+         w, h, codec, profile, level, kf, bitrate)).lastrowid
     if kf == "ok":
         db.execute("""INSERT INTO media_keyframe(file_id, times, positions, count,
                                                  gap_min, gap_med, gap_max, updated_at)
@@ -198,15 +199,18 @@ check("推不出 profile／level 就整個省略 CODECS（規格允許；填錯�
 # 主階（使用者選的那一檔）在階梯裡，但**不保證是第 1 行** —— 自動模式下
 # 上面還有一階高畫質頂階。用碼率去找它，不要用位置。
 infs = [l for l in m_remote.splitlines() if l.startswith("#EXT-X-STREAM-INF")]
-base_inf = [l for l in infs if "BANDWIDTH=8000000" in l and "x960" not in l]
-check("主轉碼階的 BANDWIDTH 是 VBV 上限", len(base_inf) == 1, infs)
+base_inf = [l for l in infs if "RESOLUTION=1440x720" in l]
+check("主轉碼階在 master 裡", len(base_inf) == 1, infs)
 check("主轉碼階的解析度是縮放後的",
       base_inf and "RESOLUTION=" in base_inf[0] and "x960" not in base_inf[0], base_inf)
 
 m_single = hls.build_master(fid_hevc, lower, remote=True, duration=DUR)
 check("沒有上階可給 → 遠端仍然發得出轉碼階梯（這正是最需要降階的片源）",
       m_single.count("#EXT-X-STREAM-INF") >= 2, m_single)
-check("階梯的頂端是使用者選的那一檔", f"?p={lower}" in m_single, m_single)
+check("階梯的頂端用的是使用者選的那一檔碼率",
+      "_b8000_" in m_single.split("index.m3u8?p=")[1].split("\n")[0], m_single)
+m_manual = hls.build_master(fid_hevc, lower, remote=True, duration=DUR, auto=False)
+check("手動挑過畫質 → 階梯頂端就是那一檔", f"?p={lower}" in m_manual, m_manual)
 check("沒有上階時不會混進 m1 的階", "_m1" not in m_single, m_single)
 
 m_single_lan = hls.build_master(fid_hevc, lower, remote=False, duration=DUR)
@@ -261,8 +265,21 @@ check("**頂階的碼率跟主階一樣，沒有放寬**（放寬了就是在偷
       lad_hi[0][1] == 2800, lad_hi)
 check("頂階排在最前面（master 裡最好的要排前面）",
       [x[0] for x in lad_hi] == sorted([x[0] for x in lad_hi], reverse=True), lad_hi)
-check("主階還在（網路不夠時 ABR 要降得回來）", (720, 2800) in lad_hi, lad_hi)
-check("底下那幾階沒有被影響", lad_hi[1:] == lad, (lad_hi[1:], lad))
+check("主階還在（網路不夠時 ABR 要降得回來）", lad_hi[1][0] == 720, lad_hi)
+# 實機日誌（10/30 遠端手機、REMOTE_BITRATE_KBPS=8000）：1080／720 兩階都是 8000，
+# 下一階直接掉到 480p@3600。720p 那一階從來沒被選過 —— 同碼率的兩階，ABR 只會挑
+# 解析度高的那個。鏈路 8～9 Mbps 的人就在「8000 太緊」與「3600 太糊」之間來回跳。
+check("**沒有兩階同碼率**（同碼率的低解析度那階 ABR 永遠不會選）",
+      len({x[1] for x in lad_hi}) == len(lad_hi), lad_hi)
+check("主階的碼率落在頂階與下一階之間（補上中間那一格）",
+      lad_hi[0][1] > lad_hi[1][1] > lad_hi[2][1], lad_hi)
+ratios = [lad_hi[i][1] / lad_hi[i + 1][1] for i in range(len(lad_hi) - 1)]
+check("相鄰兩階的碼率差不超過 1.8 倍（差太多 ABR 就只能在太緊與太糊之間跳）",
+      all(r <= 1.8 for r in ratios), ratios)
+check("8000 的設定也一樣補得上（實機的值）",
+      len({x[1] for x in hls.abr_ladder(1920, 1080, 720, 8000, auto=True)}) == 4,
+      hls.abr_ladder(1920, 1080, 720, 8000, auto=True))
+check("底下那幾階沒有被影響", lad_hi[2:] == lad[1:], (lad_hi[2:], lad[1:]))
 
 check("手動挑過畫質就不加頂階（挑 480p 的意思是「最多 480p」）",
       all(x[0] <= 480 for x in hls.abr_ladder(1920, 1080, 480, 2800, auto=False)),
@@ -292,6 +309,59 @@ os.environ["REMOTE_HIGH_RUNG"] = "true"
 for hh, bb in lad:
     k = hls.profile_key(hh, None, bb, hls.RUNG_TRANSCODE)
     check(f"階 {hh}p 的 key 解析得回來", hls._parse_profile(k)[:3] == (hh, None, bb), k)
+
+
+head("[J 1] 宣告的碼率要對得上實際分段（hls.js 照它選階）")
+
+# 實機快取（10/31）：宣告 8000 的階，分段實際 9.5～10.8 Mbps；宣告 3600 的
+# 實際 4.8～5.0。每一段是一次獨立的 ffmpeg，VBV 緩衝每段都從滿的開始，所以
+# 一段最多可以吐 maxrate×秒數 ＋ bufsize，再加上音訊。
+def infs_of(m):
+    return [l for l in m.splitlines() if l.startswith("#EXT-X-STREAM-INF")]
+
+def attr(inf, key):
+    m = re.search(rf"(?<![-A-Z]){key}=(\d+)", inf)
+    return int(m.group(1)) if m else None
+
+fid_peak = add_file(codec="hevc", kf="skipped", w=1920, h=1080)
+m_peak = hls.build_master(fid_peak, lower, remote=True, duration=DUR, auto=False)
+top = infs_of(m_peak)[0]
+peak_floor = (8000 + 2 * 8000 / 6 + 192) * 1000
+check("轉碼階的 BANDWIDTH 不低於一段可能的峰值（目標＋緩衝÷分段秒數＋音訊）",
+      attr(top, "BANDWIDTH") >= peak_floor, (attr(top, "BANDWIDTH"), peak_floor, top))
+check("轉碼階不再宣告低於實際的 AVERAGE-BANDWIDTH（hls.js 有寫就不看實測值）",
+      attr(top, "AVERAGE-BANDWIDTH") is None
+      or attr(top, "AVERAGE-BANDWIDTH") >= attr(top, "BANDWIDTH") * 0.85, top)
+low_inf = [l for l in infs_of(m_peak) if "x480," in l][0]
+check("低階一樣照峰值宣告",
+      attr(low_inf, "BANDWIDTH") >= (3600 + 2 * 3600 / 6 + 192) * 1000, low_inf)
+
+
+head("[J 1] 階梯的碼率不超過片源（2.6 Mbps 的片源轉成 10 Mbps 是純浪費）")
+
+# 實機：file 3 是 1920×800、2.6 Mbps，720p 階卻吐出 10 Mbps —— NVENC 走碼率
+# 導向，-b:v 就是目標，片源再小也會填滿。解析度變小，畫質不可能變好。
+lad_src = hls.abr_ladder(1920, 800, 720, 8000, auto=True, src_kbps=2638)
+check("每一階的碼率都不超過片源", all(0 < b <= 2638 for _, b in lad_src), lad_src)
+check("壓低之後沒有兩階同碼率（同碼率的低解析度那階 ABR 永遠不會選）",
+      len({b for _, b in lad_src}) == len(lad_src), lad_src)
+check("碼率由上往下嚴格遞減", all(a[1] > b[1] for a, b in zip(lad_src, lad_src[1:])), lad_src)
+check("頂階仍是使用者選的解析度", lad_src[0][0] == 720, lad_src)
+check("階數不變：下面各階照比例跟著壓低的頂階走，不是被擠掉",
+      [x[0] for x in lad_src] == [x[0] for x in hls.abr_ladder(1920, 800, 720, 8000, auto=True)],
+      lad_src)
+
+lad_144 = hls.abr_ladder(1920, 1080, 720, 8000, auto=True, src_kbps=4242)
+check("4.2 Mbps 的 1080p 片源：頂階 1080p 壓到片源碼率", lad_144[0] == (1080, 4242), lad_144)
+check("4.2 Mbps 片源：不超過、嚴格遞減", all(b <= 4242 for _, b in lad_144)
+      and all(a[1] > b[1] for a, b in zip(lad_144, lad_144[1:])), lad_144)
+check("不知道片源碼率（0）就照原樣", hls.abr_ladder(1920, 1080, 720, 8000, auto=True, src_kbps=0)
+      == hls.abr_ladder(1920, 1080, 720, 8000, auto=True), lad_144)
+
+fid_lowbr = add_file(codec="hevc", kf="skipped", w=1920, h=800, bitrate=2_638_855)
+m_lowbr = hls.build_master(fid_lowbr, lower, remote=True, duration=DUR)
+bs = [int(x) for x in re.findall(r"_b(\d+)_", m_lowbr)]
+check("master 實際發出去的每一階都不超過片源碼率", bs and max(bs) <= 2638, m_lowbr)
 
 
 head("[J 1] 解析度／位元率政策：兩個端點必須問同一個函式")
