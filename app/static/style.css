@@ -116,6 +116,16 @@ main{padding:16px 24px 60px;max-width:1800px;margin:0 auto}
 }
 .meta .s{font-size:11.5px;color:var(--dim);margin-top:3px}
 
+/* 「繼續觀看」：橫向捲動的一列。卡片寬度跟海報牆同一個量級，
+   手機上刻意讓第四張露出一截，看得出來還能往右滑。
+   padding-top 留給 .card:hover 的上移 —— overflow-x:auto 會連垂直方向一起裁。 */
+.rail{
+  display:grid;grid-auto-flow:column;grid-auto-columns:158px;gap:14px;
+  overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x proximity;
+  padding:4px 0 6px;scrollbar-width:thin;
+}
+.rail .card{scroll-snap-align:start}
+
 .empty{
   text-align:center;padding:80px 20px;color:var(--muted);
 }
@@ -177,7 +187,10 @@ main{padding:16px 24px 60px;max-width:1800px;margin:0 auto}
 }
 .modal{
   max-width:1000px;margin:0 auto;background:var(--bg-2);border:1px solid var(--line);
-  border-radius:16px;overflow:hidden;box-shadow:var(--shadow);
+  /* clip 而不是 hidden：hidden 會讓 .modal 變成捲動容器，而它自己不捲，
+     裡面的 sticky（關閉鍵、季標題）就全部失效。clip 一樣裁圓角，但不建立
+     捲動容器。不認得 clip 的舊瀏覽器（Safari 15 以前）留在 hidden。 */
+  border-radius:16px;overflow:hidden;overflow:clip;box-shadow:var(--shadow);
   transform:translateY(10px) scale(.985);
   transition:transform .18s cubic-bezier(.2,.7,.3,1);
 }
@@ -197,6 +210,9 @@ body.modal-open{overflow:hidden}
 .tags span{padding:3px 9px;border-radius:6px;background:rgba(255,255,255,.08);font-size:11.5px}
 .plot{font-size:13.5px;color:#c3cad9;max-width:640px;line-height:1.65}
 .modal-body{padding:22px 26px 28px}
+/* 關閉鍵黏在畫面頂端：外層 .close-bar 高度 0、sticky 在 overlay 的捲動範圍裡，
+   按鈕再相對它絕對定位。見 app.js 的 closeBar()。 */
+.close-bar{position:sticky;top:0;height:0;z-index:5}
 .close{position:absolute;top:14px;right:16px;z-index:3;width:32px;height:32px;border-radius:8px;
   background:rgba(0,0,0,.55);display:grid;place-items:center;font-size:18px;color:#fff}
 .close:hover{background:rgba(0,0,0,.8)}
@@ -469,9 +485,15 @@ body.viewer #btnStats { display: none; }
   .to-top span{display:none}
 
   /* 方格的欄寬一直沒有行動版覆寫：375px 減 padding 只排得下 2 欄，
-     而海報牆的 .grid 早在 720px 就降到 minmax(120px) 了。
-     104px 在 375px 下是 3 欄，第一屏從 6 張變 9 張。 */
+     104px 在 375px 下是 3 欄，第一屏從 6 張變 9 張。
+     海報牆的 .grid 也一樣：720px 那條的 minmax(120px) 在 390px 寬（可用 362px）
+     排 3 欄要 380px，所以只剩 2 欄。 */
   .pgrid{grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:14px 8px}
+  /* 跟格線同樣的欄寬：一屏三張再露出第四張的一截。
+     左右滿版到螢幕邊緣，捲動時卡片不會在 14px 的留白處被切掉。 */
+  .rail{grid-auto-columns:calc((100% - 24px) / 3.3);gap:8px;
+    margin:0 -14px;padding-left:14px;padding-right:14px;scroll-padding:0 14px}
   .to-top.left{left:14px}
   .to-top.right{right:14px}
   /* 手機的掃描面板是滿版寬，右邊那顆一定會被蓋到 —— 直接收起來，
@@ -712,10 +734,7 @@ body.viewer #btnStats { display: none; }
   .hero-in h2{font-size:21px}
   /* 長片名要能換行（原本沒有限制，英文長標題會撐破 hero） */
   .hero-in h2,.hero-in .sub{overflow-wrap:anywhere}
-  .close{
-    /* 觸控目標放大到 40px，並避開瀏海 */
-    width:40px;height:40px;top:max(10px, env(safe-area-inset-top));right:12px;font-size:20px;
-  }
+  .close{top:max(10px, env(safe-area-inset-top));right:12px;font-size:20px}
   /* 季標題在手機上要更明顯 —— 它是使用者用來定位「現在看到第幾季」的唯一
      線索，而集數列表很長。順便黏在捲動頂端。 */
   .season-h{
@@ -817,3 +836,43 @@ nav{flex-wrap:wrap;min-width:0}
    （否則會以為片庫東西不見了），但這塊畫面常常有別人在旁邊看，
    不適合放一條寫著「私人」的橫幅。 */
 body.in-vault header{box-shadow:inset 0 -2px 0 var(--blue)}
+
+/* ---------- 觸控裝置：字級與觸控目標 ----------
+
+   條件是「窄螢幕**或**主要指標是手指」：手機橫向是 844px 寬，原本那幾條
+   ≤720px 的規則（例如 40px 的關閉鍵）在那裡就不套用了。iPad 也是觸控。
+
+   1. 輸入框至少 16px：iOS Safari 對小於 16px 的欄位一聚焦就自動放大，
+      而且不會縮回來。這裡用 !important 是因為各欄位自己寫的字級
+      （.pager .jump input 是 0,2,1）散在各處，16px 是 iOS 的硬下限，
+      不該被任何一條後來的規則蓋掉。
+   2. 觸控目標至少 44px（Apple HIG；Material 是 48dp）。 */
+@media (max-width:720px), (pointer:coarse){
+  input:not([type=checkbox]):not([type=radio]):not([type=range]),select,textarea{
+    font-size:16px!important;
+  }
+  .close{width:44px;height:44px}
+  nav button{min-height:44px}
+  .scope-switch button{min-height:40px}
+  .btn{min-height:44px;display:inline-flex;align-items:center;justify-content:center}
+  .chip{min-height:44px;padding:0 14px;display:inline-flex;align-items:center}
+  .pager .pg{min-width:40px;height:44px}
+  .pager .jump input{height:44px}
+  .pmode button{height:44px}
+  .tree-toggle,.album-toggle{min-height:44px}
+  .to-top{min-width:44px;min-height:44px;justify-content:center}
+}
+@media (max-width:720px){
+  /* 類型標籤 44px 高之後還照原樣換行，23 個標籤在 390px 寬會疊成六七列、
+     把格線推到第一屏外。改成跟 nav 一樣橫向捲的一列。 */
+  .chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+  .chips::-webkit-scrollbar{display:none}
+  .chip{flex:none}
+}
+@media (max-width:560px){
+  /* 分頁器：頁碼自己一整行，上一頁／下一頁在下一行。
+     頁碼鈕放大到 44px 之後，最寬的情況（1 … 7 8 9 … 335）是 7×40＋6×4＝304px，
+     加上兩顆上下頁就超過 362px 的可用寬度 —— 與其讓瀏覽器決定在哪裡折，
+     不如固定成兩行。 */
+  .pager .nums{order:-1;flex-basis:100%;justify-content:center}
+}
