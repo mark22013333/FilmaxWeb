@@ -166,6 +166,9 @@ class Settings:
     # session cookie 是否只在 HTTPS 下送出。對外開放（Cloudflare Tunnel、
     # 反向代理）時務必設 true，否則只要有一次 http 連線，session 就明文上線。
     cookie_secure: bool = field(default_factory=lambda: _b("COOKIE_SECURE", False))
+    # 相片頁的「轉成 JPG」會在來源目錄寫檔、搬動原檔。沒開驗證時全區網都是管理員，
+    # 所以不能只看角色，要在 .env 明確開啟（見 規格 S-1）。
+    photo_convert_enabled: bool = field(default_factory=lambda: _b("PHOTO_CONVERT_ENABLED", False))
     # 掃描時要略過的資料夾，比對「名稱開頭」，逗號分隔，不分大小寫。
     # 例：SCAN_EXCLUDE_DIR_PREFIXES=_,temp,備份
     #   → _old、_tmp、TempFiles、備份2024 都會整個跳過，連同底下的子目錄。
@@ -446,6 +449,7 @@ _HOT_ATTRS = {
     "max_photo_mb": "MAX_PHOTO_MB",
     "photo_exclude_artwork": "PHOTO_EXCLUDE_VIDEO_ARTWORK",
     "photo_preview_px": "PHOTO_PREVIEW_PX",
+    "photo_convert_quality": "PHOTO_CONVERT_QUALITY",
     "subtitle_prefetch": "SUBTITLE_PREFETCH",
     "session_days": "SESSION_DAYS",
     "google_allowed_domains": "GOOGLE_ALLOWED_DOMAINS",

@@ -272,8 +272,9 @@ EXEMPT = {
 # 把它列進來的話，「先問 has_vault、然後回一份沒過濾的清單」會被當成有閘門。
 # /api/vault 靠的是它裡面的 filter_sql(..., scope=VAULT)。
 #   setup_gate                       設定精靈：管理員，且沒開驗證時只限本機（routers/setup.py）
+#   convert_gate                     相片頁 HIF 轉 JPG：管理員（routers/convert.py）
 GATE = ("acl.filter_sql", "acl.assert_can_read", "acl.visible_item", "admin_only",
-        "setup_gate")
+        "setup_gate", "convert_gate")
 
 from app.routers import api as api_mod, stream as stream_mod   # noqa: E402
 
