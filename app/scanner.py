@@ -795,11 +795,24 @@ def _scrape_one(item: dict) -> int:
         return item["id"]
     if not tmdb.enabled:
         return item["id"]
-    hit = tmdb.search(kind, item["title"], item.get("year"), item.get("original_title") or "")
+    hit, sure = tmdb.match(kind, item["title"], item.get("year"), item.get("original_title") or "")
     if not hit:
         db.execute("UPDATE media_item SET scrape_state='failed', updated_at=? WHERE id=?",
                    (db.now_i(), item["id"]))
         status.note(f"找不到: {item['title']}")
+        return item["id"]
+    # 沒把握就不套用：套錯的海報和簡介看起來像對的，比「待配對」更難發現。
+    # `review` 不在一般掃描的重試名單裡（同樣的檔名會挑出同樣的答案），
+    # 等人工在後台手動比對；完整重新配對時會再試一次。
+    # 手動修正過的條目維持原樣：沒把握的結果不該蓋掉人挑的，也不該讓它
+    # 失去 manual 的保護。
+    if not sure:
+        if item.get("scrape_state") != "manual":
+            db.execute("UPDATE media_item SET scrape_state='review', updated_at=? WHERE id=?",
+                       (db.now_i(), item["id"]))
+        name = hit.get("title") or hit.get("name") or "?"
+        date = hit.get("release_date") or hit.get("first_air_date") or ""
+        status.note(f"待人工確認: {item['title']}（最接近的是 {name} {date[:4] or '-'}）")
         return item["id"]
     detail = tmdb.details(kind, hit["id"])
     if not detail:

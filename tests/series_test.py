@@ -192,7 +192,7 @@ class SeriesTests(unittest.TestCase):
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
                 title = "Corrected title " + str(enabled)
-                with patch.object(tmdb, "api_key", "test" if enabled else ""), patch.object(tmdb, "search", return_value=None):
+                with patch.object(tmdb, "api_key", "test" if enabled else ""), patch.object(tmdb, "match", return_value=(None, False)):
                     response = self.client.post("/api/rescrape/1", params={"title": title})
                 self.assertEqual(response.status_code, 200, response.text)
                 row = db.q1("SELECT title,sort_title,scrape_state FROM media_item WHERE id=1")
@@ -215,7 +215,7 @@ class SeriesTests(unittest.TestCase):
         self.item(2, "tv::two", state="manual")
         self.file(1, 1, 1)
         self.file(2, 2, 1)
-        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "search", return_value={"id": 108978}) as search, patch.object(tmdb, "details", return_value=self.fake_tmdb()), patch.object(tmdb, "download_image", return_value=None), patch.object(tmdb, "season", return_value=None):
+        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "match", return_value=({"id": 108978}, True)) as search, patch.object(tmdb, "details", return_value=self.fake_tmdb()), patch.object(tmdb, "download_image", return_value=None), patch.object(tmdb, "season", return_value=None):
             scanner._scrape_items(force=True)
         self.assertEqual(search.call_count, 1)
         self.assertEqual(db.q1("SELECT COUNT(*) c FROM media_item")["c"], 1)
@@ -227,11 +227,27 @@ class SeriesTests(unittest.TestCase):
         self.item(2, "tv::two")
         self.file(1, 1, 1)
         self.file(2, 2, 1)
-        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "search", return_value={"id": 108978}) as search, patch.object(tmdb, "details", return_value=self.fake_tmdb()), patch.object(tmdb, "download_image", return_value=None), patch.object(tmdb, "season", return_value=None):
+        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "match", return_value=({"id": 108978}, True)) as search, patch.object(tmdb, "details", return_value=self.fake_tmdb()), patch.object(tmdb, "download_image", return_value=None), patch.object(tmdb, "season", return_value=None):
             scanner._scrape_items(force=True)
         self.assertEqual(search.call_count, 1)
         self.assertEqual(db.q1("SELECT COUNT(*) c FROM media_item")["c"], 1)
         self.assertEqual(scanner.status.scraped, scanner.status.items_total)
+
+    def test_low_confidence_match_waits_for_review(self):
+        self.item(1, "tv::one", identity=None, state="pending", title="Mystery")
+        self.item(2, "tv::two", identity=None, state="manual", title="Picked by hand")
+        self.file(1, 1, 1)
+        self.file(2, 1, 1, "Other.S01E01.mp4", folder="/other")
+        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "match", return_value=({"id": 108978, "name": "Reacher"}, False)), patch.object(tmdb, "details") as details:
+            scanner._scrape_items(force=True, include_manual=True)
+        details.assert_not_called()
+        rows = {r["id"]: r for r in db.q("SELECT id,title,tmdb_id,scrape_state FROM media_item")}
+        self.assertEqual((rows[1]["title"], rows[1]["tmdb_id"], rows[1]["scrape_state"]), ("Mystery", None, "review"))
+        self.assertEqual((rows[2]["title"], rows[2]["scrape_state"]), ("Picked by hand", "manual"))
+        # 一般掃描不重試 review（同樣的檔名會挑出同樣的答案）
+        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "match") as match:
+            scanner._scrape_items()
+        match.assert_not_called()
 
     def test_pending_index_batch_finishes_before_runtime_merge(self):
         self.item(1, "tv::alpha", state="manual")
@@ -282,7 +298,7 @@ class SeriesTests(unittest.TestCase):
         self.item(1, "movie::one::", identity=108978, kind="movie")
         self.item(2, "tv::two", identity=108978)
         db.execute("INSERT INTO media_file(item_id,ftp_path,filename) VALUES(1,'/one/Reacher.S00E01.mp4','Reacher.S00E01.mp4')")
-        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "search", return_value=None):
+        with patch.object(tmdb, "api_key", "test"), patch.object(tmdb, "match", return_value=(None, False)):
             response = self.client.patch("/api/items/1", json={"kind": "tv"})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(db.q1("SELECT tmdb_id FROM media_item WHERE id=1")["tmdb_id"], None)
