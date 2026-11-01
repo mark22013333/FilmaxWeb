@@ -25,6 +25,19 @@ log = logging.getLogger("filmax.photo")
 # 完全關掉的話，一張惡意構造的圖片就能把記憶體吃光。
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
+# HIF／HEIF／HEIC。註冊之後 Image.open 就認得，縮圖與 EXIF 都不必分流。
+# 沒裝 pillow-heif 時整個格式視為不支援（掃描不收），而不是收進來再全部失敗。
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_OK = True
+except Exception:            # ImportError，或 wheel 與平台不合的 OSError
+    HEIF_OK = False
+
+# /photo/{id}/full 對 HEIF 轉出的 JPEG 用這個當 box：大到不會縮小，只是借同一套
+# 衍生檔的命名與快取（p{box}_{hash}.jpg）。
+FULL_BOX = 65535
+
 # 縮圖與 preview 的長邊。preview 是「點圖放大」用的衍生圖：原圖每次都得從
 # FTP 重新拉（沒有快取，中位數 2MB、最大 30.9MB），衍生圖產生一次就是本機檔案。
 THUMB_BOX = 480

@@ -143,6 +143,7 @@ _ALL: List[Param] = [
     _p("VIEWER_PASSWORD", ENV_ONLY, is_secret=True, section="登入", sensitive=True, lockout=True),
     _p("AUTH_SECRET", ENV_ONLY, is_secret=True, section="登入", sensitive=True, lockout=True),
     _p("COOKIE_SECURE", ENV_ONLY, type="bool", default=False, section="登入", lockout=True),
+    _p("PHOTO_CONVERT_ENABLED", ENV_ONLY, type="bool", default=False, section="相片庫"),
     _p("USER_STORE", ENV_ONLY, section="資料庫"),
     _p("MEDIA_STORE", ENV_ONLY, section="資料庫"),
     _p("MSSQL_HOST", ENV_ONLY, section="資料庫", sensitive=True),
@@ -362,6 +363,10 @@ _ALL: List[Param] = [
             "按下字幕時就不用等；抽好的快取在來源檔沒換過之前一直有效。"
             "代價是會跟影片本身的串流搶一點 FTP 頻寬 —— "
             "如果你幾乎不看字幕，關掉可以省下那次 demux"),
+    _p("PHOTO_CONVERT_QUALITY", HOT, type="int", default=100, apply=APPLY_HOT,
+       section="相片庫", label="HIF 轉 JPG 的品質", minimum=1, maximum=100,
+       help="100 是最高（色度也不縮減），檔案約為 HIF 的 3～4 倍大。"
+            "只影響之後轉出的檔案"),
     _p("PHOTO_PREVIEW_PX", HOT, type="int", default=1920, apply=APPLY_HOT,
        section="相片庫", label="看大圖的長邊像素", minimum=640, maximum=6000,
        help="燈箱載入的衍生圖尺寸。放大到超過這個像素時前端會自己換成原圖。"

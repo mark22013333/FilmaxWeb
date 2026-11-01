@@ -245,7 +245,12 @@ def photo_thumb(photo_id: int, request: Request):
 
 
 PHOTO_MIME = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-              "webp": "image/webp", "gif": "image/gif"}
+              "webp": "image/webp", "gif": "image/gif",
+              "hif": "image/heif", "heif": "image/heif", "heic": "image/heic"}
+
+
+def _is_heif(d: dict) -> bool:
+    return (d.get("ext") or "").lower() in ftpclient.HEIF_EXTS
 
 
 def _photo_row(photo_id: int, request: Request) -> dict:
@@ -270,10 +275,39 @@ def _stream_original(d: dict) -> StreamingResponse:
     return StreamingResponse(stream.iter_chunks(), media_type=mime, headers=headers)
 
 
+def _fetch_photo(d: dict) -> bytes:
+    limit = int(settings.max_photo_mb) * 1024 * 1024
+    if d.get("size") and d["size"] > limit:
+        raise HTTPException(413, f"相片超過 {settings.max_photo_mb} MB，不轉換")
+    try:
+        return b"".join(ftpclient.FtpReadStream(d["ftp_path"], 0).iter_chunks(limit=limit))
+    except ftpclient.FtpError as e:
+        raise HTTPException(502, str(e))
+
+
+def _heif_as_jpeg(d: dict, box: int, quality: int) -> FileResponse:
+    """瀏覽器不能顯示 HEIF，所以任何要給瀏覽器看的 HEIF 都轉成 JPEG 再給。"""
+    name = photo.derived_name(d.get("thumb") or "", box)
+    if name:
+        path = IMAGE_DIR / name
+        if path.exists() and path.stat().st_size > 0:
+            return FileResponse(path, media_type="image/jpeg",
+                                headers={"Cache-Control": "public, max-age=604800"})
+    data = _fetch_photo(d)
+    out = photo.make_thumb(data, name, box=box, quality=quality)
+    if not out:
+        raise HTTPException(415, "這張 HEIF 解碼失敗")
+    return FileResponse(IMAGE_DIR / out, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
 @router.get("/photo/{photo_id}/full")
-def photo_full(photo_id: int, request: Request):
-    """原圖。"""
-    return _stream_original(_photo_row(photo_id, request))
+def photo_full(photo_id: int, request: Request, raw: bool = False):
+    """原圖。HEIF 預設給轉好的 JPEG（瀏覽器看得懂），raw=1 才給原始檔（下載用）。"""
+    d = _photo_row(photo_id, request)
+    if _is_heif(d) and not raw:
+        return _heif_as_jpeg(d, photo.FULL_BOX, quality=90)
+    return _stream_original(d)
 
 
 @router.get("/photo/{photo_id}/preview.jpg")
@@ -291,6 +325,9 @@ def photo_preview(photo_id: int, request: Request):
     d = _photo_row(photo_id, request)
     box = int(getattr(settings, "photo_preview_px", 0) or photo.PREVIEW_BOX)
     w, h = d.get("width") or 0, d.get("height") or 0
+
+    if _is_heif(d):
+        return _heif_as_jpeg(d, box, quality=88)
 
     # 原圖本來就比 preview 小 —— 產生衍生圖只會變大又變模糊
     if w and h and max(w, h) <= box:

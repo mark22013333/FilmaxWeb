@@ -70,8 +70,9 @@ def start(full: bool = False, reparse: bool = False, remanual: bool = False) -> 
              不該是「完整重掃」的副作用。
     """
     global _thread
+    from . import hifconvert           # 延後 import：hifconvert 會 import 回 scanner
     with _lock:
-        if status.running:
+        if status.running or hifconvert.is_running():
             return False
         _cancel.clear()
         status.__init__()  # reset
@@ -261,7 +262,7 @@ def _wanted_photo(f) -> bool:
     所有圖片都濾掉。改用一個小很多的門檻，濾掉圖示與版面用的小圖。
     """
     ext = (f.ext or "").lower()
-    if ext not in ftpclient.IMAGE_EXTS:
+    if ext not in ftpclient.IMAGE_EXTS and not (ext in ftpclient.HEIF_EXTS and photo.HEIF_OK):
         return False
     if ext in settings.exclude_exts:
         return False
@@ -460,6 +461,38 @@ def _index_photo(entry: ftpclient.FtpEntry, *, batch) -> None:
                        mtime=entry.mtime, mtime_ts=mts, sort_ts=mts or now, at=now)
 
 
+def fill_photo(pid: int, data: bytes) -> None:
+    """讀 EXIF、產縮圖，把結果寫回這一列。讀不出圖就丟 ValueError。"""
+    info = photo.read_info(data)
+    if not info["width"]:
+        raise ValueError("不是能辨識的圖片格式")
+    # 檔名交給 make_thumb 用內容雜湊決定，不要用 pid ——
+    # 還原備份或重掃之後 pid 會被重用，舊縮圖會被當成新照片的
+    thumb = photo.make_thumb(data)
+    # taken_at 保留原始 EXIF 字串（唯一的事實來源），
+    # taken_ts 是解析後的數字，sort_ts 是具體化的排序鍵。
+    #
+    # taken_tz 記的是「這個數字怎麼來的」：EXIF 有給時區就存那個字串，
+    # 沒給就存 'local' 表示用本機時區猜的。出國拍的照片這一猜可以差
+    # 十幾個小時，把猜的跟算的混在同一個欄位就再也分不出來了。
+    off = info.get("taken_offset")
+    tks = timeparse.parse(info["taken_at"], tz_offset=off)
+    tz = None
+    if tks is not None:
+        tz = off if timeparse.offset_seconds(off) is not None else "local"
+    db.execute("""UPDATE photo SET width=?, height=?, format=?, mode=?,
+                      taken_at=?, taken_ts=?, taken_tz=?,
+                      sort_ts=COALESCE(?, mtime_ts, sort_ts, CAST(added_at AS INTEGER)),
+                      camera=?, lens=?, exposure=?, aperture=?,
+                      iso=?, focal_len=?, orientation=?, thumb=?,
+                      probe_state='ok', probe_error=NULL WHERE id=?""",
+               (info["width"], info["height"], info["format"], info["mode"],
+                info["taken_at"], tks, tz, tks,
+                info["camera"], info["lens"], info["exposure"],
+                info["aperture"], info["iso"], info["focal_len"],
+                info["orientation"], thumb, pid))
+
+
 def _read_photos() -> None:
     """把還沒讀過的相片抓下來讀 EXIF 並產縮圖。
 
@@ -478,34 +511,7 @@ def _read_photos() -> None:
                 raise ValueError(f"檔案過大（{size / 1048576:.0f} MB，上限 {settings.max_photo_mb} MB）")
             stream = ftpclient.FtpReadStream(path, 0)
             data = b"".join(stream.iter_chunks(limit=limit))
-            info = photo.read_info(data)
-            if not info["width"]:
-                raise ValueError("不是能辨識的圖片格式")
-            # 檔名交給 make_thumb 用內容雜湊決定，不要用 pid ——
-            # 還原備份或重掃之後 pid 會被重用，舊縮圖會被當成新照片的
-            thumb = photo.make_thumb(data)
-            # taken_at 保留原始 EXIF 字串（唯一的事實來源），
-            # taken_ts 是解析後的數字，sort_ts 是具體化的排序鍵。
-            #
-            # taken_tz 記的是「這個數字怎麼來的」：EXIF 有給時區就存那個字串，
-            # 沒給就存 'local' 表示用本機時區猜的。出國拍的照片這一猜可以差
-            # 十幾個小時，把猜的跟算的混在同一個欄位就再也分不出來了。
-            off = info.get("taken_offset")
-            tks = timeparse.parse(info["taken_at"], tz_offset=off)
-            tz = None
-            if tks is not None:
-                tz = off if timeparse.offset_seconds(off) is not None else "local"
-            db.execute("""UPDATE photo SET width=?, height=?, format=?, mode=?,
-                              taken_at=?, taken_ts=?, taken_tz=?,
-                              sort_ts=COALESCE(?, mtime_ts, sort_ts, CAST(added_at AS INTEGER)),
-                              camera=?, lens=?, exposure=?, aperture=?,
-                              iso=?, focal_len=?, orientation=?, thumb=?,
-                              probe_state='ok', probe_error=NULL WHERE id=?""",
-                       (info["width"], info["height"], info["format"], info["mode"],
-                        info["taken_at"], tks, tz, tks,
-                        info["camera"], info["lens"], info["exposure"],
-                        info["aperture"], info["iso"], info["focal_len"],
-                        info["orientation"], thumb, pid))
+            fill_photo(pid, data)
         except Exception as e:
             db.execute("UPDATE photo SET probe_state='failed', probe_error=? WHERE id=?",
                        (str(e)[:300], pid))

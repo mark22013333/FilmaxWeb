@@ -689,7 +689,7 @@ window.testFtp = async () => {
   const r = await api('/api/ftp/test');
   toast(r.ok ? `連線成功：${(r.welcome || '').slice(0, 60)}` : '連線失敗：' + r.error);
 };
-window.api = api; window.toast = toast; window.pollScan = pollScan; window.openItem = openItem;
+window.showOverlay = showOverlay; window.api = api; window.toast = toast; window.pollScan = pollScan; window.openItem = openItem;
 
 /* ------------------------- 相片牆 ------------------------- */
 const pstate = { folder: '', page: 1, sort: 'taken', items: [], total: 0, previewPx: 1920,
@@ -920,6 +920,7 @@ async function loadPhotos() {
   const flow = pstate.mode === 'flow';
   grid.classList.toggle('flow', flow);
   grid.innerHTML = '<div class="loading">載入中…</div>';
+  $('#convBar').hidden = true;
   // 換相簿／換排序／換模式都是重新開始 —— 累積下來的東西全部清掉，
   // 否則上一個相簿的相片會留在 items 裡，PhotoSwipe 就會翻到不存在的圖。
   pstate.items = []; pstate.done = false; pstate.loading = false;
@@ -951,6 +952,7 @@ async function loadPhotos() {
   pstate.items = d.items.slice();
   grid.innerHTML = pstate.items.map(photoTile).join('');
   bindTiles(grid);
+  Convert.paintBar({ enabled: !!me.photo_convert, folder: searching ? '' : pstate.folder, onDone: loadPhotos });
 
   if (flow) {
     // 瀑布流沒有「第幾頁」的概念，分頁器要收起來
@@ -1389,6 +1391,9 @@ function photoInfoHtml(d) {
     ${shot ? '<h4>拍攝資訊</h4>' + shot : '<h4>拍攝資訊</h4><div class="row"><b style="color:var(--dim)">這張圖沒有 EXIF</b></div>'}
     ${me.is_admin ? `<div style="margin-top:20px">
       <a class="btn" href="${d.download_url}" download>下載原圖</a>
+      ${me.photo_convert && /^(hif|heif|heic)$/i.test(d.ext || '')
+        ? `<button class="btn" data-id="${d.id}" data-folder="${esc(d.folder)}"
+             onclick="Convert.openFromViewer(this.dataset)">轉成 JPG</button>` : ''}
     </div>` : ''}
     <div style="margin-top:14px;font-size:11.5px;color:var(--dim);line-height:1.6">
       不讀取也不顯示 GPS 座標。原始檔案沒有被修改。

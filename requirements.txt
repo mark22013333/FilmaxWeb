@@ -13,6 +13,8 @@ python-dotenv==1.0.1
 paramiko>=3.5.1,<6
 pydantic==2.10.4
 Pillow>=10.4.0
+# 讀 HIF／HEIF／HEIC（Sony 相機的相片格式）。沒裝也能跑，只是相片庫不收這些檔。
+pillow-heif>=0.20.0
 
 # 使用者資料要存 MSSQL 才需要（.env 有設 MSSQL_HOST 時）。
 # 不裝也能跑，帳號會存在本機 SQLite。
