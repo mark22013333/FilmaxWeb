@@ -309,8 +309,10 @@ async function loadContinue() {
   const { items } = await api('/api/continue');
   const box = $('#continue');
   if (!items.length) { box.innerHTML = ''; return; }
+  // 橫向捲動的一列，不是 .grid：最多 20 筆塞成格線的話，直向手機約 10 列、
+  // 將近 3000px，媒體庫本體要往下滑好幾個畫面才看得到。
   box.innerHTML = `<div class="section-title">繼續觀看 <span>${items.length} 部</span></div>
-    <div class="grid">${items.map(i => `
+    <div class="rail">${items.map(i => `
       <div class="card" onclick="location.href='/player?file=${i.file_id}'">
         <div class="poster">${i.poster_url ? `<img loading="lazy" src="${i.poster_url}" onerror="this.remove()">` : `<div class="ph">${esc(i.title || i.filename)}</div>`}
           ${i.season ? `<div class="badge ep">S${String(i.season).padStart(2, '0')}E${String(i.episode).padStart(2, '0')}</div>` : ''}
@@ -334,9 +336,8 @@ async function openItem(id) {
       ).join('') + (it.files || []).map(f => fileRow(f)).join('')
     : (it.files || []).map(f => fileRow(f)).join('');
 
-  $('#modal').innerHTML = `
+  $('#modal').innerHTML = `${closeBar()}
     <div class="hero">
-      <button class="close" onclick="closeModal()">×</button>
       ${it.backdrop_url ? `<img src="${it.backdrop_url}" onerror="this.remove()">` : ''}
       <div class="hero-in">
         <div class="p">${it.poster_url || it.thumb_url ? `<img src="${it.poster_url || it.thumb_url}" onerror="this.remove()">` : ''}</div>
@@ -363,16 +364,45 @@ async function openItem(id) {
       ${files || '<div class="empty">沒有檔案</div>'}
     </div>`;
 }
-// 開關集中在這兩個函式：body.modal-open 要跟 .show 同進同出，
+/* 關閉鍵包在一條高度 0 的 sticky 列裡，而且放在 .modal 的第一層、不放進 .hero。
+   放在 .hero 裡的話它跟著 hero 捲走 —— 影集的集數清單一長，手機上就只剩點
+   周圍 8～12px 的背景能關。高度 0 是為了不佔版面，桌機上看起來跟原本一樣。 */
+const closeBar = () =>
+  '<div class="close-bar"><button class="close" onclick="closeModal()" aria-label="關閉">×</button></div>';
+
+// 開關集中在這幾個函式：body.modal-open 要跟 .show 同進同出，
 // 分散在三個開啟點各寫一次的話，遲早有一個忘了加而讓背景捲動鎖不掉。
+//
+// 開彈窗時多推一筆歷史紀錄，Android 的返回鍵（以及桌機的上一頁）才會是
+// 「關掉詳情」而不是直接離開 App。modalInHistory 記的是「那筆紀錄還在不在」：
+// 從關閉鍵／背景／Esc 關的時候要自己 history.back() 把它退掉，
+// 從返回鍵關的時候瀏覽器已經退掉了，只要把畫面收起來。
+let modalInHistory = false;
+function hideOverlay() {
+  $('#overlay').classList.remove('show');
+  document.body.classList.remove('modal-open');
+}
 function showOverlay() {
+  if (!modalInHistory) {
+    history.pushState({ filmaxModal: true }, '');
+    modalInHistory = true;
+  }
   $('#overlay').classList.add('show');
   document.body.classList.add('modal-open');
 }
 window.closeModal = () => {
-  $('#overlay').classList.remove('show');
-  document.body.classList.remove('modal-open');
+  hideOverlay();
+  if (modalInHistory) {
+    modalInHistory = false;
+    history.back();
+  }
 };
+// 自己呼叫 history.back() 引發的 popstate 進來時 modalInHistory 已經是 false，什麼都不做
+addEventListener('popstate', () => {
+  if (!modalInHistory) return;
+  modalInHistory = false;
+  hideOverlay();
+});
 $('#overlay').onclick = e => { if (e.target.id === 'overlay') closeModal(); };
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
@@ -636,7 +666,7 @@ window.openAccount = async () => {
       <code>GOOGLE_CLIENT_SECRET</code> 與 <code>PUBLIC_BASE_URL</code> 後重新啟動，
       這裡就會出現帳號審核清單。</div>`;
   }
-  $('#modal').innerHTML = `<div class="modal-body"><button class="close" onclick="closeModal()">×</button>
+  $('#modal').innerHTML = `${closeBar()}<div class="modal-body">
     <h2 style="margin-top:0">帳號</h2>${who}${list}</div>`;
 };
 
@@ -655,7 +685,7 @@ $('#btnStats').onclick = async () => {
   const tools = d && d.tools ? Object.entries(d.tools).map(([k, t]) => `
     <div class="file-row"><div class="n"><b>${k}</b><small>${esc(t.resolved || t.configured || '')}${t.version ? ' · ' + esc(t.version) : ''}</small></div>
     <span class="pill ${t.ok ? 'direct' : 'warn'}">${t.ok ? 'OK' : '找不到'}</span></div>`).join('') : '';
-  $('#modal').innerHTML = `<div class="modal-body"><button class="close" onclick="closeModal()">×</button>
+  $('#modal').innerHTML = `${closeBar()}<div class="modal-body">
     <h2 style="margin-top:0">媒體庫狀態</h2>
     ${problems}
     ${tools}
