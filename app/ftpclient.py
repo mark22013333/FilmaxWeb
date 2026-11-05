@@ -29,6 +29,11 @@ VIDEO_EXTS = {
 }
 SUBTITLE_EXTS = {"srt", "ass", "ssa", "vtt", "sub"}
 IMAGE_EXTS = {"jpg", "jpeg", "png", "webp"}
+# 瀏覽器顯示不了，要靠 pillow-heif 解碼。收不收由 scanner 看有沒有裝決定。
+HEIF_EXTS = {"hif", "heif", "heic"}
+# 轉檔後原檔搬進 `YYYYMMDD原檔/`。這種資料夾掃描時整個略過，否則搬進去的
+# HIF 下一輪又被收回相片庫，同一張照片出現兩次。
+ARCHIVE_DIR_SUFFIX = "原檔"
 # 文件庫。目前只有 PDF —— cbz/epub 是另一種排版模型與另一種閱讀器，
 # 混進來只會讓兩邊都做不好（見規格書 I 節的「刻意不做」）。
 DOC_EXTS = {"pdf"}
@@ -305,7 +310,7 @@ def _skip_dir(name: str) -> bool:
     整個子樹都不會被走訪 —— 這正是重點：省下的是整棵樹的列目錄時間。
     """
     low = name.lower()
-    if low in SKIP_DIRS or name.startswith("."):
+    if low in SKIP_DIRS or name.startswith(".") or name.endswith(ARCHIVE_DIR_SUFFIX):
         return True
     prefixes = settings.exclude_dir_prefixes
     return bool(prefixes and low.startswith(prefixes))

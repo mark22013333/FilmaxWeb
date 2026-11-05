@@ -53,6 +53,7 @@ def me(request: Request):
     role = auth.role_of(request)
     out = {"role": role, "is_admin": role == auth.ADMIN,
            "auth_enabled": settings.auth_enabled,
+           "photo_convert": bool(settings.photo_convert_enabled and role == auth.ADMIN),
            "google_login": settings.google_enabled,
            "uid": auth.user_id(request), "email": auth.user_email(request),
            "display_name": None, "picture_url": None}
@@ -1164,7 +1165,7 @@ def photo_detail(photo_id: int, request: Request):
         raise HTTPException(404, "找不到相片")
     acl.assert_can_read(request, r["folder"], kind="photo")
     d = db.row_to_dict(r) or {}
-    d["download_url"] = f"/api/photo/{photo_id}/full"
+    d["download_url"] = f"/api/photo/{photo_id}/full?raw=1"
     d["thumb_url"] = f"/api/photo/{photo_id}/thumb.jpg" if d.get("thumb") else None
     return d
 
