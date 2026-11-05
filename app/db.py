@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS media_item (
     runtime         INTEGER,
     genres          TEXT,                       -- JSON array
     cast_json       TEXT,                       -- JSON array
-    scrape_state    TEXT DEFAULT 'pending',     -- pending / ok / failed / manual / skip
+    scrape_state    TEXT DEFAULT 'pending',     -- pending / ok / failed / review / manual / skip
     guess_key       TEXT UNIQUE,                -- 用來合併同一部作品
     added_at        REAL,
     updated_at      REAL

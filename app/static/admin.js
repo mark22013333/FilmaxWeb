@@ -6,7 +6,7 @@
  */
 'use strict';
 
-const metadataState = state => ({ pending: '待配對', failed: '配對失敗', ok: '已配對',
+const metadataState = state => ({ pending: '待配對', failed: '配對失敗', review: '待人工確認', ok: '已配對',
   manual: '手動配對', skip: '不需配對' }[state] || '待配對');
 
 const $ = s => document.querySelector(s);
