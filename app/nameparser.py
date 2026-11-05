@@ -28,11 +28,13 @@ JUNK_TOKENS = [
 ]
 JUNK_RE = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(JUNK_TOKENS) + r")(?![A-Za-z0-9])", re.I)
 
-# 發布組 [xxx] 或結尾 -GROUP
-BRACKET_RE = re.compile(r"[\[\(【（][^\]\)】）]{0,40}[\]\)】）]")
+# 發布組 [xxx]、{imdb-tt...} 或結尾 -GROUP
+BRACKET_RE = re.compile(r"[\[\(【（{][^\]\)】）}]{0,40}[\]\)】）}]")
 GROUP_TAIL_RE = re.compile(r"-[A-Za-z0-9]{2,15}$")
 
 YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+# 括號裡只有年份：`Inception (2010)` 是 Plex 的標準命名，年份要留下來
+BRACKET_YEAR_RE = re.compile(r"^\s*(19\d{2}|20\d{2})\s*$")
 
 SE_PATTERNS = [
     re.compile(r"(?<![a-z0-9])s(?P<s>\d{1,2})[\s\._-]*e(?P<e>\d{1,4})(?![0-9])", re.I),
@@ -41,7 +43,8 @@ SE_PATTERNS = [
     re.compile(r"season[\s\._-]*(?P<s>\d{1,2}).*?episode[\s\._-]*(?P<e>\d{1,4})", re.I),
 ]
 EP_ONLY_PATTERNS = [
-    re.compile(r"(?<![a-z0-9])e(?:p|pisode)?[\s\._-]*(?P<e>\d{1,4})(?![0-9])", re.I),
+    # 單獨的 E 必須緊貼數字：`WALL-E 1080p` 的 E 是片名，1080p 是解析度
+    re.compile(r"(?<![a-z0-9])(?:e|(?:ep|episode)[\s\._-]*)(?P<e>\d{1,4})(?![0-9])(?![pi]\b)", re.I),
     re.compile(r"第\s*(?P<e>[0-9一二三四五六七八九十百]{1,4})\s*[集话話]"),
     re.compile(r"(?<![\d\w])(?P<e>\d{1,3})[\s\._-]*(?:集|话|話)"),
     # 動畫常見: "作品名 - 12" / "作品名 - 12v2"
@@ -98,9 +101,30 @@ class ParsedName:
         return self.title or self.alt_title or self.raw
 
 
+def _unbracket(m: re.Match) -> str:
+    y = BRACKET_YEAR_RE.match(m.group(0)[1:-1])
+    return f" {y.group(1)} " if y else " "
+
+
+def _strip_group_tail(text: str) -> str:
+    """拿掉結尾的 `-GROUP`，但只在它接在技術標籤或年份後面時。
+
+    `x264-SPARKS`、`WEB-DL-FLUX` 的尾巴是壓制組；`Spider-Man`、`X-Men` 的
+    尾巴是片名。差別在連字號前面那個字：壓制組一定掛在 release 標籤後面。
+    """
+    m = GROUP_TAIL_RE.search(text)
+    if not m:
+        return text
+    before = text[:m.start()].rsplit(None, 1)
+    last = before[-1] if before else ""
+    if JUNK_RE.search(last) or YEAR_RE.fullmatch(last) or any(p.search(last) for p in SE_PATTERNS):
+        return text[:m.start()]
+    return text
+
+
 def _clean(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
-    text = BRACKET_RE.sub(" ", text)
+    text = BRACKET_RE.sub(_unbracket, text)
     text = text.replace("_", " ").replace("+", " ")
     # 只有在看起來像 release 命名（點很多、沒空白）時才把點當分隔符
     if text.count(".") >= 2 and " " not in text.replace(".", " ").strip()[:0] or text.count(".") >= 2:
@@ -229,7 +253,7 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
     if m:
         p.source = m.group(1).lower()
 
-    work = _clean(stem)
+    work = _strip_group_tail(_clean(stem))
 
     # --- 季集 ---
     cut_at = len(work)
@@ -253,15 +277,29 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
                     break
 
     # --- 年份 ---
-    head = work[:cut_at] if cut_at < len(work) else work
-    years = YEAR_RE.findall(head) or YEAR_RE.findall(work)
-    if years:
-        p.year = int(years[0])
-        ym = YEAR_RE.search(head if years == YEAR_RE.findall(head) else work)
-        if ym and ym.start() < cut_at:
-            cut_at = min(cut_at, ym.start())
+    # 取片名之後的**最後一個**年份：`1917.2019`、`Blade.Runner.2049.2017`
+    # 前面那個數字是片名的一部分。只有一個年份又在最前面時，後面還有片名
+    # 才算年份（`2019.某片`），否則它就是片名（`2012.mkv`）。
+    title_start = 0
+    strip_years = False                  # 片名從資料夾來時，裡面的年份要清掉
+    in_head = list(YEAR_RE.finditer(work[:cut_at]))
+    later = [m for m in in_head if m.start() > 0]
+    if later:
+        p.year = int(later[-1].group(1))
+        cut_at = later[-1].start()
+    elif in_head:
+        ym = in_head[0]
+        if re.search(r"[^\W\d_]", JUNK_RE.sub(" ", work[ym.end():cut_at])):
+            p.year = int(ym.group(1))
+            title_start = ym.end()
+    else:
+        ym = YEAR_RE.search(work)
+        if ym:
+            p.year = int(ym.group(1))
 
-    title_part = work[:cut_at].strip(" -._") or work
+    title_part = work[title_start:cut_at].strip(" -._")
+    if not title_part:
+        title_part, strip_years = work, True
 
     # --- 從上層資料夾補季別 / 劇名 ---
     if parent_dirs:
@@ -278,8 +316,10 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
             p.is_tv = True
             if len(parent_dirs) >= 2:
                 title_part = _clean(parent_dirs[-2]) or title_part
+                strip_years = True
         elif p.is_tv and len(title_part) <= 2:
             title_part = _clean(last) or title_part
+            strip_years = True
 
         # --- 規則 1：一集一資料夾 ---
         # /來！金來號 ！/01/來！金來號 ！01.mp4 這種結構。
@@ -301,6 +341,7 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
                     if p.season is None:
                         p.season = 1
                     title_part = _clean(parent_dirs[-2]) or title_part
+                    strip_years = True
 
     # 純數字檔名（在劇集資料夾內）視為集數
     if p.episode is None and re.fullmatch(r"\d{1,3}", work.strip()):
@@ -316,9 +357,9 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
         p.season = 1
 
     # --- 清掉技術標籤 ---
-    title_part = JUNK_RE.sub(" ", title_part)
-    title_part = GROUP_TAIL_RE.sub("", title_part)
-    title_part = YEAR_RE.sub(" ", title_part)
+    title_part = JUNK_RE.sub(" ", _strip_group_tail(title_part.strip()))
+    if strip_years:
+        title_part = YEAR_RE.sub(" ", title_part)
     title_part = re.sub(r"[\s\.\-_]{2,}", " ", title_part).strip(" -._·")
 
     # --- 規則 2：檔名尾端的數字是集數 ---
@@ -340,8 +381,7 @@ def parse(filename: str, parent_dirs: Optional[List[str]] = None,
             ym = YEAR_RE.search(cand)
             if ym:
                 p.year = int(ym.group(1))
-        cand = YEAR_RE.sub(" ", JUNK_RE.sub(" ", cand))
-        cand = GROUP_TAIL_RE.sub("", cand)
+        cand = YEAR_RE.sub(" ", JUNK_RE.sub(" ", _strip_group_tail(cand)))
         cand = re.sub(r"[\s\.\-_]{2,}", " ", cand).strip(" -._·")
         if cand:
             title_part = cand

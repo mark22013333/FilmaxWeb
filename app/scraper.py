@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -85,6 +86,16 @@ class TmdbClient:
     # ---------- 搜尋 ----------
     def search(self, kind: str, title: str, year: Optional[int] = None,
                alt_title: str = "") -> Optional[dict]:
+        """最接近的結果，不管有沒有把握。要分辨把握請用 `match()`。"""
+        return self.match(kind, title, year, alt_title)[0]
+
+    def match(self, kind: str, title: str, year: Optional[int] = None,
+              alt_title: str = "") -> tuple[Optional[dict], bool]:
+        """(最接近的結果, 有沒有把握)。
+
+        依序試各種查詢，**第一個有把握的就停**；全部都沒把握時回傳所有查詢裡
+        分數最高的那一筆、把握為 False，讓呼叫端標成待人工確認，而不是照單全收。
+        """
         endpoint = "/search/movie" if kind == "movie" else "/search/tv"
         year_key = "year" if kind == "movie" else "first_air_date_year"
         candidates: List[tuple[str, Optional[int], str]] = []
@@ -102,6 +113,7 @@ class TmdbClient:
                 candidates.append((stripped, year, self.language))
 
         seen = set()
+        fallback: Optional[tuple[float, dict]] = None
         for t, y, lang in candidates:
             sig = (t, y, lang)
             if sig in seen:
@@ -112,29 +124,69 @@ class TmdbClient:
                 params[year_key] = y
             data = self._get(endpoint, **params)
             results = (data or {}).get("results") or []
-            if results:
-                return self._best(results, t, y, kind)
-        return None
+            if not results:
+                continue
+            # 比對時用檔名原本的年份：帶年份的查詢沒結果、改不帶年份查到的片，
+            # 年份不合就該扣分，不能因為這次查詢沒帶年份就放過。
+            hit, sure, s = self._rank(results, t, year)
+            if sure:
+                return hit, True
+            if fallback is None or s > fallback[0]:
+                fallback = (s, hit)
+        return (fallback[1], False) if fallback else (None, False)
 
     @staticmethod
-    def _best(results: List[dict], title: str, year: Optional[int], kind: str) -> dict:
-        def score(r: dict) -> float:
-            s = 0.0
-            name = (r.get("title") or r.get("name") or "").lower()
-            orig = (r.get("original_title") or r.get("original_name") or "").lower()
-            t = title.lower()
-            if t == name or t == orig:
-                s += 50
-            elif t in name or name in t or t in orig:
-                s += 20
+    def _best(results: List[dict], title: str, year: Optional[int],
+              kind: str = "") -> tuple[dict, bool]:
+        """(分數最高的結果, 有沒有把握)。"""
+        hit, sure, _ = TmdbClient._rank(results, title, year)
+        return hit, sure
+
+    @staticmethod
+    def _rank(results: List[dict], title: str,
+              year: Optional[int]) -> tuple[dict, bool, float]:
+        """有把握的條件（任一）：
+
+        - 片名完全相符，而且年份沒有明顯不合（沒年份、或差一年以內）
+        - 片名部分相符，而且年份差一年以內
+        - 片名對不上，但結果裡只有這一筆的年份完全相符 —— 中文檔名常跟 TMDB 的
+          zh-TW 譯名不同（簡繁、兩岸譯名），這時年份是唯一的訊號
+        """
+        t = _norm(title)
+
+        def title_score(r: dict) -> int:
+            names = {_norm(r.get("title") or r.get("name") or ""),
+                     _norm(r.get("original_title") or r.get("original_name") or "")} - {""}
+            if not t or not names:
+                return 0
+            if t in names:
+                return 50
+            if any(t in n or n in t for n in names):
+                return 20
+            return 0
+
+        def year_diff(r: dict) -> Optional[int]:
             date = r.get("release_date") or r.get("first_air_date") or ""
-            if year and date[:4].isdigit():
-                diff = abs(int(date[:4]) - year)
+            return abs(int(date[:4]) - year) if year and date[:4].isdigit() else None
+
+        def score(r: dict) -> float:
+            s = float(title_score(r))
+            diff = year_diff(r)
+            if diff is not None:
                 s += 25 if diff == 0 else (10 if diff == 1 else -5 * min(diff, 5))
             s += min(float(r.get("popularity") or 0), 100) / 10.0
             s += min(float(r.get("vote_count") or 0), 5000) / 1000.0
             return s
-        return max(results, key=score)
+
+        best = max(results, key=score)
+        ts, diff = title_score(best), year_diff(best)
+        if ts == 50:
+            sure = diff is None or diff <= 1
+        elif ts == 20:
+            sure = diff is not None and diff <= 1
+        else:
+            sure = diff == 0 and sum(1 for r in results if year_diff(r) == 0) == 1
+        return best, sure, score(best)
 
     # ---------- 詳情 ----------
     def details(self, kind: str, tmdb_id: int) -> Optional[dict]:
@@ -169,6 +221,11 @@ class TmdbClient:
         except Exception as e:
             log.warning("下載圖片失敗 %s: %s", url, e)
         return None
+
+
+def _norm(s: str) -> str:
+    """比對片名用：小寫、拿掉標點與空白。`Spider-Man` 和 `spider man` 算同名。"""
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", s or "")).lower()
 
 
 def _ext_of(path: str) -> str:
